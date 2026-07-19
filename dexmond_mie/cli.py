@@ -3,12 +3,18 @@ import sys
 import json
 import logging
 import os
+import time
+import threading
 
 from colorama import init, Fore, Style
 
 from .core import Engine
+from . import paths
 
 init()
+
+DEFAULT_HOST = '127.0.0.1'
+DEFAULT_PORT = int(os.environ.get('DEXMOND_PORT', '8888'))
 
 
 def setup_logging(verbose=False):
@@ -53,61 +59,85 @@ def color_verdict(verdict):
     return f'''{Fore.GREEN}{verdict}{Style.RESET_ALL}'''
 
 
-def run_gui(host='127.0.0.1', port=8000):
-    logger = logging.getLogger('DEXMOND_MIE')
-    try:
-        import uvicorn
-        from .webapp import app
-    except ImportError as e:
-        logger.error(f'GUI dependencies not available ({e}). '
-                     'Install fastapi and uvicorn, or use the "scan" / "background" commands.')
-        sys.exit(1)
-    import threading
+def _start_server(host, port):
+    '''Starts the dashboard/API server in a background thread and waits until
+    it is accepting connections. The webapp auto-starts realtime protection.'''
+    import uvicorn
+    from .webapp import app
     server = threading.Thread(
         target=uvicorn.run, args=(app,),
         kwargs={'host': host, 'port': port, 'log_level': 'warning'},
         daemon=True)
     server.start()
     url = f'http://{host}:{port}'
+    for _ in range(50):
+        try:
+            import urllib.request
+            urllib.request.urlopen(url, timeout=1)
+            break
+        except Exception:
+            time.sleep(0.1)
+    return url
+
+
+def run_gui(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    '''Full desktop experience: dashboard server + system-tray icon + window.'''
+    logger = logging.getLogger('DEXMOND_MIE')
+    os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
+    try:
+        import uvicorn  # noqa: F401
+        from .webapp import app  # noqa: F401
+    except ImportError as e:
+        logger.error(f'GUI dependencies not available ({e}). '
+                     'Install requirements.txt, or use the "scan" / "background" commands.')
+        sys.exit(1)
+    url = _start_server(host, port)
     logger.info(f'Dashboard running at {url}')
+
+    # Desktop window (pywebview) on the main thread; tray icon in a helper
+    # thread. Both are optional so the app still runs if either is missing.
+    window = None
     try:
         import webview
-        window = webview.create_window('DEXMOND MIE', url)
-        webview.start()
+        window = webview.create_window('DEXMOND MIE', url, width=1200, height=820)
     except ImportError:
-        logger.info('pywebview not installed; serving in browser mode (Ctrl+C to stop)')
+        logger.info('pywebview not installed; the dashboard is available in your browser')
+
+    try:
+        from .tray import run_tray
+        threading.Thread(target=run_tray, args=(window,), daemon=True).start()
+    except ImportError as e:
+        logger.info(f'System tray unavailable ({e})')
+
+    if window is not None:
+        import webview
+        webview.start()
+    else:
         try:
+            import webbrowser
+            webbrowser.open(url)
             while True:
-                import time
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
 
 
-def run_background():
+def run_background(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    '''Headless/tray mode: dashboard server + realtime protection, no window.'''
     logger = logging.getLogger('DEXMOND_MIE')
-    from .realtime import RealtimeScanner
-    notification_callback = None
+    os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
+    url = _start_server(host, port)
+    logger.info(f'Protection running in background; dashboard at {url}')
     try:
-        from .tray import run_tray, show_notification
-        notification_callback = show_notification
-        has_tray = True
+        from .tray import run_tray
+        run_tray(None)
     except ImportError as e:
-        logger.warning(f'Tray unavailable ({e}); running headless realtime scan')
-        has_tray = False
-    scanner = RealtimeScanner('./rules', notification_callback=notification_callback)
-    scanner.start()
-    try:
-        if has_tray:
-            run_tray()
-        else:
-            import time
+        logger.warning(f'Tray unavailable ({e}); running headless (Ctrl+C to stop)')
+        try:
             while True:
                 time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        scanner.stop()
+        except KeyboardInterrupt:
+            pass
 
 
 def run():
@@ -117,7 +147,7 @@ def run():
     subparsers.add_parser('background', help='Launch in background with tray icon and realtime scan')
     scan_parser = subparsers.add_parser('scan', help='Scan a file or directory')
     scan_parser.add_argument('target', help='File or directory to scan')
-    scan_parser.add_argument('--rules-dir', default='./rules', help='Path to YARA rules directory')
+    scan_parser.add_argument('--rules-dir', default=paths.rules_dir(), help='Path to YARA rules directory')
     scan_parser.add_argument('--output', choices=['console', 'json'], default='console', help='Output format')
     scan_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     args = parser.parse_args()
@@ -132,7 +162,7 @@ def run():
         run_background()
         return
     if args.command == 'scan':
-        engine = Engine(args.rules_dir)
+        engine = Engine(args.rules_dir, paths.reputation_db())
         target_path = os.path.abspath(args.target)
         if os.path.isfile(target_path):
             results = engine.scan_file(target_path)

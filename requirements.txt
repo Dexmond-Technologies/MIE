@@ -1,0 +1,20 @@
+# DEXMOND MIE runtime dependencies
+# Core scanning engine
+yara-python>=4.3.1
+pefile>=2023.2.7
+watchdog>=3.0.0
+colorama>=0.4.6
+
+# Web dashboard / API
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+
+# Desktop shell (window + system tray)
+pywebview>=5.0
+pystray>=0.19.5
+Pillow>=10.0.0
+requests>=2.31.0
+
+# Packaging (Windows build only)
+pyinstaller>=6.5.0

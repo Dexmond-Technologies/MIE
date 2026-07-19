@@ -8,14 +8,15 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as item
 
-API_URL = os.environ.get('DEXMOND_API_URL', 'http://localhost:8000')
-TOKEN_FILE = os.environ.get('DEXMOND_TOKEN_FILE', './data/.auth_token')
+from . import paths
+
+API_URL = os.environ.get('DEXMOND_API_URL', 'http://localhost:8888')
 CHECK_INTERVAL = 5
 
 
 def _auth_headers():
     try:
-        with open(TOKEN_FILE) as f:
+        with open(paths.token_file()) as f:
             return {'X-DEXMOND-Token': f.read().strip()}
     except OSError:
         return {}

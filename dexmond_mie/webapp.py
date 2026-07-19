@@ -13,15 +13,17 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from .core import Engine
 from .realtime import RealtimeScanner, ALERT_THRESHOLD
 from .quarantine import QuarantineManager
+from . import paths
 from . import __version__
 
 logger = logging.getLogger('DEXMOND_MIE')
 
-RULES_DIR = os.environ.get('DEXMOND_RULES_DIR', './rules')
-QUARANTINE_DIR = os.environ.get('DEXMOND_QUARANTINE_DIR', './quarantine')
-STATE_FILE = os.environ.get('DEXMOND_STATE_FILE', './data/state.json')
-REPUTATION_DB = os.environ.get('DEXMOND_REPUTATION_DB', './data/reputation.json')
-TOKEN_FILE = os.environ.get('DEXMOND_TOKEN_FILE', './data/.auth_token')
+# Paths resolve correctly whether running from source or a packaged executable.
+RULES_DIR = paths.rules_dir()
+QUARANTINE_DIR = paths.quarantine_dir()
+STATE_FILE = paths.state_file()
+REPUTATION_DB = paths.reputation_db()
+TOKEN_FILE = paths.token_file()
 
 # Only loopback host names are accepted, which blocks DNS-rebinding attacks
 # that would otherwise let a remote page reach this local service.
