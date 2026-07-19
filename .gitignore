@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data (never commit the auth token or live state)
+data/.auth_token
+data/state.json
+quarantine/
+
+# OS
+.DS_Store
+Thumbs.db

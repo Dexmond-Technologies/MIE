@@ -1,75 +1,91 @@
-# Source Generated with Decompyle++
-# File: tray.pyc (Python 3.10)
-
 import os
-import sys
 import threading
 import time
 import webbrowser
+
 import requests
 from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as item
-API_URL = 'http://localhost:8000'
+
+API_URL = os.environ.get('DEXMOND_API_URL', 'http://localhost:8000')
+TOKEN_FILE = os.environ.get('DEXMOND_TOKEN_FILE', './data/.auth_token')
 CHECK_INTERVAL = 5
 
-def create_image(width, height, color1, color2 = (64, 64, 'black', 'cyan')):
+
+def _auth_headers():
+    try:
+        with open(TOKEN_FILE) as f:
+            return {'X-DEXMOND-Token': f.read().strip()}
+    except OSError:
+        return {}
+
+
+def create_image(width=64, height=64, color1='black', color2='cyan'):
     image = Image.new('RGB', (width, height), color1)
     dc = ImageDraw.Draw(image)
-    dc.rectangle((width // 4, height // 4, width * 3 // 4, height * 3 // 4), color2, **('fill',))
+    dc.rectangle((width // 4, height // 4, width * 3 // 4, height * 3 // 4), fill=color2)
     return image
 
 
 def open_dashboard(icon, item):
     if hasattr(icon, 'webview_window') and icon.webview_window:
-        
         try:
             icon.webview_window.show()
-        finally:
-            return None
-            webbrowser.open(API_URL)
-            return None
-            webbrowser.open(API_URL)
-            return None
-
+            return
+        except Exception:
+            pass
+    webbrowser.open(API_URL)
 
 
 def exit_app(icon, item):
     icon.stop()
     if hasattr(icon, 'webview_window') and icon.webview_window:
-        
         try:
             icon.webview_window.destroy()
-        finally:
+        except Exception:
             pass
-        import os
-        os._exit(0)
-        return None
-
+    os._exit(0)
 
 
 def check_status(icon):
-    pass
-# WARNING: Decompyle incomplete
+    while icon.visible is not None:
+        try:
+            resp = requests.get(f'{API_URL}/status', timeout=3, headers=_auth_headers())
+            if resp.ok:
+                icon.title = 'DEXMOND MIE - Active'
+            else:
+                icon.title = 'DEXMOND MIE - Degraded'
+        except requests.RequestException:
+            icon.title = 'DEXMOND MIE'
+        time.sleep(CHECK_INTERVAL)
+
 
 icon_instance = None
 
+
 def show_notification(title, msg):
-    pass
-# WARNING: Decompyle incomplete
+    if icon_instance is not None:
+        try:
+            icon_instance.notify(msg, title)
+        except Exception:
+            pass
 
 
-def run_tray(window = (None,)):
+def run_tray(window=None):
     global icon_instance
     image = create_image()
-    menu = (item('Open Dashboard', open_dashboard, True, **('default',)), item('Status: Checking...', (lambda icon, item: pass), False, **('enabled',)), item('Exit', exit_app))
+    menu = (
+        item('Open Dashboard', open_dashboard, default=True),
+        item('Status: Checking...', lambda icon, item: None, enabled=False),
+        item('Exit', exit_app))
     icon = pystray.Icon('dexmond_mie', image, 'DEXMOND MIE', menu)
     icon.webview_window = window
     icon_instance = icon
-    t = threading.Thread(check_status, (icon,), True, **('target', 'args', 'daemon'))
+    t = threading.Thread(target=check_status, args=(icon,), daemon=True)
     t.start()
     icon.run()
 
+
 if __name__ == '__main__':
     run_tray()
-    return None
