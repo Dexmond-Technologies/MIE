@@ -21,6 +21,11 @@ class YaraAnalyzer:
         self.rules_dir = rules_dir
         self._compile_rules()
 
+    def reload_rules(self):
+        '''Recompiles rules dynamically when rules are updated or auto-generated.'''
+        logger.info('Reloading and recompiling YARA rules...')
+        self._compile_rules()
+
     def _compile_rules(self):
         '''Compiles all .yar files in the specified directory.'''
         if yara is None:

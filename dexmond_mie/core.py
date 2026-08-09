@@ -6,11 +6,12 @@ import tempfile
 import logging
 from typing import Dict, Any
 
-from .utils import calculate_hashes, calculate_entropy, StringExtractor
+from .utils import calculate_hashes, calculate_entropy, calculate_sliding_window_entropy, StringExtractor
 from .pe_analyzer import PEAnalyzer
 from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
 from .reputation import ReputationDB
+from .auto_evolution import AutoEvolutionEngine
 
 logger = logging.getLogger('DEXMOND_MIE')
 
@@ -27,8 +28,10 @@ class Engine:
     '''Orchestrates the malware inspection process.'''
 
     def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json'):
+        self.rules_dir = rules_dir
         self.yara_engine = YaraAnalyzer(rules_dir)
         self.reputation = ReputationDB(reputation_db)
+        self.auto_evolution = AutoEvolutionEngine(rules_dir)
 
     def scan_file(self, file_path: str, _depth: int = 0) -> Dict[str, Any]:
         '''Scans a single file and returns results.'''
@@ -76,10 +79,15 @@ class Engine:
 
         # --- Entropy ---
         entropy = calculate_entropy(data)
+        sliding_entropy = calculate_sliding_window_entropy(data)
         results['details']['entropy'] = round(entropy, 4)
+        results['details']['sliding_entropy'] = sliding_entropy
         if entropy > 7.2:
             scorer.add_finding('high_entropy',
-                               f'File has very high entropy ({entropy:.2f}/8.00) - likely packed or encrypted')
+                               f'File has very high overall entropy ({entropy:.2f}/8.00) - likely packed or encrypted')
+        elif sliding_entropy['high_entropy_windows'] > 0:
+            scorer.add_finding('sliding_entropy_spike',
+                               f"Detected {sliding_entropy['high_entropy_windows']} high-entropy pocket(s) (peak {sliding_entropy['max']:.2f}/8.00)")
 
         # --- YARA ---
         yara_matches = self.yara_engine.scan(file_path)
@@ -103,8 +111,14 @@ class Engine:
             for warning in pe_info.get('warnings', []):
                 if 'entropy' in warning:
                     scorer.add_finding('high_entropy', warning)
+                elif 'TLS Callbacks' in warning:
+                    scorer.add_finding('tls_callback', warning)
+                elif 'overlay' in warning:
+                    scorer.add_finding('pe_overlay', warning)
                 else:
                     scorer.add_finding('anomaly', warning)
+            for chain in pe_info.get('api_chains', []):
+                scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
             suspicious_imports = pe_analyzer.get_suspicious_imports()
             if suspicious_imports:
                 scorer.add_finding('suspicious_import',
@@ -123,6 +137,12 @@ class Engine:
             if key in iocs:
                 scorer.add_finding('suspicious_string',
                                    f"Suspicious strings ({key}): {', '.join(iocs[key][:5])}")
+        if 'b64_executable' in iocs:
+            scorer.add_finding('b64_executable',
+                               f"Embedded Base64-encoded executable signature detected ({len(iocs['b64_executable'])} occurrence(s))")
+        if 'obfuscated_script' in iocs:
+            scorer.add_finding('obfuscated_script',
+                               f"Obfuscated script pattern detected: {', '.join(iocs['obfuscated_script'][:3])}")
 
         # --- Archive inspection (scan contents of zips/tars) ---
         if _depth == 0 and self._is_archive(file_path):
@@ -141,6 +161,12 @@ class Engine:
         results['score'] = scorer.get_score()
         results['verdict'] = scorer.get_verdict()
         results['scan_time'] = round(time.time() - start_time, 3)
+
+        if _depth == 0 and results['score'] >= 70:
+            gen_rule = self.auto_evolution.process_scan_result(file_path, results, self.yara_engine)
+            if gen_rule:
+                results['details']['auto_generated_rule'] = gen_rule
+
         logger.info(f"Scan complete: {results['verdict']} (score {results['score']}) in {results['scan_time']}s")
         return results
 

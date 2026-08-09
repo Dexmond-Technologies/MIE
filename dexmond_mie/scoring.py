@@ -7,9 +7,15 @@ class Scorer:
         'yara_match': 20,
         'critical_yara': 70,
         'high_entropy': 15,
+        'sliding_entropy_spike': 20,
         'suspicious_import': 10,
+        'api_chain': 35,
         'suspicious_string': 5,
+        'obfuscated_script': 25,
+        'b64_executable': 30,
         'packer_detected': 25,
+        'pe_overlay': 15,
+        'tls_callback': 20,
         'anomaly': 10}
 
     def __init__(self):

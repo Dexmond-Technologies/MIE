@@ -56,12 +56,25 @@ class PEAnalyzer:
             'compile_time': self.pe.FILE_HEADER.TimeDateStamp,
             'entry_point': hex(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint),
             'image_base': hex(self.pe.OPTIONAL_HEADER.ImageBase),
+            'imphash': self.get_imphash(),
             'sections': self._get_sections(),
             'imports': self._get_imports(),
             'exports': self._get_exports(),
             'resources': self._get_resources(),
+            'api_chains': self.get_api_chains(),
+            'overlay': self.get_overlay_info(),
+            'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies()}
         return results
+
+    def get_imphash(self) -> str:
+        '''Returns PE import hash if available.'''
+        if self.pe and hasattr(self.pe, 'get_imphash'):
+            try:
+                return self.pe.get_imphash()
+            except Exception:
+                pass
+        return ''
 
     def get_suspicious_imports(self) -> List[str]:
         '''Returns imported API names commonly abused by malware.'''
@@ -71,6 +84,51 @@ class PEAnalyzer:
                 if func in SUSPICIOUS_IMPORTS:
                     found.append(func)
         return sorted(set(found))
+
+    def get_api_chains(self) -> List[str]:
+        '''Identifies combinations of API calls matching known attack behaviors.'''
+        all_funcs = set()
+        for funcs in self._get_imports().values():
+            all_funcs.update(funcs)
+        
+        chains = []
+        # Process Injection Chain
+        if ('VirtualAllocEx' in all_funcs or 'VirtualAlloc' in all_funcs) and \
+           ('WriteProcessMemory' in all_funcs or 'NtWriteVirtualMemory' in all_funcs) and \
+           ('CreateRemoteThread' in all_funcs or 'NtCreateThreadEx' in all_funcs or 'QueueUserAPC' in all_funcs):
+            chains.append('Process Injection Chain (VirtualAllocEx + WriteProcessMemory + Thread Creation)')
+            
+        # Remote Download & Execute Chain
+        if any(f in all_funcs for f in ('URLDownloadToFileA', 'URLDownloadToFileW', 'InternetOpenA', 'InternetOpenUrlA')) and \
+           any(f in all_funcs for f in ('WinExec', 'ShellExecuteA', 'ShellExecuteW', 'CreateProcessA', 'CreateProcessW')):
+            chains.append('Remote Download & Exec Chain (Internet API + Execution)')
+
+        # Hooking / Keylogging Chain
+        if any(f in all_funcs for f in ('SetWindowsHookExA', 'SetWindowsHookExW')) and \
+           any(f in all_funcs for f in ('GetAsyncKeyState', 'GetForegroundWindow')):
+            chains.append('System Hooking / Keylogging Chain (SetWindowsHookEx + Input Capture)')
+
+        return chains
+
+    def get_overlay_info(self) -> Dict[str, Any]:
+        '''Checks for PE overlay data appended past the last section.'''
+        if not self.pe:
+            return {'present': False, 'size': 0}
+        try:
+            offset = self.pe.get_overlay_data_offset()
+            if offset is not None:
+                file_size = len(self.pe.__data__) if hasattr(self.pe, '__data__') else 0
+                overlay_size = file_size - offset if file_size > offset else 0
+                return {'present': overlay_size > 0, 'size': overlay_size, 'offset': offset}
+        except Exception:
+            pass
+        return {'present': False, 'size': 0}
+
+    def has_tls_callbacks(self) -> bool:
+        '''Checks if binary uses TLS Callbacks to execute code before main entry point.'''
+        if not self.pe:
+            return False
+        return hasattr(self.pe, 'DIRECTORY_ENTRY_TLS') and bool(getattr(self.pe, 'DIRECTORY_ENTRY_TLS', None))
 
     def get_packer_sections(self) -> List[str]:
         '''Returns section names matching known packer signatures.'''
@@ -153,4 +211,9 @@ class PEAnalyzer:
             warnings.append('Suspicious compilation timestamp')
         if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
             warnings.append('Entry point is zero')
+        if self.has_tls_callbacks():
+            warnings.append('PE uses TLS Callbacks to execute code before main entry point')
+        overlay = self.get_overlay_info()
+        if overlay.get('present') and overlay.get('size', 0) > 1024 * 1024:
+            warnings.append(f"Significant PE overlay data detected ({overlay['size'] // (1024*1024)} MB appended past last section)")
         return warnings

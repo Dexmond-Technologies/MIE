@@ -42,6 +42,34 @@ def calculate_entropy(data: bytes) -> float:
     return entropy
 
 
+def calculate_sliding_window_entropy(data: bytes, window_size: int = 4096, step: int = 2048) -> Dict[str, float]:
+    '''Calculates sliding window entropy across data to detect hidden high-entropy pockets.'''
+    if not data or len(data) < window_size:
+        e = calculate_entropy(data)
+        return {'max': round(e, 4), 'min': round(e, 4), 'avg': round(e, 4), 'high_entropy_windows': 1 if e > 7.2 else 0, 'total_windows': 1}
+    
+    entropies = []
+    high_count = 0
+    for i in range(0, len(data) - window_size + 1, step):
+        window = data[i:i + window_size]
+        e = calculate_entropy(window)
+        entropies.append(e)
+        if e > 7.2:
+            high_count += 1
+            
+    if not entropies:
+        e = calculate_entropy(data)
+        return {'max': round(e, 4), 'min': round(e, 4), 'avg': round(e, 4), 'high_entropy_windows': 1 if e > 7.2 else 0, 'total_windows': 1}
+        
+    return {
+        'max': round(max(entropies), 4),
+        'min': round(min(entropies), 4),
+        'avg': round(sum(entropies) / len(entropies), 4),
+        'high_entropy_windows': high_count,
+        'total_windows': len(entropies)
+    }
+
+
 class StringExtractor:
     '''Extracts strings and identifies suspicious patterns.'''
     PATTERNS = {
@@ -51,7 +79,9 @@ class StringExtractor:
         'bitcoin': re.compile('\\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\\b'),
         'base64': re.compile('(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?'),
         'powershell': re.compile('powershell(?:\\.exe)?|pwsh(?:\\.exe)?|-enc|-encodedcommand', re.IGNORECASE),
-        'suspicious_api': re.compile('(VirtualAlloc|CreateRemoteThread|WriteProcessMemory|LdrLoadDll|ReflectiveLoader)', re.IGNORECASE)}
+        'suspicious_api': re.compile('(VirtualAlloc|CreateRemoteThread|WriteProcessMemory|LdrLoadDll|ReflectiveLoader)', re.IGNORECASE),
+        'b64_executable': re.compile('TVqQAAMAAAA4A[A-Za-z0-9+/=]+'),
+        'obfuscated_script': re.compile('(\\[char\\[\\]\\]|Invoke-Expression|iex\\s*\\(|FromBase64String|Bypass\\s+-noprofile)', re.IGNORECASE)}
 
     @staticmethod
     def extract_ascii_unicode(data: bytes, min_length: int = 5) -> Tuple[List[str], Dict[str, List[str]]]:

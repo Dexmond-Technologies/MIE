@@ -208,6 +208,8 @@ def quarantine_add(payload: dict):
                    f"(score {results.get('score', 0)}/{ALERT_THRESHOLD}).")
     try:
         meta = quarantine.add(path, results)
+        if meta and meta.get('sha256'):
+            engine.auto_evolution.on_isolate(engine.reputation, meta['sha256'], meta.get('filename', ''))
     except OSError as e:
         raise HTTPException(status_code=500, detail=f'Could not quarantine file: {e}')
     abspath = os.path.abspath(path)
@@ -221,7 +223,10 @@ def quarantine_add(payload: dict):
 @app.post('/api/quarantine/{qid}/restore')
 def quarantine_restore(qid: str):
     try:
+        meta = quarantine._meta(qid)
         dest = quarantine.restore(qid)
+        if meta and meta.get('sha256'):
+            engine.auto_evolution.on_restore(engine.reputation, meta['sha256'], meta.get('filename', ''))
     except KeyError:
         raise HTTPException(status_code=404, detail='Quarantine item not found')
     return {'restored_to': dest}
@@ -429,6 +434,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
   <div class="edition"><span class="badge">Free Edition</span> v<span id="ver">&ndash;</span></div>
 </header>
 <main>
+  <p style="text-align: center; color: var(--ink-soft); margin-bottom: 24px; font-size: 14px;">
+    MIE is a stress-free antimalware. You don't need to do anything as long as active monitoring and autoquarantine are turned on!
+  </p>
   <div class="strip">
     <div class="tile">
       <p class="eyebrow">Real-time protection</p>
@@ -466,14 +474,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
   <div class="cols">
     <aside>
       <div class="card">
-        <p class="eyebrow">Scan a file by path</p>
-        <form onsubmit="scanPath(event)">
+        <p class="eyebrow">Scan a file</p>
+        <form onsubmit="scanPath(event)" style="margin-bottom: 16px;">
           <input type="text" id="path" placeholder="C:\\path\\to\\file" aria-label="File path">
-          <button type="submit">Scan file</button>
+          <button type="submit" style="width: 100%;">Scan file</button>
         </form>
-      </div>
-      <div class="card">
-        <p class="eyebrow">Upload and scan</p>
+        <div style="text-align: center; color: var(--ink-soft); font-size: 13px; margin-bottom: 16px;">&mdash; OR &mdash;</div>
         <div class="dropzone" id="dz" tabindex="0" role="button" aria-label="Upload a file to scan">
           Drop a file here or click to choose
         </div>
