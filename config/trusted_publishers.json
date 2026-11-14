@@ -1,10 +1,34 @@
 {
   "_comment": "X12 publisher policy. A VALID signature caps MIE heuristics at LOW only if the leaf CN AND O both equal a 'publishers' entry AND the issuing CA is an 'issuing_intermediates' entry matched by CN AND SPKI sha256. An entry with spki_sha256 null is not usable (no cap) until SENTINEL pins it (python -m dexmond_mie.signature spki FILE.exe prints the values). Changes are reviewed commits.",
-  "publishers": ["Microsoft Corporation"],
+  "publishers": [
+    "Microsoft Corporation"
+  ],
   "issuing_intermediates": [
-    {"cn": "Microsoft Code Signing PCA 2010", "spki_sha256": null},
-    {"cn": "Microsoft Code Signing PCA 2011", "spki_sha256": null},
-    {"cn": "Microsoft Code Signing PCA 2024", "spki_sha256": null}
+    {
+      "cn": "Microsoft Code Signing PCA 2011",
+      "spki_sha256": "403d745163781e8bc32dcd578fc66040ce004feb501362a4fc789ccfe1599a97",
+      "note": "root 2011; intermediate expired 2026-07-08: valid only with in-store countersignature before then"
+    },
+    {
+      "cn": "Microsoft Code Signing PCA 2024",
+      "spki_sha256": "50e824592caa59c7db9615d676738c7e4eee522622440c4c2152d0668d68c6d9",
+      "note": "root 2011, until 2036"
+    },
+    {
+      "cn": "Microsoft Code Signing PCA",
+      "spki_sha256": "17139f06a3c117cef49a7ca60263017e1d667df819075c302969c41a2c77e506",
+      "note": "legacy, root 2001, expired 2020; needs in-store countersignature"
+    },
+    {
+      "cn": "Microsoft Code Signing PCA",
+      "spki_sha256": "02f3fac4ace37ae5feeee9a7efd688bf5413563e97fcfddc698d607525539138",
+      "note": "legacy second key, root 2001, expired 2017; needs in-store countersignature"
+    },
+    {
+      "cn": "Windows Production PCA 2023",
+      "spki_sha256": "0fb4ac795fcb2d074eb1997c5e91697c2fcaab336d2b2799ae807ddc6541be72",
+      "note": "root 2010, until 2035; signs Microsoft's own Windows binaries"
+    }
   ],
   "rejected_issuers": [
     "Microsoft Windows Third Party Component CA 2012",
@@ -13,5 +37,6 @@
   ],
   "rejected_leaf_cns": [
     "Microsoft Windows Hardware Compatibility Publisher"
-  ]
+  ],
+  "_pinned_by": "SENTINEL 2026-11-14, independently recomputed from 319 extracted certificates (openssl SPKI DER sha256), board B-2398 follow-up"
 }
