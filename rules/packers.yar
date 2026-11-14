@@ -3,6 +3,7 @@ rule Packer_UPX
     meta:
         description = "UPX packed executable"
         severity = "medium"
+        category = "packer"
         author = "DEXMOND MIE"
     strings:
         $upx0 = "UPX0" ascii
@@ -17,6 +18,7 @@ rule Packer_Themida_VMProtect
     meta:
         description = "Themida/VMProtect protected executable"
         severity = "medium"
+        category = "packer"
         author = "DEXMOND MIE"
     strings:
         $vmp0 = ".vmp0" ascii

@@ -153,7 +153,11 @@ class Engine:
         results['yara'] = [m['rule'] for m in yara_matches]
         if yara_matches:
             results['details']['yara_matches'] = yara_matches
-        self._add_yara_findings(scorer, yara_matches)
+        packer_yara = [m['rule'] for m in yara_matches if self._yara_category(m) == 'packer']
+        self._add_yara_findings(scorer, [m for m in yara_matches
+                                         if self._yara_category(m) != 'packer'])
+        if packer_yara and not pe_parsed:
+            scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer_yara)}")
 
         # --- PE analysis ---
         if pe_parsed:
@@ -172,6 +176,8 @@ class Engine:
                         scorer.add_finding('tls_callback', warning)
                 elif 'overlay' in warning:
                     scorer.add_finding('pe_overlay', warning)
+                elif 'Writable and executable' in warning:
+                    scorer.add_finding('wx_section', warning)
                 else:
                     scorer.add_finding('anomaly', warning)
             cert = pe_info.get('certificate', {})
@@ -187,14 +193,18 @@ class Engine:
             for chain in pe_info.get('api_chains', []):
                 scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
             for chain in pe_info.get('minor_api_chains', []):
-                scorer.add_finding('api_chain_minor', f"Behavioral API Chain detected: {chain}")
+                scorer.add_finding(self._minor_chain_category(chain),
+                                   f"Behavioral API Chain detected: {chain}")
             suspicious_imports = pe_analyzer.get_suspicious_imports()
             if suspicious_imports:
                 scorer.add_finding('suspicious_import',
                                    f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
-            if packer_sections:
+            # Packing is one signal: YARA packer rules OR section names, never
+            # both (X10)
+            packer_evidence = list(packer_sections) + packer_yara
+            if packer_evidence:
                 scorer.add_finding('packer_detected',
-                                   f"Packer section names detected: {', '.join(packer_sections)}")
+                                   f"Packer detected: {', '.join(packer_evidence)}")
 
         # --- Strings / IOCs ---
         strings, iocs = StringExtractor.extract_ascii_unicode(data, 5)
@@ -265,6 +275,18 @@ class Engine:
         return results
 
     @staticmethod
+    def _minor_chain_category(chain: str) -> str:
+        # a packer stub resolves its imports at run time, so this chain is a
+        # packing consequence when a packer is detected (scoring.py)
+        if chain.startswith('Dynamic API Resolution'):
+            return 'dynamic_resolution_chain'
+        return 'api_chain_minor'
+
+    @staticmethod
+    def _yara_category(match) -> str:
+        return str(match.get('meta', {}).get('category', '')).lower()
+
+    @staticmethod
     def _add_yara_findings(scorer: Scorer, yara_matches, where: str = ''):
         for match in yara_matches:
             severity = str(match['meta'].get('severity', '')).lower()
@@ -307,7 +329,11 @@ class Engine:
             yara_rules.extend(m['rule'] for m in matches)
             if matches:
                 results['details'].setdefault('yara_matches', []).extend(matches)
-            self._add_yara_findings(scorer, matches, f' ({name} window)')
+            packer = [m['rule'] for m in matches if self._yara_category(m) == 'packer']
+            if packer and not any(f['category'] == 'packer_detected' for f in scorer.findings):
+                scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer)}")
+            self._add_yara_findings(scorer, [m for m in matches if self._yara_category(m) != 'packer'],
+                                    f' ({name} window)')
         results['yara'] = sorted(set(yara_rules))
 
         # PE header and import table from the head window only
@@ -319,7 +345,8 @@ class Engine:
                 for chain in pe_analyzer.get_api_chains():
                     scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
                 for chain in pe_analyzer.get_minor_api_chains():
-                    scorer.add_finding('api_chain_minor', f"Behavioral API Chain detected: {chain}")
+                    scorer.add_finding(self._minor_chain_category(chain),
+                                       f"Behavioral API Chain detected: {chain}")
                 suspicious_imports = pe_analyzer.get_suspicious_imports()
                 if suspicious_imports:
                     scorer.add_finding('suspicious_import',
