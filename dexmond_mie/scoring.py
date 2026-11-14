@@ -36,13 +36,11 @@ class Scorer:
     FAMILIES = {
         'packer_detected': 'packing',
     }
-    # Packing is a property, not malice (X10). When a packer is detected,
-    # the signals packing itself causes (high-entropy sections, W+X
-    # sections, TLS callbacks, a stub that resolves imports at run time) are
-    # the same evidence and join the packing
-    # family, whose cap keeps a packer alone below MEDIUM (30).
-    PACKING_CONSEQUENCES = {'high_entropy', 'wx_section', 'tls_callback',
-                            'dynamic_resolution_chain'}
+    # Packing is a property, not malice (X10). The engine puts a finding
+    # in the 'packing' family (family='packing') only when the packer is
+    # CONFIRMED and the finding is on the packer's own sections; the cap
+    # keeps a confirmed packer alone below MEDIUM (30). A fake marker folds
+    # nothing, so it cannot hide independent evidence.
     FAMILY_CAPS = {
         'packing': 25,
     }
@@ -73,22 +71,19 @@ class Scorer:
             'weight': floor,
             'mode': 'floor'})
 
-    def _family(self, finding: Dict, packer_present: bool) -> str:
+    def _family(self, finding: Dict) -> str:
         if finding.get('family'):
             return finding['family']
         category = finding['category']
-        if packer_present and category in self.PACKING_CONSEQUENCES:
-            return 'packing'
         return self.FAMILIES.get(category, category)
 
     def family_scores(self) -> Dict[str, int]:
         '''Score per family after caps (floor findings excluded).'''
-        packer_present = any(self._family(f, False) == 'packing' for f in self.findings)
         totals: Dict[str, int] = {}
         for f in self.findings:
             if f.get('mode') == 'floor':
                 continue
-            fam = self._family(f, packer_present)
+            fam = self._family(f)
             totals[fam] = totals.get(fam, 0) + f['weight']
         return {fam: min(total, self.FAMILY_CAPS.get(fam, total)) for fam, total in totals.items()}
 

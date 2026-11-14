@@ -168,20 +168,41 @@ class Engine:
             pe_info = pe_analyzer.analyze()
             results['details']['pe_info'] = pe_info
             packer_sections = pe_analyzer.get_packer_sections()
-            entropy_warnings = [w for w in pe_info.get('warnings', []) if 'entropy' in w]
+            # Signals that packing itself causes are folded into the capped
+            # 'packing' family ONLY when the packer is confirmed (YARA rule +
+            # the packer's real section layout), and only for the packer's
+            # OWN sections. A fake marker folds nothing: every other finding
+            # keeps its own weight outside the cap.
+            own = pe_analyzer.confirmed_upx_sections(packer_yara)
+            if own:
+                results['details']['packer_confirmed'] = sorted(own)
+            pack = lambda in_packer: 'packing' if in_packer else None  # noqa: E731
+            he_sections = pe_info.get('high_entropy_sections', [])
+            for name in he_sections:
+                scorer.add_finding('high_entropy',
+                                   f'Section {name} has very high entropy (packed/encrypted?)',
+                                   family=pack(name in own))
+            wx = pe_info.get('wx_sections', [])
+            for group, in_packer in (([n for n in wx if n in own], True),
+                                     ([n for n in wx if n not in own], False)):
+                if group:
+                    scorer.add_finding('wx_section',
+                                       f"Writable and executable section(s): {', '.join(group)}",
+                                       family=pack(in_packer))
             for warning in pe_info.get('warnings', []):
+                if '(packed/encrypted?)' in warning or 'Writable and executable' in warning:
+                    continue  # scored per section above
                 if 'entropy' in warning:
                     scorer.add_finding('high_entropy', warning)
                 elif 'TLS Callbacks' in warning:
                     # TLS callbacks are scored (weight 5) only together with a
                     # packer or high-entropy-section signal; otherwise they are
                     # reported in pe_info.tls_callbacks only
-                    if packer_sections or entropy_warnings:
-                        scorer.add_finding('tls_callback', warning)
+                    if packer_sections or packer_yara or he_sections:
+                        scorer.add_finding('tls_callback', warning,
+                                           family=pack(pe_info.get('tls_callback_section') in own))
                 elif 'overlay' in warning:
                     scorer.add_finding('pe_overlay', warning)
-                elif 'Writable and executable' in warning:
-                    scorer.add_finding('wx_section', warning)
                 else:
                     scorer.add_finding('anomaly', warning)
             cert = pe_info.get('certificate', {})
@@ -197,8 +218,10 @@ class Engine:
             for chain in pe_info.get('api_chains', []):
                 scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
             for chain in pe_info.get('minor_api_chains', []):
-                scorer.add_finding(self._minor_chain_category(chain),
-                                   f"Behavioral API Chain detected: {chain}")
+                category = self._minor_chain_category(chain)
+                # a confirmed UPX stub resolves its imports at run time
+                scorer.add_finding(category, f"Behavioral API Chain detected: {chain}",
+                                   family=pack(bool(own) and category == 'dynamic_resolution_chain'))
             suspicious_imports = pe_analyzer.get_suspicious_imports()
             if suspicious_imports:
                 scorer.add_finding('suspicious_import',

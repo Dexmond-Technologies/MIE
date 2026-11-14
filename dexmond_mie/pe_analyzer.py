@@ -140,6 +140,9 @@ class PEAnalyzer:
             'certificate': self.parse_certificate_table(),
             'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies(),
+            'high_entropy_sections': list(self.high_entropy_sections),
+            'wx_sections': list(self.wx_sections),
+            'tls_callback_section': self.tls_callback_section(),
             'notes': self._notes()}
         return results
 
@@ -401,6 +404,52 @@ class PEAnalyzer:
         except Exception:
             return False
 
+    def section_at_rva(self, rva: int):
+        for section in self.pe.sections:
+            span = max(section.Misc_VirtualSize, section.SizeOfRawData)
+            if section.VirtualAddress <= rva < section.VirtualAddress + span:
+                return section
+        return None
+
+    def tls_callback_section(self):
+        '''Name of the section the first TLS callback points into.'''
+        if not self.has_tls_callbacks():
+            return None
+        try:
+            tls = self.pe.DIRECTORY_ENTRY_TLS
+            base = self.pe.OPTIONAL_HEADER.ImageBase
+            rva = tls.struct.AddressOfCallBacks - base
+            if getattr(self.pe, 'PE_TYPE', 0x10b) == 0x20b:
+                first = self.pe.get_qword_at_rva(rva)
+            else:
+                first = self.pe.get_dword_at_rva(rva)
+            section = self.section_at_rva(first - base)
+            return self._section_name(section) if section is not None else None
+        except Exception:
+            return None
+
+    def confirmed_upx_sections(self, yara_rules) -> set:
+        '''UPX is CONFIRMED only when the Packer_UPX YARA rule matched AND the
+        section layout is the one UPX writes: UPX0 (no raw data, non-zero
+        virtual size, executable) and UPX1 (raw data, executable) with the
+        entry point inside UPX1. A UPX string or section name alone is not
+        confirmation. Returns the packer's own section names, or an empty
+        set.'''
+        if 'Packer_UPX' not in set(yara_rules or ()):
+            return set()
+        by_name = {self._section_name(s): s for s in self.pe.sections}
+        upx0, upx1 = by_name.get('UPX0'), by_name.get('UPX1')
+        if upx0 is None or upx1 is None:
+            return set()
+        if upx0.SizeOfRawData != 0 or not upx0.Misc_VirtualSize or not upx1.SizeOfRawData:
+            return set()
+        if 'X' not in self._get_section_permissions(upx0) or \
+                'X' not in self._get_section_permissions(upx1):
+            return set()
+        if self.section_at_rva(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint) is not upx1:
+            return set()
+        return {'UPX0', 'UPX1'}
+
     def get_packer_sections(self) -> List[str]:
         '''Returns section names matching known packer signatures.'''
         found = []
@@ -489,6 +538,7 @@ class PEAnalyzer:
 
     def _check_anomalies(self) -> List[str]:
         warnings = []
+        self.high_entropy_sections = []
         wx_sections = []
         resource_section = self.get_resource_section()
         for section in self.pe.sections:
@@ -503,10 +553,12 @@ class PEAnalyzer:
                     warnings.append(f'Section {self._section_name(section)} has very high entropy '
                                     f'outside its resource data entries')
             elif section.get_entropy() > 7:
+                self.high_entropy_sections.append(self._section_name(section))
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:
                 wx_sections.append(self._section_name(section))
+        self.wx_sections = wx_sections
         if wx_sections:
             # counted once per file, however many W+X sections there are
             warnings.append(f"Writable and executable section(s): {', '.join(wx_sections)}")

@@ -10,7 +10,7 @@ IMAGE_SCN_MEM_WRITE = 0x80000000
 
 class FakeSection:
     def __init__(self, name, entropy=5.0, perms='R', raw_size=0x1000, va=0x1000,
-                 raw_ptr=0x400, data=None):
+                 raw_ptr=0x400, data=None, vsize=None):
         self._data = data if data is not None else b'\0' * raw_size
         if data is not None:
             raw_size = len(data)
@@ -23,7 +23,7 @@ class FakeSection:
             self.Characteristics |= IMAGE_SCN_MEM_READ
         if 'W' in perms:
             self.Characteristics |= IMAGE_SCN_MEM_WRITE
-        self.Misc_VirtualSize = raw_size
+        self.Misc_VirtualSize = raw_size if vsize is None else vsize
         self.VirtualAddress = va
         self.SizeOfRawData = raw_size
         self.PointerToRawData = raw_ptr
