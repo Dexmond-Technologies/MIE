@@ -3,6 +3,7 @@ rule Process_Injection_APIs
     meta:
         description = "Combination of APIs commonly used for process injection"
         severity = "high"
+        category = "imports"
         author = "DEXMOND MIE"
     strings:
         $a1 = "VirtualAllocEx" ascii

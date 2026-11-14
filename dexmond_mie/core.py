@@ -330,6 +330,9 @@ class Engine:
 
     @staticmethod
     def _add_yara_findings(scorer: Scorer, yara_matches, where: str = ''):
+        '''YARA weight by severity (X13). A rule with meta category
+        "imports" detects API names, the same evidence as the import
+        analysis, so it scores in the capped 'imports' family.'''
         for match in yara_matches:
             severity = str(match['meta'].get('severity', '')).lower()
             description = match['meta'].get('description', match['rule'])
@@ -337,8 +340,11 @@ class Engine:
                 scorer.add_finding('critical_yara',
                                    f"Critical YARA match{where}: {match['rule']} ({description})")
             else:
+                weight = Scorer.YARA_SEVERITY_WEIGHTS.get(severity, Scorer.WEIGHTS['yara_match'])
+                family = 'imports' if Engine._yara_category(match) == 'imports' else None
                 scorer.add_finding('yara_match',
-                                   f"YARA match{where}: {match['rule']} ({description})")
+                                   f"YARA match{where}: {match['rule']} ({description})",
+                                   weight_override=weight, family=family)
 
     def _scan_oversize(self, file_path, results, scorer, rep_malicious, start_time):
         '''Bounded partial scan of a file over max_scan_bytes. Memory stays at

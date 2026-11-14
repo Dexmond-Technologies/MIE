@@ -35,14 +35,33 @@ class Scorer:
     # category -> family (categories not listed form their own family)
     FAMILIES = {
         'packer_detected': 'packing',
+        # entropy (X13: <= 15)
+        'high_entropy': 'entropy',
+        'sliding_entropy_spike': 'entropy',
+        'overlay_high_entropy': 'entropy',
+        # imports and API chains (X13: <= 35)
+        'suspicious_import': 'imports',
+        'api_chain': 'imports',
+        'api_chain_minor': 'imports',
+        'dynamic_resolution_chain': 'imports',
+        # non-critical YARA (weight by severity, X13: <= 40)
+        'yara_match': 'yara',
+        'critical_yara': 'critical_yara',
     }
+    # YARA weight by rule severity; critical rules are uncapped
+    YARA_SEVERITY_WEIGHTS = {'critical': 70, 'high': 20, 'medium': 10, 'low': 5}
     # Packing is a property, not malice (X10). The engine puts a finding
     # in the 'packing' family (family='packing') only when the packer is
     # CONFIRMED and the finding is on the packer's own sections; the cap
     # keeps a confirmed packer alone below MEDIUM (30). A fake marker folds
     # nothing, so it cannot hide independent evidence.
+    # X13 caps per family. Thresholds stay 30 (MEDIUM) / 70 (MALICIOUS):
+    # re-calibration needs corpus B and was NOT done here.
     FAMILY_CAPS = {
         'packing': 25,
+        'entropy': 15,
+        'imports': 35,
+        'yara': 40,
     }
 
     # Never lowered by a trusted signature: hard evidence, not heuristics
