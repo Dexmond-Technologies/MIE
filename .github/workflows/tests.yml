@@ -10,11 +10,6 @@ name: tests
 
 on:
   workflow_dispatch:
-  # TEMPORARY: one verification run (a dispatch-only workflow cannot start off the default
-  # branch until GitHub has registered it). Removed in the next commit.
-  push:
-    branches: [fix/false-alarms-v1]
-    paths: [.github/workflows/tests.yml]
 
 permissions:
   contents: read
@@ -54,6 +49,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
+      # Byte-exact checkout: the shipped trust/authenticode_roots.pem is pinned by SHA-256,
+      # and Git for Windows' default autocrlf would rewrite it with CRLF.
+      - name: Keep line endings exactly as committed
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
