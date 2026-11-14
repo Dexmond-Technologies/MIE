@@ -12,7 +12,7 @@ from .pe_analyzer import PEAnalyzer
 from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
 from .reputation import ReputationDB
-from .auto_evolution import AutoEvolutionEngine
+from .auto_evolution import AutoEvolutionEngine, auto_evolution_enabled_by_env
 from . import signature
 
 logger = logging.getLogger('DEXMOND_MIE')
@@ -65,7 +65,7 @@ class Engine:
     def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json',
                  use_reputation: bool = True, max_scan_bytes: int = None,
                  oversize_window_bytes: int = None, signature_verifier=None,
-                 trusted_publishers=None):
+                 trusted_publishers=None, auto_evolution: bool = None):
         self.rules_dir = rules_dir
         # X12: real Authenticode verification (Windows WinVerifyTrust);
         # elsewhere it reports 'unavailable' and no cap is applied
@@ -81,7 +81,10 @@ class Engine:
         self.use_reputation = use_reputation
         self.yara_engine = YaraAnalyzer(rules_dir)
         self.reputation = ReputationDB(reputation_db)
-        self.auto_evolution = AutoEvolutionEngine(rules_dir)
+        # F1: off by default; proposals only, never loaded until approved
+        if auto_evolution is None:
+            auto_evolution = auto_evolution_enabled_by_env()
+        self.auto_evolution = AutoEvolutionEngine(rules_dir, enabled=auto_evolution)
 
     def scan_file(self, file_path: str, _depth: int = 0, _budget: Dict[str, int] = None) -> Dict[str, Any]:
         '''Scans a single file and returns results.'''
@@ -312,9 +315,10 @@ class Engine:
         results['scan_time'] = round(time.time() - start_time, 3)
 
         if _depth == 0 and results['score'] >= 70:
-            gen_rule = self.auto_evolution.process_scan_result(file_path, results, self.yara_engine)
+            gen_rule = self.auto_evolution.process_scan_result(file_path, results)
             if gen_rule:
-                results['details']['auto_generated_rule'] = gen_rule
+                results['details']['proposed_rule'] = {'name': gen_rule, 'active': False,
+                                                       'approve_with': f'main.py rules approve {gen_rule}'}
 
         logger.info(f"Scan complete: {results['verdict']} (score {results['score']}) in {results['scan_time']}s")
         return results

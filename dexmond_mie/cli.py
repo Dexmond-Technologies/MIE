@@ -152,6 +152,13 @@ def run():
     scan_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     scan_parser.add_argument('--no-reputation', action='store_true',
                              help='Measuring mode: ignore the known-hash reputation list')
+    scan_parser.add_argument('--auto-evolution', action='store_true',
+                             help='Propose YARA rules for unmatched threats (rules/proposed/, '
+                                  'not loaded until approved)')
+    rules_parser = subparsers.add_parser('rules', help='Review auto-generated (proposed) YARA rules')
+    rules_parser.add_argument('action', choices=['list-proposed', 'approve'])
+    rules_parser.add_argument('name', nargs='?', help='Rule name to approve')
+    rules_parser.add_argument('--rules-dir', default=paths.rules_dir(), help='Path to YARA rules directory')
     args = parser.parse_args()
     if not args.command:
         args.command = 'gui'
@@ -163,9 +170,26 @@ def run():
     if args.command == 'background':
         run_background()
         return
+    if args.command == 'rules':
+        from .auto_evolution import list_proposed, approve_rule
+        if args.action == 'list-proposed':
+            names = list_proposed(args.rules_dir)
+            print('\n'.join(names) if names else 'No proposed rules.')
+            return
+        if not args.name:
+            print('Error: give the rule name to approve.')
+            sys.exit(2)
+        try:
+            dest = approve_rule(args.rules_dir, args.name)
+        except ValueError as e:
+            print(f'Not approved: {e}')
+            sys.exit(1)
+        print(f'Approved {args.name} -> {dest} (restart the app to load it)')
+        return
     if args.command == 'scan':
         engine = Engine(args.rules_dir, paths.reputation_db(),
-                        use_reputation=not args.no_reputation)
+                        use_reputation=not args.no_reputation,
+                        auto_evolution=True if args.auto_evolution else None)
         target_path = os.path.abspath(args.target)
         if os.path.isfile(target_path):
             results = engine.scan_file(target_path)

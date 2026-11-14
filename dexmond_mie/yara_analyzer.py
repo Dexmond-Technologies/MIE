@@ -38,8 +38,15 @@ class YaraAnalyzer:
         if not os.path.exists(self.rules_dir):
             logger.warning(f'YARA rules directory not found: {self.rules_dir}')
             return
-        for root, _, files in os.walk(self.rules_dir):
+        for root, dirs, files in os.walk(self.rules_dir):
+            # rules/proposed/ holds unreviewed auto-generated rules (F1):
+            # never loaded
+            dirs[:] = [d for d in dirs if d != 'proposed']
             for file in files:
+                if root == self.rules_dir and file == 'auto_generated.yar':
+                    logger.warning('Not loading legacy unreviewed rules/auto_generated.yar; '
+                                   'move it to rules/proposed/ and approve rules one by one')
+                    continue
                 if file.endswith(('.yar', '.yara')):
                     full_path = os.path.join(root, file)
                     namespace = os.path.splitext(file)[0]

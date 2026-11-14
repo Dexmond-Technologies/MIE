@@ -6,6 +6,23 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger('DEXMOND_MIE')
 
+# F1: auto-generated rules are PROPOSALS. They go to rules/proposed/, which
+# the YARA loader never reads; a human approves a rule with
+# `main.py rules approve <name>`, which validates it and moves it into the
+# live file rules/auto_approved.yar. The feature is OFF by default
+# (Engine(auto_evolution=True) or DEXMOND_AUTO_EVOLUTION=1 turns it on).
+PROPOSED_DIR = 'proposed'
+PROPOSED_FILE = 'auto_generated.yar'
+APPROVED_FILE = 'auto_approved.yar'
+
+
+def proposed_path(rules_dir: str) -> str:
+    return os.path.join(rules_dir, PROPOSED_DIR, PROPOSED_FILE)
+
+
+def auto_evolution_enabled_by_env() -> bool:
+    return os.environ.get('DEXMOND_AUTO_EVOLUTION', '').strip() == '1'
+
 COMMON_STRINGS = {
     'kernel32.dll', 'user32.dll', 'advapi32.dll', 'ntdll.dll', 'shell32.dll',
     'ws2_32.dll', 'ole32.dll', 'oleaut32.dll', 'msvcrt.dll', 'gdi32.dll',
@@ -75,12 +92,13 @@ rule {rule_name} {{
         any of ($s*)
 }}
 """
-        target_rule_file = os.path.join(rules_dir, 'auto_generated.yar')
+        target_rule_file = proposed_path(rules_dir)
         try:
-            os.makedirs(rules_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(target_rule_file), exist_ok=True)
             with open(target_rule_file, 'a', encoding='utf-8') as f:
                 f.write(rule_body)
-            logger.info(f'Auto-Evolution Engine synthesized new YARA rule: {rule_name}')
+            logger.info(f'Auto-Evolution proposed YARA rule {rule_name} (NOT active until approved: '
+                        f'main.py rules approve {rule_name})')
             return rule_name
         except OSError as e:
             logger.error(f'Failed to save auto-generated YARA rule: {e}')
@@ -90,25 +108,22 @@ rule {rule_name} {{
 class AutoEvolutionEngine:
     '''Orchestrates self-learning and automatic adaptation across scans.'''
 
-    def __init__(self, rules_dir: str):
+    def __init__(self, rules_dir: str, enabled: bool = False):
         self.rules_dir = rules_dir
+        self.enabled = enabled
         self.auto_rules_count = 0
         self._count_auto_rules()
 
     def _count_auto_rules(self):
-        auto_file = os.path.join(self.rules_dir, 'auto_generated.yar')
-        if os.path.exists(auto_file):
-            try:
-                with open(auto_file, encoding='utf-8', errors='ignore') as f:
-                    self.auto_rules_count = f.read().count('rule auto_gen_')
-            except OSError:
-                self.auto_rules_count = 0
+        '''Counts PROPOSED rules (not active).'''
+        self.auto_rules_count = len(list_proposed(self.rules_dir))
 
-    def process_scan_result(self, file_path: str, results: Dict[str, Any], yara_engine) -> Optional[str]:
-        '''Evaluates scan results and triggers dynamic rule synthesis if needed.'''
+    def process_scan_result(self, file_path: str, results: Dict[str, Any], yara_engine=None) -> Optional[str]:
+        '''Proposes a rule for review. Never reloads or changes the live rules.'''
+        if not self.enabled:
+            return None
         rule_name = RuleSynthesizer.generate_yara_rule(file_path, results, self.rules_dir)
-        if rule_name and yara_engine:
-            yara_engine.reload_rules()
+        if rule_name:
             self._count_auto_rules()
         return rule_name
 
@@ -127,3 +142,61 @@ class AutoEvolutionEngine:
             label = f'user-restored ({filename})' if filename else 'user-restored'
             reputation_db.add_trusted(sha256, label)
             logger.info(f'Auto-Evolution: Learned trusted hash {sha256[:12]}...')
+
+
+def _split_rules(text: str) -> List[str]:
+    '''Splits a generated-rules file into rule blocks.'''
+    blocks, current = [], []
+    for line in text.splitlines(keepends=True):
+        if line.startswith('rule ') and current:
+            blocks.append(''.join(current))
+            current = []
+        if line.startswith('rule ') or current:
+            current.append(line)
+    if current:
+        blocks.append(''.join(current))
+    return blocks
+
+
+def _rule_name(block: str) -> str:
+    return block.split()[1] if len(block.split()) > 1 else ''
+
+
+def list_proposed(rules_dir: str) -> List[str]:
+    path = proposed_path(rules_dir)
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        return [_rule_name(b) for b in _split_rules(f.read())]
+
+
+def approve_rule(rules_dir: str, rule_name: str, compiler=None) -> str:
+    '''Human approval: validates the proposed rule on its own, appends it to
+    the live rules/auto_approved.yar and removes it from proposed/.
+    Raises ValueError if the rule is missing or does not compile.'''
+    path = proposed_path(rules_dir)
+    if not os.path.exists(path):
+        raise ValueError('no proposed rules')
+    with open(path, encoding='utf-8') as f:
+        blocks = _split_rules(f.read())
+    chosen = [b for b in blocks if _rule_name(b) == rule_name]
+    if not chosen:
+        raise ValueError(f'proposed rule not found: {rule_name}')
+    block = chosen[0]
+    if compiler is None:
+        try:
+            import yara
+        except ImportError:
+            raise ValueError('yara-python is not installed: cannot validate the rule, not approved')
+        compiler = lambda source: yara.compile(source=source)  # noqa: E731
+    try:
+        compiler(block)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f'rule does not compile, not approved: {e}')
+    with open(os.path.join(rules_dir, APPROVED_FILE), 'a', encoding='utf-8') as f:
+        f.write('\n' + block.strip() + '\n')
+    remaining = [b for b in blocks if _rule_name(b) != rule_name]
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(''.join(remaining))
+    logger.info(f'Approved auto-generated rule {rule_name} into {APPROVED_FILE}')
+    return os.path.join(rules_dir, APPROVED_FILE)
