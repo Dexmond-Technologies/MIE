@@ -587,7 +587,7 @@ async function refresh() {
     $('rules').textContent = ys === 'ON' ? s.rules_count
       : (ys === 'DEGRADED' ? s.rules_count + ' (DEGRADED)' : 'YARA-OFF');
     $('rules').style.color = ys === 'ON' ? '' : 'var(--danger)';
-    $('rules').title = (s.yara_errors || []).map((e) => e.file + ': ' + e.error).join('\n');
+    $('rules').title = (s.yara_errors || []).map((e) => e.file + ': ' + e.error).join(' | ');
     const rep = s.reputation || {malicious: 0, trusted: 0};
     $('repLine').textContent = rep.malicious + ' known-bad / ' + rep.trusted + ' trusted hashes';
     $('scans').textContent = s.scans;
