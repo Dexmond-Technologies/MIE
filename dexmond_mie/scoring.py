@@ -16,11 +16,17 @@ class Scorer:
         'packer_detected': 25,
         'pe_overlay': 15,
         'tls_callback': 20,
-        'anomaly': 10}
+        'anomaly': 10,
+        'reputation_malicious': 70}
 
     def __init__(self):
         self.score = 0
+        self.floor = 0
         self.findings: List[Dict] = []
+
+    def set_floor(self, floor: int):
+        '''Sets a minimum score (used for a malicious reputation hit).'''
+        self.floor = max(self.floor, floor)
 
     def add_finding(self, category: str, description: str, weight_override=None):
         '''Adds a finding and updates the score.'''
@@ -33,7 +39,7 @@ class Scorer:
 
     def get_score(self) -> int:
         '''Returns the final score, capped at 100.'''
-        return min(self.score, 100)
+        return min(max(self.score, self.floor), 100)
 
     def get_verdict(self) -> str:
         score = self.get_score()

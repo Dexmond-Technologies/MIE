@@ -21,20 +21,33 @@ MAX_ANALYSIS_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 200
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
+# Nested archives (a zip inside a zip) are opened up to this depth. The member
+# and byte limits above are a budget for the WHOLE scan, shared by all
+# nesting levels, so nesting cannot multiply the work.
+MAX_ARCHIVE_DEPTH = 3
+# Score floor applied for a malicious reputation hit (forces MALICIOUS)
+MALICIOUS_FLOOR = 70
 ARCHIVE_EXTENSIONS = ('.zip', '.jar', '.apk', '.tar', '.tar.gz', '.tgz', '.tar.bz2')
 
 
 class Engine:
     '''Orchestrates the malware inspection process.'''
 
-    def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json'):
+    def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json',
+                 use_reputation: bool = True):
         self.rules_dir = rules_dir
+        # use_reputation=False is the measuring mode (CLI --no-reputation):
+        # the known-hash list is not consulted, so detection by YARA and the
+        # heuristics can be measured on its own.
+        self.use_reputation = use_reputation
         self.yara_engine = YaraAnalyzer(rules_dir)
         self.reputation = ReputationDB(reputation_db)
         self.auto_evolution = AutoEvolutionEngine(rules_dir)
 
-    def scan_file(self, file_path: str, _depth: int = 0) -> Dict[str, Any]:
+    def scan_file(self, file_path: str, _depth: int = 0, _budget: Dict[str, int] = None) -> Dict[str, Any]:
         '''Scans a single file and returns results.'''
+        if _budget is None:
+            _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         start_time = time.time()
         logger.info(f'Scanning file: {file_path}')
         if not os.path.exists(file_path):
@@ -50,22 +63,23 @@ class Engine:
             'details': {}}
         scorer = Scorer()
 
-        # --- Reputation lookup (instant verdict for known hashes) ---
-        rep = self.reputation.lookup(results['hashes'].get('sha256', ''))
+        # --- Reputation lookup ---
+        # A malicious hit no longer returns early: the full pipeline still
+        # runs so YARA and the heuristics are recorded next to it, and the
+        # verdict is forced to MALICIOUS at the end (a floor that later caps
+        # cannot lower). A trusted hit (user-restored hash) still returns
+        # CLEAN at once.
+        rep_malicious = None
+        rep = self.reputation.lookup(results['hashes'].get('sha256', '')) if self.use_reputation else None
         if rep:
             results['details']['reputation'] = rep
             if rep['reputation'] == 'malicious':
-                scorer.add_finding('critical_yara',
-                                   f"Known malicious file (reputation: {rep['label']})")
-                results['findings'] = scorer.findings
-                results['score'] = scorer.get_score()
-                results['verdict'] = scorer.get_verdict()
-                results['scan_time'] = round(time.time() - start_time, 3)
+                rep_malicious = rep
                 logger.info(f"Reputation hit: MALICIOUS ({rep['label']})")
-                return results
-            if rep['reputation'] == 'trusted':
+            elif rep['reputation'] == 'trusted':
                 results['verdict'] = 'CLEAN'
                 results['findings'] = []
+                results['yara'] = []
                 results['scan_time'] = round(time.time() - start_time, 3)
                 logger.info(f"Reputation hit: TRUSTED ({rep['label']})")
                 return results
@@ -91,6 +105,7 @@ class Engine:
 
         # --- YARA ---
         yara_matches = self.yara_engine.scan(file_path)
+        results['yara'] = [m['rule'] for m in yara_matches]
         if yara_matches:
             results['details']['yara_matches'] = yara_matches
         for match in yara_matches:
@@ -145,8 +160,8 @@ class Engine:
                                f"Obfuscated script pattern detected: {', '.join(iocs['obfuscated_script'][:3])}")
 
         # --- Archive inspection (scan contents of zips/tars) ---
-        if _depth == 0 and self._is_archive(file_path):
-            archive = self._scan_archive(file_path)
+        if _depth < MAX_ARCHIVE_DEPTH and self._is_archive(file_path):
+            archive = self._scan_archive(file_path, _depth, _budget)
             if archive:
                 results['details']['archive'] = archive
                 worst = archive['worst_score']
@@ -156,6 +171,11 @@ class Engine:
                         f"Archive contains a threat: {archive['worst_member']} "
                         f"({archive['worst_verdict']}, score {worst})",
                         weight_override=worst)
+
+        if rep_malicious:
+            scorer.add_finding('reputation_malicious',
+                               f"Known malicious file (reputation: {rep_malicious['label']})")
+            scorer.set_floor(MALICIOUS_FLOOR)
 
         results['findings'] = scorer.findings
         results['score'] = scorer.get_score()
@@ -177,18 +197,26 @@ class Engine:
             return zipfile.is_zipfile(file_path) or tarfile.is_tarfile(file_path)
         return False
 
-    def _scan_archive(self, file_path: str) -> Dict[str, Any]:
+    def _scan_archive(self, file_path: str, _depth: int = 0, _budget: Dict[str, int] = None) -> Dict[str, Any]:
         '''Extracts archive members to a temp dir and scans each one.'''
-        summary = {'members_scanned': 0, 'threats': [], 'worst_score': 0,
+        summary = {'members_scanned': 0, 'threats': [], 'member_yara': [], 'worst_score': 0,
                    'worst_member': None, 'worst_verdict': 'CLEAN'}
         try:
             with tempfile.TemporaryDirectory(prefix='dexmond_arc_') as tmpdir:
-                members = self._extract_safely(file_path, tmpdir)
+                if _budget is None:
+                    _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
+                members = self._extract_safely(file_path, tmpdir, _budget)
                 for member_name, member_path in members:
-                    sub = self.scan_file(member_path, _depth=1)
+                    sub = self.scan_file(member_path, _depth=_depth + 1, _budget=_budget)
                     if 'error' in sub:
                         continue
                     summary['members_scanned'] += 1
+                    member_rules = list(sub.get('yara', []))
+                    for entry in sub.get('details', {}).get('archive', {}).get('member_yara', []):
+                        member_rules.extend(entry['rules'])
+                    if member_rules:
+                        summary['member_yara'].append({'member': member_name,
+                                                       'rules': sorted(set(member_rules))})
                     score = sub.get('score', 0)
                     if score >= 30:
                         summary['threats'].append({
@@ -205,11 +233,13 @@ class Engine:
         return summary
 
     @staticmethod
-    def _extract_safely(file_path: str, dest_dir: str):
-        '''Yields (name, extracted_path) for archive members, guarding against
-        path traversal, zip bombs, and excessive member counts.'''
+    def _extract_safely(file_path: str, dest_dir: str, budget: Dict[str, int] = None):
+        '''Returns (name, extracted_path) for archive members, guarding against
+        path traversal, zip bombs, and excessive member counts. The budget
+        (members, bytes) is shared with nested archives and is decremented.'''
+        if budget is None:
+            budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         extracted = []
-        total = 0
         dest_real = os.path.realpath(dest_dir)
 
         def _target(name):
@@ -218,35 +248,38 @@ class Engine:
                 return None  # path traversal attempt
             return out
 
+        def _take(size):
+            '''Reserves one member of `size` bytes from the budget.'''
+            if budget['members'] <= 0 or size > budget['bytes']:
+                return False
+            budget['members'] -= 1
+            budget['bytes'] -= size
+            return True
+
         if zipfile.is_zipfile(file_path):
             with zipfile.ZipFile(file_path) as zf:
                 for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
                     if info.is_dir() or info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
                         continue
-                    total += info.file_size
-                    if total > MAX_ARCHIVE_TOTAL_BYTES:
-                        break
                     out = _target(info.filename)
                     if not out:
                         continue
+                    if not _take(info.file_size):
+                        break
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     with zf.open(info) as src, open(out, 'wb') as dst:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((info.filename, out))
         elif tarfile.is_tarfile(file_path):
             with tarfile.open(file_path) as tf:
-                count = 0
                 for member in tf:
-                    if count >= MAX_ARCHIVE_MEMBERS:
-                        break
                     if not member.isfile() or member.size > MAX_ARCHIVE_MEMBER_BYTES:
                         continue
-                    total += member.size
-                    if total > MAX_ARCHIVE_TOTAL_BYTES:
-                        break
                     out = _target(member.name)
                     if not out:
                         continue
+                    if not _take(member.size):
+                        break
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     extracted_file = tf.extractfile(member)
                     if extracted_file is None:
@@ -254,5 +287,4 @@ class Engine:
                     with extracted_file as src, open(out, 'wb') as dst:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((member.name, out))
-                    count += 1
         return extracted

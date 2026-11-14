@@ -150,6 +150,8 @@ def run():
     scan_parser.add_argument('--rules-dir', default=paths.rules_dir(), help='Path to YARA rules directory')
     scan_parser.add_argument('--output', choices=['console', 'json'], default='console', help='Output format')
     scan_parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    scan_parser.add_argument('--no-reputation', action='store_true',
+                             help='Measuring mode: ignore the known-hash reputation list')
     args = parser.parse_args()
     if not args.command:
         args.command = 'gui'
@@ -162,7 +164,8 @@ def run():
         run_background()
         return
     if args.command == 'scan':
-        engine = Engine(args.rules_dir, paths.reputation_db())
+        engine = Engine(args.rules_dir, paths.reputation_db(),
+                        use_reputation=not args.no_reputation)
         target_path = os.path.abspath(args.target)
         if os.path.isfile(target_path):
             results = engine.scan_file(target_path)
