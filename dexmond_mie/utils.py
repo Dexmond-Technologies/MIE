@@ -1,4 +1,5 @@
 import bz2
+import tarfile
 import hashlib
 import lzma
 import re
@@ -25,7 +26,8 @@ COMPRESSED_MAGICS = (
     (0, b'\x89PNG\r\n\x1a\n', 'png'), (0, b'\xff\xd8\xff', 'jpeg'),
     (0, b'GIF87a', 'gif'), (0, b'GIF89a', 'gif'), (0, b'%PDF-', 'pdf'),
     (0, b'OggS', 'ogg'), (0, b'fLaC', 'flac'), (0, b'ID3', 'mp3'),
-    (4, b'ftyp', 'mp4'), (0, b'wOFF', 'woff'), (0, b'wOF2', 'woff2'))
+    (4, b'ftyp', 'mp4'), (0, b'wOFF', 'woff'), (0, b'wOF2', 'woff2'),
+    (257, b'ustar', 'tar'))
 
 
 def detect_compressed_format(data: bytes):
@@ -96,6 +98,8 @@ def validate_compressed_format(fmt: str, data: bytes, path: str = None) -> bool:
     try:
         if fmt == 'zip':
             return path is not None and zipfile.is_zipfile(path) and _zip_members_ok(path)
+        if fmt == 'tar':
+            return path is not None and _tar_ok(path)
         if fmt == 'gzip':
             return _gzip_ok(data)
         if fmt == 'bzip2':
@@ -111,6 +115,11 @@ def validate_compressed_format(fmt: str, data: bytes, path: str = None) -> bool:
     except Exception:
         return False
     return False
+
+
+def _tar_ok(path: str) -> bool:
+    with tarfile.open(path, 'r:') as tf:
+        return tf.next() is not None
 
 
 def _zip_members_ok(path: str) -> bool:

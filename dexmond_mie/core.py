@@ -160,7 +160,12 @@ class Engine:
             if compressed_format and not format_valid:
                 weight = UNVALIDATED_FORMAT_WEIGHT
                 note = f' (claims {compressed_format}, structure not valid)'
-            if entropy > 7.2:
+            if entropy > 7.2 and format_valid:
+                # recognised archive/compressed container: high entropy is its
+                # nature; archive members are scanned on their own (X5)
+                results['details']['entropy_note'] = (f'whole-file entropy not scored: '
+                                                      f'valid {compressed_format} container')
+            elif entropy > 7.2:
                 scorer.add_finding('high_entropy',
                                    f'File has very high overall entropy ({entropy:.2f}/8.00) - '
                                    f'likely packed or encrypted{note}', weight_override=weight)
