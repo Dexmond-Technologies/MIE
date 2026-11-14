@@ -247,14 +247,26 @@ def _pem_to_ders(pem: bytes):
 # Only the packages in requirements-signify.lock are used here (signify,
 # asn1crypto, certvalidator, oscrypto); `cryptography` is NOT a dependency.
 def _import_signify():
-    '''Imports the signify pieces used here; raises ImportError if absent.'''
-    from signify.authenticode import SignedPEFile          # noqa: F401
+    '''Imports the signify (0.9.x) pieces used here; raises ImportError if
+    absent. signify 0.9.3: signify.authenticode.AuthenticodeFile (base class,
+    from_stream() returns the concrete subclass), signify.x509.'''
+    from signify.authenticode import AuthenticodeFile
     try:
         from signify.x509 import Certificate, CertificateStore
     except ImportError:
         from signify.x509.certificates import Certificate
         from signify.x509.context import CertificateStore
-    return SignedPEFile, Certificate, CertificateStore
+    return AuthenticodeFile, Certificate, CertificateStore
+
+
+def primary_signature(data: bytes):
+    '''(authenticode_file, primary embedded signature) for a buffer. Only
+    EMBEDDED signatures (never catalogs), nested signatures excluded.'''
+    AuthenticodeFile, _, _ = _import_signify()
+    af = AuthenticodeFile.from_stream(io.BytesIO(data))
+    sigs = list(af.iter_signatures(signature_types='embedded', include_nested=False,
+                                   ignore_parse_errors=False))
+    return af, (sigs[0] if sigs else None)
 
 
 def _as_asn1(cert):
@@ -410,18 +422,20 @@ def _leaf_checks(leaf, signing_time):
 def _signify_verify(data, pem):
     '''Runs signify on the buffer. Returns (primary, leaf, signing_time) or
     a result dict on failure. TypeError (API mismatch) propagates.'''
-    SignedPEFile, Certificate, CertificateStore = _import_signify()
+    _, Certificate, CertificateStore = _import_signify()
     store = CertificateStore(list(Certificate.from_pems(pem)), trusted=True)
-    pe = SignedPEFile(io.BytesIO(data))
-    signed_datas = list(pe.signed_datas)
-    if not signed_datas:
-        return _result('invalid', detail='no Authenticode signature parsed')
-    primary = signed_datas[0]          # nested / extra signatures ignored
+    af, primary = primary_signature(data)
+    if primary is None:
+        return _result('invalid', detail='no embedded Authenticode signature parsed')
     try:
-        # digest (2), PKCS#7 (3), chain to the pinned store with EKU code
-        # signing (4), primary only (6); no fetching, so no revocation (7)
-        pe.verify(multi_verify_mode='first',
+        # digest (2), PKCS#7 (3), chain to the pinned store ONLY with EKU code
+        # signing (4), countersignature strict (5), primary embedded
+        # signature only (6); no fetching, so no revocation (7)
+        af.verify(multi_verify_mode='first',
+                  signature_types='embedded',
+                  ignore_parse_errors=False,
                   trusted_certificate_store=store,
+                  countersignature_mode='strict',
                   verification_context_kwargs={'allow_fetching': False,
                                                'extended_key_usages': ['code_signing'],
                                                'optional_eku': True})
@@ -431,7 +445,8 @@ def _signify_verify(data, pem):
         return _result('invalid', detail=f'signify: {type(e).__name__}: {e}')
     leaf = _leaf_certificate(primary)
     # (5) the countersignature time counts ONLY if the countersigner chains
-    # to OUR pinned store (strict); otherwise validity is checked at now
+    # to OUR pinned store (own check, on top of signify's strict mode);
+    # otherwise validity is checked at now
     signing_time = _signing_time(primary, pem)
     return primary, leaf, signing_time
 

@@ -27,6 +27,43 @@ from dexmond_mie import signature
 
 # ---------------------------------------------------------------- helpers
 
+
+def _throwaway_cert(cn, org=None, ca=False, code_signing=False):
+    '''A throwaway key + self-signed certificate made with asn1crypto and
+    oscrypto (both in requirements-signify.lock; no `cryptography`).'''
+    pytest.importorskip('asn1crypto')
+    pytest.importorskip('oscrypto')
+    import datetime as dt
+    from asn1crypto import x509 as ax509
+    from oscrypto import asymmetric
+    pub, priv = asymmetric.generate_pair('rsa', bit_size=2048)
+    attrs = {'common_name': cn}
+    if org:
+        attrs['organization_name'] = org
+    name = ax509.Name.build(attrs)
+    now = dt.datetime.now(dt.timezone.utc)
+    exts = [{'extn_id': 'basic_constraints', 'critical': True, 'extn_value': {'ca': ca}}]
+    if code_signing:
+        exts.append({'extn_id': 'extended_key_usage', 'critical': False,
+                     'extn_value': ['code_signing']})
+    tbs = ax509.TbsCertificate({
+        'version': 'v3', 'serial_number': int.from_bytes(os.urandom(8), 'big'),
+        'signature': {'algorithm': 'sha256_rsa'}, 'issuer': name, 'subject': name,
+        'validity': {'not_before': ax509.Time({'utc_time': now - dt.timedelta(days=1)}),
+                     'not_after': ax509.Time({'utc_time': now + dt.timedelta(days=30)})},
+        'subject_public_key_info': pub.asn1, 'extensions': exts})
+    cert = ax509.Certificate({'tbs_certificate': tbs,
+                              'signature_algorithm': {'algorithm': 'sha256_rsa'},
+                              'signature_value': asymmetric.rsa_pkcs1v15_sign(priv, tbs.dump(),
+                                                                             'sha256')})
+    return cert, asymmetric.dump_private_key(priv, None)
+
+
+def _pem(cert):
+    from asn1crypto import pem as apem
+    return apem.armor('CERTIFICATE', cert.dump())
+
+
 def _synthetic_pe(cert_table=None, trailing=b'', pe32_plus=False):
     '''Minimal PE header + body; optional certificate table at the end.'''
     hdr = bytearray(0x400)
@@ -236,28 +273,13 @@ def _strip_signature(data):
 
 def test_neg_self_signed_test_certificate(tmp_path):
     files, store, sha = _real_env()
-    pytest.importorskip('cryptography')     # test-only: makes the throwaway key
     tool = shutil.which('osslsigncode')
     if not tool:
         pytest.skip('osslsigncode not installed (needed to sign with a throwaway key)')
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-    import datetime as dt
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'Microsoft Corporation'),
-                      x509.NameAttribute(NameOID.COMMON_NAME, 'Microsoft Corporation')])
-    now = dt.datetime.now(dt.timezone.utc)
-    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
-            .public_key(key.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=30))
-            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]), False)
-            .sign(key, hashes.SHA256()))
-    (tmp_path / 'k.pem').write_bytes(key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption()))
-    (tmp_path / 'c.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    cert, key_pem = _throwaway_cert('Microsoft Corporation', 'Microsoft Corporation',
+                                    code_signing=True)
+    (tmp_path / 'k.pem').write_bytes(key_pem)
+    (tmp_path / 'c.pem').write_bytes(_pem(cert))
     unsigned = _write(tmp_path, _strip_signature(open(files[0], 'rb').read()), 'u.exe')
     out = str(tmp_path / 's.exe')
     subprocess.run([tool, 'sign', '-certs', str(tmp_path / 'c.pem'), '-key', str(tmp_path / 'k.pem'),
@@ -331,23 +353,10 @@ def test_parity_windows_vs_signify():
 def test_neg_pinned_store_really_used_not_os_or_bundle(tmp_path):
     '''A real Microsoft-signed file checked against a pinned store that holds
     ONLY a throwaway root must NOT be valid. Catches signify silently falling
-    back to its bundled or the OS trust store.'''
+    back to mscerts (its bundled store) or the OS trust store.'''
     files, _, _ = _real_env()
-    pytest.importorskip('cryptography')     # test-only: makes the throwaway root
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-    import datetime as dt
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'Throwaway Test Root')])
-    now = dt.datetime.now(dt.timezone.utc)
-    root = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
-            .public_key(key.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=1))
-            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
-            .sign(key, hashes.SHA256()))
-    pem = root.public_bytes(serialization.Encoding.PEM)
+    root, _ = _throwaway_cert('Throwaway Test Root', ca=True)
+    pem = _pem(root)
     store = tmp_path / 'only_throwaway.pem'
     store.write_bytes(pem)
     r = _verify(files[0], str(store), hashlib.sha256(pem).hexdigest())
@@ -389,19 +398,17 @@ def _chains_to(cert_asn1, pool_asn1, root_asn1, when, eku):
 def _ts_case(files):
     '''A file whose timestamp root differs from its signing root.'''
     from asn1crypto import pem as apem, x509 as ax509
-    from signify.authenticode import SignedPEFile
     roots = [ax509.Certificate.load(d) for _, _, d in
              apem.unarmor(open(signature.TRUST_STORE_PATH, 'rb').read(), multiple=True)]
     for path in files:
-        with open(path, 'rb') as f:
-            primary = list(SignedPEFile(f).signed_datas)[0]
-            cs = signature._countersignature(primary)
-            if cs is None or cs[1] is None:
-                continue
-            when, ts_cert, pool = cs
-            leaf = signature._leaf_certificate(primary)
-            pool_a = [signature._as_asn1(c) for c in pool]
-            ts_a = signature._as_asn1(ts_cert)
+        _, primary = signature.primary_signature(open(path, 'rb').read())
+        cs = signature._countersignature(primary) if primary is not None else None
+        if cs is None or cs[1] is None:
+            continue
+        when, ts_cert, pool = cs
+        leaf = signature._leaf_certificate(primary)
+        pool_a = [signature._as_asn1(c) for c in pool]
+        ts_a = signature._as_asn1(ts_cert)
         ts_root = [r for r in roots if _chains_to(ts_a, pool_a, r, when, 'time_stamping')]
         sig_root = [r for r in roots if _chains_to(leaf, pool_a, r, when, 'code_signing')]
         if ts_root and sig_root and ts_root[0].sha256 != sig_root[0].sha256:
