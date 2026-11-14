@@ -519,11 +519,20 @@ def test_publisher_name_is_cn_first():
     assert signature._publisher(_FakeCert(None, 'Org Only')) == 'Org Only'
 
 
-def test_shipped_policy_has_the_three_pcas_and_denials():
+SENTINEL_PINS = {  # reviewed 2026-11-14, recomputed independently from 319 certificates
+    '403d745163781e8bc32dcd578fc66040ce004feb501362a4fc789ccfe1599a97',  # PCA 2011
+    '50e824592caa59c7db9615d676738c7e4eee522622440c4c2152d0668d68c6d9',  # PCA 2024
+    '17139f06a3c117cef49a7ca60263017e1d667df819075c302969c41a2c77e506',  # PCA (legacy)
+    '02f3fac4ace37ae5feeee9a7efd688bf5413563e97fcfddc698d607525539138',  # PCA (legacy, 2nd key)
+    '0fb4ac795fcb2d074eb1997c5e91697c2fcaab336d2b2799ae807ddc6541be72',  # Windows Production PCA 2023
+}
+
+
+def test_shipped_policy_has_exactly_the_reviewed_pins_and_denials():
     pol = signature.load_policy()
-    assert [e['cn'] for e in pol['issuing_intermediates']] == [
-        'Microsoft Code Signing PCA 2010', 'Microsoft Code Signing PCA 2011',
-        'Microsoft Code Signing PCA 2024']
+    pins = {e['spki_sha256'] for e in pol['issuing_intermediates']}
+    assert pins == SENTINEL_PINS
+    assert all(e['spki_sha256'] for e in pol['issuing_intermediates'])
     assert 'Microsoft Windows Hardware Compatibility Publisher' in pol['rejected_leaf_cns']
     assert pol['publishers'] == ('Microsoft Corporation',)
 
