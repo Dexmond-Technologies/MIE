@@ -98,8 +98,10 @@ def test_pe_without_pefile_is_not_exempt(tmp_path, make_engine, monkeypatch):
     assert results['details']['pe_analysis'].startswith('unavailable')
 
 
-def _win_cert(body_len=1024, revision=0x0200, cert_type=0x0002, der=b'\x30\x82'):
-    body = der + bytes(range(256)) * (body_len // 256)
+def _win_cert(body_len=1024, revision=0x0200, cert_type=0x0002, der=b'\x30\x82',
+              der_len_delta=0):
+    content = bytes(range(256)) * (body_len // 256)
+    body = der + struct.pack('>H', len(content) + der_len_delta) + content
     length = 8 + len(body)
     blob = struct.pack('<IHH', length, revision, cert_type) + body
     return blob + b'\0' * ((-len(blob)) % 8)
@@ -112,15 +114,17 @@ def test_overlay_entropy_measured_without_valid_certificate(tmp_path, make_engin
     results = make_engine().scan_file(_pe_file(tmp_path, b'\0' * 1024))
     info = results['details']['pe_info']['overlay_entropy']
     assert results['details']['pe_info']['certificate']['valid']
-    assert info['certificate_excluded'] == len(cert)
-    assert info['size'] == 16 * 1024
+    der_span = 8 + 4 + 4096          # WIN_CERTIFICATE header + 30 82 LL LL + content
+    assert info['certificate_excluded'] == der_span   # zero alignment bytes stay in
+    assert info['size'] == 16 * 1024 + (len(cert) - der_span)
     assert 'overlay_high_entropy' in _cats(results)
     assert 'malformed_certificate_table' not in _cats(results)
 
 
 def test_malformed_certificate_is_not_excluded_and_flagged(tmp_path, make_engine, monkeypatch):
     for bad in (_win_cert(4096, revision=0x0100), _win_cert(4096, cert_type=0x0001),
-                _win_cert(4096, der=b'\xde\xad')):
+                _win_cert(4096, der=b'\xde\xad'), _win_cert(4096, der_len_delta=-512),
+                _win_cert(4096, der_len_delta=+8)):
         overlay = bad + os.urandom(16 * 1024)
         patch_engine_pe(monkeypatch, overlay_data=overlay, security=(0x2000, len(bad)))
         results = make_engine().scan_file(_pe_file(tmp_path, b'\0' * 1024))

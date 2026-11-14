@@ -292,16 +292,17 @@ class PEAnalyzer:
         '''Validates the Authenticode certificate table (WIN_CERTIFICATE
         entries) before any of it is excluded from entropy: dwLength in
         bounds, wRevision 0x0200, wCertificateType 0x0002 (PKCS#7 signed
-        data), body starting as a DER SEQUENCE (30 82). This checks the
+        data), body a DER SEQUENCE 30 82 LL LL whose length matches dwLength
+        (at most 7 zero alignment bytes after it). This checks the
         structure only; it does NOT verify the signature.'''
         entry = self._data_directory(DIR_SECURITY)
         if entry is None or not entry.Size:
-            return {'present': False, 'valid': False, 'parsed_size': 0, 'problems': []}
+            return {'present': False, 'valid': False, 'parsed_size': 0, 'spans': [], 'problems': []}
         data = self.pe.__data__
         flen = len(data)
         off, size = entry.VirtualAddress, entry.Size
         info = {'present': True, 'offset': off, 'declared_size': size, 'valid': False,
-                'parsed_size': 0, 'entries': 0, 'problems': []}
+                'parsed_size': 0, 'entries': 0, 'spans': [], 'problems': []}
         problems = info['problems']
         if off <= 0 or off >= flen:
             problems.append('certificate table offset outside the file')
@@ -312,7 +313,7 @@ class PEAnalyzer:
         pos = off
         while pos + 8 <= end:
             length, revision, cert_type = struct.unpack_from('<IHH', data, pos)
-            if length < 10 or pos + length > end:
+            if length < 12 or pos + length > end:
                 problems.append(f'bad dwLength {length} at offset {pos}')
                 break
             if revision != WIN_CERT_REVISION_2_0:
@@ -321,18 +322,32 @@ class PEAnalyzer:
             if cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA:
                 problems.append(f'wCertificateType 0x{cert_type:04x} is not PKCS#7 (0x0002)')
                 break
-            if bytes(data[pos + 8:pos + 10]) != b'\x30\x82':
-                problems.append('certificate body is not PKCS#7 DER')
+            body = bytes(data[pos + 8:pos + 12])
+            if body[:2] != b'\x30\x82':
+                problems.append('certificate body is not a PKCS#7 DER SEQUENCE (30 82 LL LL)')
+                break
+            der_span = 4 + int.from_bytes(body[2:4], 'big')
+            inner_pad = (length - 8) - der_span
+            if not 0 <= inner_pad <= 7:
+                problems.append(f'DER length {der_span} does not match dwLength {length}')
+                break
+            aligned = (length + 7) & ~7
+            pad = bytes(data[pos + 8 + der_span:min(pos + aligned, end)])
+            if pad.count(0) != len(pad):
+                problems.append('non-zero bytes after the DER certificate')
                 break
             info['entries'] += 1
-            pos += (length + 7) & ~7
-        if not problems and end - pos >= 8:
+            info['spans'].append((pos, pos + 8 + der_span))
+            pos += aligned
+        if not problems and end - pos > 0:
             problems.append(f'declared size is {end - pos} bytes larger than the certificates in it')
         if info['entries'] and not problems:
             info['valid'] = True
-            info['parsed_size'] = min(pos, end) - off
-        elif not info['entries'] and not problems:
-            problems.append('no certificate entries')
+            info['parsed_size'] = sum(b - a for a, b in info['spans'])
+        else:
+            info['spans'] = []
+            if not info['entries'] and not problems:
+                problems.append('no certificate entries')
         return info
 
     def get_overlay_entropy(self) -> Dict[str, Any]:
@@ -348,14 +363,16 @@ class PEAnalyzer:
         data = self.pe.__data__
         end = len(data)
         pieces = [(offset, end)]
-        # only a VALID certificate table is cut out, and only as far as its
-        # parsed entries reach (never the declared Size)
+        # only a VALID certificate table is cut out, and only the spans its
+        # DER lengths declare (never the declared table Size)
         cert = self.parse_certificate_table()
         if cert['valid'] and cert['offset'] >= offset:
-            c0 = cert['offset']
-            c1 = min(c0 + cert['parsed_size'], end)
-            pieces = [(offset, c0), (c1, end)]
-            info['certificate_excluded'] = c1 - c0
+            pieces, pos = [], offset
+            for c0, c1 in cert['spans']:
+                pieces.append((pos, c0))
+                pos = min(c1, end)
+                info['certificate_excluded'] += pos - c0
+            pieces.append((pos, end))
         blob = b''.join(bytes(data[a:b]) for a, b in pieces if b > a)[:MAX_OVERLAY_ENTROPY_BYTES]
         info['size'] = sum(max(0, b - a) for a, b in pieces)
         info['entropy'] = round(calculate_entropy(blob), 4) if blob else 0.0

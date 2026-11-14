@@ -40,6 +40,10 @@ REDUCED_ENTROPY_WEIGHT = 5
 MAX_TAR_PADDING = 1024 * 1024
 # Slack allowed after a zip member that uses a data descriptor
 ZIP_DESCRIPTOR_SLACK = 24
+# Bytes no member scan sees (zip extra fields + comments, tar pax/GNU
+# extended headers): more than this and the archive is not fully covered
+MAX_UNCOVERED_ZIP_BYTES = 4096
+MAX_UNCOVERED_TAR_HEADER_BYTES = 4096
 # Overlay (data past the last PE section, certificate cut out)
 OVERLAY_ENTROPY_MIN_BYTES = 4096
 # Archive scanning limits (guard against zip bombs)
@@ -418,56 +422,69 @@ class Engine:
     def _scan_archive(self, file_path: str, _depth: int = 0, _budget: Dict[str, int] = None) -> Dict[str, Any]:
         '''Extracts archive members to a temp dir and scans each one.
         summary['coverage'] says whether every member was unpacked and
-        scanned and the members cover the whole file.'''
+        scanned and the members cover the whole file. Any error (also an
+        unexpected one from a crafted archive) is recorded as a coverage
+        failure for that member; the rest of the scan carries on.'''
         summary = {'members_scanned': 0, 'threats': [], 'member_yara': [], 'worst_score': 0,
-                   'worst_member': None, 'worst_verdict': 'CLEAN'}
+                   'worst_member': None, 'worst_verdict': 'CLEAN',
+                   'coverage': {'complete': False, 'reasons': []}}
+        reasons = summary['coverage']['reasons']
+        if _budget is None:
+            _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         try:
-            with tempfile.TemporaryDirectory(prefix='dexmond_arc_') as tmpdir:
-                if _budget is None:
-                    _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
-                members, coverage = self._extract_safely(file_path, tmpdir, _budget)
-                for member_name, member_path in members:
+            tmp = tempfile.TemporaryDirectory(prefix='dexmond_arc_')
+        except OSError as e:
+            reasons.append(f'no temp dir: {e}')
+            return summary
+        with tmp as tmpdir:
+            members, coverage = self._extract_safely(file_path, tmpdir, _budget)
+            reasons.extend(coverage['reasons'])
+            for member_name, member_path in members:
+                try:
                     sub = self.scan_file(member_path, _depth=_depth + 1, _budget=_budget)
-                    if 'error' in sub:
-                        coverage['reasons'].append(f'member not scanned: {member_name}')
-                        continue
-                    sub_details = sub.get('details', {})
-                    if sub_details.get('archive_not_unpacked'):
-                        coverage['reasons'].append(f'nested archive not unpacked (depth): {member_name}')
-                    elif sub_details.get('archive') and not sub_details['archive'].get(
-                            'coverage', {}).get('complete'):
-                        coverage['reasons'].append(f'nested archive incomplete: {member_name}')
-                    summary['members_scanned'] += 1
-                    member_rules = list(sub.get('yara', []))
-                    for entry in sub_details.get('archive', {}).get('member_yara', []):
-                        member_rules.extend(entry['rules'])
-                    if member_rules:
-                        summary['member_yara'].append({'member': member_name,
-                                                       'rules': sorted(set(member_rules))})
-                    score = sub.get('score', 0)
-                    if score >= 30:
-                        summary['threats'].append({
-                            'name': member_name,
-                            'verdict': sub.get('verdict'),
-                            'score': score})
-                    if score > summary['worst_score']:
-                        summary['worst_score'] = score
-                        summary['worst_member'] = member_name
-                        summary['worst_verdict'] = sub.get('verdict', 'UNKNOWN')
-                coverage['complete'] = not coverage['reasons']
-                summary['coverage'] = coverage
-        except (OSError, EOFError, ValueError, zipfile.BadZipFile, tarfile.TarError) as e:
-            logger.warning(f'Archive scan failed for {file_path}: {e}')
-            return {}
+                except Exception as e:  # noqa: BLE001 - never lose the outer scan
+                    logger.warning(f'Member scan failed for {member_name} in {file_path}: {e}')
+                    reasons.append(f'member scan failed: {member_name} ({type(e).__name__})')
+                    continue
+                if 'error' in sub:
+                    reasons.append(f'member not scanned: {member_name}')
+                    continue
+                sub_details = sub.get('details', {})
+                if sub_details.get('archive_not_unpacked'):
+                    reasons.append(f'nested archive not unpacked (depth): {member_name}')
+                elif sub_details.get('archive') and not sub_details['archive'].get(
+                        'coverage', {}).get('complete'):
+                    reasons.append(f'nested archive incomplete: {member_name}')
+                summary['members_scanned'] += 1
+                member_rules = list(sub.get('yara', []))
+                for entry in sub_details.get('archive', {}).get('member_yara', []):
+                    member_rules.extend(entry['rules'])
+                if member_rules:
+                    summary['member_yara'].append({'member': member_name,
+                                                   'rules': sorted(set(member_rules))})
+                score = sub.get('score', 0)
+                if score >= 30:
+                    summary['threats'].append({
+                        'name': member_name,
+                        'verdict': sub.get('verdict'),
+                        'score': score})
+                if score > summary['worst_score']:
+                    summary['worst_score'] = score
+                    summary['worst_member'] = member_name
+                    summary['worst_verdict'] = sub.get('verdict', 'UNKNOWN')
+        summary['coverage']['complete'] = not reasons
         return summary
 
     @staticmethod
     def _zip_covers_file(file_path: str, zf: zipfile.ZipFile, infos) -> list:
         '''Returns reasons the zip members do NOT cover the file ([] = full
         coverage): local header at offset 0, members back to back up to the
-        central directory, end record at the very end of the file.'''
+        central directory, end record at the very end of the file, and at
+        most MAX_UNCOVERED_ZIP_BYTES of extra fields and comments (bytes no
+        member scan sees).'''
         reasons = []
         size = os.path.getsize(file_path)
+        uncovered = len(zf.comment or b'')
         with open(file_path, 'rb') as f:
             if f.read(4) != b'PK\x03\x04':
                 reasons.append('no local header at offset 0')
@@ -483,6 +500,7 @@ class Engine:
                     break
                 name_len = int.from_bytes(lh[26:28], 'little')
                 extra_len = int.from_bytes(lh[28:30], 'little')
+                uncovered += extra_len + len(info.extra or b'') + len(info.comment or b'')
                 pos = info.header_offset + 30 + name_len + extra_len + info.compress_size
                 slack = ZIP_DESCRIPTOR_SLACK if info.flag_bits & 0x08 else 0
             start_dir = getattr(zf, 'start_dir', None)
@@ -492,6 +510,8 @@ class Engine:
             f.seek(max(eocd, 0))
             if eocd < 0 or f.read(4) != b'PK\x05\x06':
                 reasons.append('data after the end-of-central-directory record')
+        if uncovered > MAX_UNCOVERED_ZIP_BYTES:
+            reasons.append(f'{uncovered} bytes of extra fields/comments not covered by members')
         return reasons
 
     @staticmethod
@@ -500,7 +520,8 @@ class Engine:
         guarding against path traversal, zip bombs, and excessive member
         counts. The budget (members, bytes) is shared with nested archives and
         is decremented. coverage['reasons'] lists every member that was NOT
-        extracted and any file data the members do not account for.'''
+        extracted and any file data the members do not account for. Errors,
+        expected or not, are recorded per member and never raised.'''
         if budget is None:
             budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         extracted = []
@@ -522,49 +543,87 @@ class Engine:
             budget['bytes'] -= size
             return True
 
-        if zipfile.is_zipfile(file_path):
-            with zipfile.ZipFile(file_path) as zf:
-                infos = zf.infolist()
+        try:
+            is_zip = zipfile.is_zipfile(file_path)
+        except Exception as e:  # noqa: BLE001
+            reasons.append(f'zip check failed ({type(e).__name__})')
+            is_zip = False
+        try:
+            if is_zip:
+                Engine._extract_zip(file_path, _target, _take, extracted, reasons)
+            elif tarfile.is_tarfile(file_path):
+                Engine._extract_tar(file_path, _target, _take, extracted, reasons)
+            else:
+                reasons.append('not a zip or tar archive')
+        except Exception as e:  # noqa: BLE001 - a crafted archive must not drop the scan
+            logger.warning(f'Archive extraction failed for {file_path}: {e}')
+            reasons.append(f'archive could not be read ({type(e).__name__}: {e})')
+        return extracted, coverage
+
+    @staticmethod
+    def _extract_zip(file_path, _target, _take, extracted, reasons):
+        with zipfile.ZipFile(file_path) as zf:
+            infos = zf.infolist()
+            try:
                 reasons.extend(Engine._zip_covers_file(file_path, zf, infos))
-                if len(infos) > MAX_ARCHIVE_MEMBERS:
-                    reasons.append(f'more than {MAX_ARCHIVE_MEMBERS} members')
-                for info in infos[:MAX_ARCHIVE_MEMBERS]:
-                    if info.is_dir():
-                        continue
-                    if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
-                        reasons.append(f'member over size limit: {info.filename}')
-                        continue
-                    out = _target(info.filename)
-                    if not out:
-                        reasons.append(f'unsafe member path: {info.filename}')
-                        continue
-                    if not _take(info.file_size):
-                        reasons.append('member/byte budget exhausted')
-                        break
+            except Exception as e:  # noqa: BLE001
+                reasons.append(f'zip coverage check failed ({type(e).__name__})')
+            if len(infos) > MAX_ARCHIVE_MEMBERS:
+                reasons.append(f'more than {MAX_ARCHIVE_MEMBERS} members')
+            for info in infos[:MAX_ARCHIVE_MEMBERS]:
+                if info.is_dir():
+                    continue
+                if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                    reasons.append(f'member over size limit: {info.filename}')
+                    continue
+                out = _target(info.filename)
+                if not out:
+                    reasons.append(f'unsafe member path: {info.filename}')
+                    continue
+                if not _take(info.file_size):
+                    reasons.append('member/byte budget exhausted')
+                    break
+                try:
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     with zf.open(info) as src, open(out, 'wb') as dst:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((info.filename, out))
-        elif tarfile.is_tarfile(file_path):
-            with tarfile.open(file_path) as tf:
-                stopped = False
-                for member in tf:
-                    if member.isdir():
-                        continue
-                    if not member.isfile():
-                        reasons.append(f'non-regular member: {member.name}')
-                        continue
-                    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
-                        reasons.append(f'member over size limit: {member.name}')
-                        continue
-                    out = _target(member.name)
-                    if not out:
-                        reasons.append(f'unsafe member path: {member.name}')
-                        continue
-                    if not _take(member.size):
-                        reasons.append('member/byte budget exhausted')
-                        stopped = True
-                        break
+                except Exception as e:  # noqa: BLE001
+                    reasons.append(f'member extraction failed: {info.filename} ({type(e).__name__})')
+
+    @staticmethod
+    def _extract_tar(file_path, _target, _take, extracted, reasons):
+        header_overhead = 0
+        with tarfile.open(file_path) as tf:
+            stopped = False
+            while True:
+                try:
+                    member = tf.next()
+                except Exception as e:  # noqa: BLE001
+                    reasons.append(f'tar header unreadable ({type(e).__name__})')
+                    stopped = True
+                    break
+                if member is None:
+                    break
+                # pax / GNU long-name headers before the member's own header
+                header_overhead += max(0, member.offset_data - member.offset - 512)
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    reasons.append(f'non-regular member: {member.name}')
+                    continue
+                if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                    reasons.append(f'member over size limit: {member.name}')
+                    continue
+                out = _target(member.name)
+                if not out:
+                    reasons.append(f'unsafe member path: {member.name}')
+                    continue
+                if not _take(member.size):
+                    reasons.append('member/byte budget exhausted')
+                    stopped = True
+                    break
+                try:
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     extracted_file = tf.extractfile(member)
                     if extracted_file is None:
@@ -573,19 +632,26 @@ class Engine:
                     with extracted_file as src, open(out, 'wb') as dst:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((member.name, out))
-                if not stopped:
-                    # members + end padding must account for the whole
-                    # (decompressed) stream: only zero bytes may follow
-                    try:
-                        tf.fileobj.seek(tf.offset)
-                        rest = tf.fileobj.read(MAX_TAR_PADDING + 1)
-                        if len(rest) > MAX_TAR_PADDING or rest.count(0) != len(rest):
-                            reasons.append('data after the last tar member')
-                    except (OSError, EOFError, ValueError) as e:
-                        reasons.append(f'tar end not readable: {e}')
-        else:
-            reasons.append('not a zip or tar archive')
-        return extracted, coverage
+                    # the block padding after the member's data must be zero
+                    pad = (-member.size) % 512
+                    if pad:
+                        tf.fileobj.seek(member.offset_data + member.size)
+                        if tf.fileobj.read(pad).count(0) != pad:
+                            reasons.append(f'non-zero padding after member {member.name}')
+                except Exception as e:  # noqa: BLE001
+                    reasons.append(f'member extraction failed: {member.name} ({type(e).__name__})')
+            if header_overhead > MAX_UNCOVERED_TAR_HEADER_BYTES:
+                reasons.append(f'{header_overhead} bytes of extended (pax/GNU) headers not covered')
+            if not stopped:
+                # members + end padding must account for the whole
+                # (decompressed) stream: only zero bytes may follow
+                try:
+                    tf.fileobj.seek(tf.offset)
+                    rest = tf.fileobj.read(MAX_TAR_PADDING + 1)
+                    if len(rest) > MAX_TAR_PADDING or rest.count(0) != len(rest):
+                        reasons.append('data after the last tar member')
+                except Exception as e:  # noqa: BLE001
+                    reasons.append(f'tar end not readable ({type(e).__name__})')
 
 
 def is_partial_scan(results: Dict[str, Any]) -> bool:
