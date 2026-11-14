@@ -9,6 +9,38 @@ logger = logging.getLogger('DEXMOND_MIE')
 
 CHUNK_SIZE = 1024 * 1024
 
+# Magic numbers of formats that are compressed (or hold compressed streams)
+# by design, so high entropy in them is expected and says nothing about
+# packing or encryption. (offset, magic, name)
+COMPRESSED_MAGICS = (
+    (0, b'PK\x03\x04', 'zip'), (0, b'PK\x05\x06', 'zip'), (0, b'PK\x07\x08', 'zip'),
+    (0, b'\x1f\x8b', 'gzip'), (0, b'BZh', 'bzip2'), (0, b'\xfd7zXZ\x00', 'xz'),
+    (0, b"7z\xbc\xaf\x27\x1c", '7z'), (0, b'Rar!\x1a\x07', 'rar'),
+    (0, b'\x28\xb5\x2f\xfd', 'zstd'), (0, b'MSCF', 'cab'), (0, b'\x5d\x00\x00', 'lzma'),
+    (0, b'\x89PNG\r\n\x1a\n', 'png'), (0, b'\xff\xd8\xff', 'jpeg'),
+    (0, b'GIF87a', 'gif'), (0, b'GIF89a', 'gif'), (0, b'%PDF-', 'pdf'),
+    (0, b'OggS', 'ogg'), (0, b'fLaC', 'flac'), (0, b'ID3', 'mp3'),
+    (4, b'ftyp', 'mp4'), (0, b'wOFF', 'woff'), (0, b'wOF2', 'woff2'))
+
+
+def detect_compressed_format(data: bytes):
+    '''Returns the name of a known compressed/archive format, or None.'''
+    if data[:4] == b'RIFF' and data[8:12] in (b'WEBP', b'AVI ', b'WAVE'):
+        return 'riff'
+    for offset, magic, name in COMPRESSED_MAGICS:
+        if data[offset:offset + len(magic)] == magic:
+            return name
+    return None
+
+
+def is_pe_data(data: bytes) -> bool:
+    '''True when data starts with an MZ header whose e_lfanew points to a PE
+    signature. Decided from the bytes, so it does not depend on pefile.'''
+    if len(data) < 0x40 or data[:2] != b'MZ':
+        return False
+    e_lfanew = int.from_bytes(data[0x3c:0x40], 'little')
+    return data[e_lfanew:e_lfanew + 4] == b'PE\x00\x00'
+
 
 def calculate_hashes(file_path: str) -> Dict[str, str]:
     '''Calculates MD5, SHA1, and SHA256 hashes of a file efficiently.'''

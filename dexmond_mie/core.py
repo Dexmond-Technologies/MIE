@@ -6,7 +6,8 @@ import tempfile
 import logging
 from typing import Dict, Any
 
-from .utils import calculate_hashes, calculate_entropy, calculate_sliding_window_entropy, StringExtractor
+from .utils import (calculate_hashes, calculate_entropy, calculate_sliding_window_entropy,
+                    detect_compressed_format, is_pe_data, StringExtractor)
 from .pe_analyzer import PEAnalyzer
 from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
@@ -23,6 +24,9 @@ MAX_ANALYSIS_BYTES = 32 * 1024 * 1024
 # says so (verdict SKIPPED_VERDICT, details.skipped).
 MAX_SCAN_BYTES = 256 * 1024 * 1024
 SKIPPED_VERDICT = 'SKIPPED (SIZE LIMIT)'
+# Non-PE files: the high-entropy-pocket finding needs more than this share of
+# 4 KiB windows above 7.2 bits (one icon or embedded blob is not enough)
+SLIDING_HIGH_SHARE = 0.25
 # Archive scanning limits (guard against zip bombs)
 MAX_ARCHIVE_MEMBERS = 200
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
@@ -120,16 +124,29 @@ class Engine:
             return {'error': str(e), 'path': file_path}
 
         # --- Entropy ---
+        # PE files: entropy is judged per section in the PE analysis (with
+        # .rsrc ignored; the Authenticode certificate table lies outside the
+        # sections), not over the whole file, where resources, icons and
+        # signatures raise it. Known compressed formats are skipped for the
+        # sliding-window check.
         entropy = calculate_entropy(data)
         sliding_entropy = calculate_sliding_window_entropy(data)
         results['details']['entropy'] = round(entropy, 4)
         results['details']['sliding_entropy'] = sliding_entropy
-        if entropy > 7.2:
-            scorer.add_finding('high_entropy',
-                               f'File has very high overall entropy ({entropy:.2f}/8.00) - likely packed or encrypted')
-        elif sliding_entropy['high_entropy_windows'] > 0:
-            scorer.add_finding('sliding_entropy_spike',
-                               f"Detected {sliding_entropy['high_entropy_windows']} high-entropy pocket(s) (peak {sliding_entropy['max']:.2f}/8.00)")
+        is_pe = is_pe_data(data)
+        compressed_format = detect_compressed_format(data)
+        if compressed_format:
+            results['details']['compressed_format'] = compressed_format
+        if not is_pe:
+            high_share = (sliding_entropy['high_entropy_windows'] / sliding_entropy['total_windows']
+                          if sliding_entropy['total_windows'] else 0)
+            if entropy > 7.2:
+                scorer.add_finding('high_entropy',
+                                   f'File has very high overall entropy ({entropy:.2f}/8.00) - likely packed or encrypted')
+            elif not compressed_format and high_share > SLIDING_HIGH_SHARE:
+                scorer.add_finding('sliding_entropy_spike',
+                                   f"{sliding_entropy['high_entropy_windows']} of {sliding_entropy['total_windows']} "
+                                   f"windows have high entropy (peak {sliding_entropy['max']:.2f}/8.00)")
 
         # --- YARA ---
         yara_matches = self.yara_engine.scan(file_path)

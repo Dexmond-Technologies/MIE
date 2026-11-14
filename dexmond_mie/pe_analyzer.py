@@ -220,7 +220,9 @@ class PEAnalyzer:
     def _check_anomalies(self) -> List[str]:
         warnings = []
         for section in self.pe.sections:
-            if section.get_entropy() > 7:
+            # .rsrc holds icons, images and compressed resources: high entropy
+            # there is normal and is not counted
+            if self._section_name(section).lower() != '.rsrc' and section.get_entropy() > 7:
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:

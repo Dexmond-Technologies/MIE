@@ -7,7 +7,7 @@ class Scorer:
         'yara_match': 20,
         'critical_yara': 70,
         'high_entropy': 15,
-        'sliding_entropy_spike': 20,
+        'sliding_entropy_spike': 10,
         'suspicious_import': 10,
         'api_chain': 35,
         'suspicious_string': 5,
