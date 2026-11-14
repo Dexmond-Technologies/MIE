@@ -1,4 +1,17 @@
 {
-  "_comment": "Publishers whose VALID Authenticode signature caps MIE heuristics at LOW (X12). Exact leaf subject O or CN. Extending this list is an owner decision.",
-  "publishers": ["Microsoft Corporation"]
+  "_comment": "X12 publisher policy. A VALID signature caps MIE heuristics at LOW only if the leaf CN AND O both equal a 'publishers' entry AND the issuing CA is an 'issuing_intermediates' entry matched by CN AND SPKI sha256. An entry with spki_sha256 null is not usable (no cap) until SENTINEL pins it (python -m dexmond_mie.signature spki FILE.exe prints the values). Changes are reviewed commits.",
+  "publishers": ["Microsoft Corporation"],
+  "issuing_intermediates": [
+    {"cn": "Microsoft Code Signing PCA 2010", "spki_sha256": null},
+    {"cn": "Microsoft Code Signing PCA 2011", "spki_sha256": null},
+    {"cn": "Microsoft Code Signing PCA 2024", "spki_sha256": null}
+  ],
+  "rejected_issuers": [
+    "Microsoft Windows Third Party Component CA 2012",
+    "Microsoft Windows Third Party Component CA 2013",
+    "Microsoft Windows Third Party Component CA 2014"
+  ],
+  "rejected_leaf_cns": [
+    "Microsoft Windows Hardware Compatibility Publisher"
+  ]
 }

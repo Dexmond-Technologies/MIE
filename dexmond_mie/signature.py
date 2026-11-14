@@ -30,9 +30,11 @@ timeout (2 s), missing dependency or unprovisioned / mismatching store
 gives 'unavailable', i.e. no cap (fails closed).
 '''
 import hashlib
+import io
 import json
 import logging
 import os
+import stat as stat_mod
 import struct
 import sys
 import threading
@@ -51,6 +53,9 @@ PUBLISHERS_CONFIG = os.path.join(_ROOT, 'config', 'trusted_publishers.json')
 PINNED_ROOTS_SHA256 = "59934744aa41b1432da5196f37e97bac269df7be62bb02d65b74d08d80b6d2c4"  # SENTINEL-provisioned 2026-11-14: Microsoft Root CA 2011, 2010, 2001 (see trust/README)
 DEFAULT_TRUSTED_PUBLISHERS = ('Microsoft Corporation',)
 MAX_SIGNATURE_BYTES = 1024 * 1024
+# Only files that fit in one analysed buffer are verified (TOCTOU: the exact
+# bytes scanned are the bytes verified). Same value as core.MAX_ANALYSIS_BYTES.
+MAX_VERIFY_BYTES = 32 * 1024 * 1024
 VERIFY_TIMEOUT_S = 2.0
 REVOCATION_NOTE = 'revocation not checked (offline)'
 WIN_CERT_REVISION_2_0 = 0x0200
@@ -70,55 +75,118 @@ def _result(status, publisher=None, detail='', **extra):
     return out
 
 
-def trusted_publishers(config_path: str = None):
-    '''Allowlist from config/trusted_publishers.json ({"publishers": [...]}).
-    Missing or unreadable file: Microsoft Corporation only.'''
+def load_policy(config_path: str = None) -> dict:
+    '''Publisher policy from config/trusted_publishers.json:
+      publishers            leaf CN AND O must both equal one entry
+      issuing_intermediates the leaf's issuing CA must be one of these,
+                            matched by subject CN AND SPKI sha256 (an entry
+                            whose spki_sha256 is null is not usable yet)
+      rejected_issuers / rejected_leaf_cns  explicit denials (WHCP and
+                            third-party component chains)
+    Missing or unreadable file: Microsoft Corporation, no usable
+    intermediates (so no cap).'''
     path = config_path or PUBLISHERS_CONFIG
     try:
         with open(path, encoding='utf-8') as f:
-            names = json.load(f).get('publishers', [])
-        names = tuple(n for n in names if isinstance(n, str) and n.strip())
-        return names or DEFAULT_TRUSTED_PUBLISHERS
-    except (OSError, ValueError, AttributeError):
-        return DEFAULT_TRUSTED_PUBLISHERS
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    pubs = tuple(n for n in cfg.get('publishers', []) if isinstance(n, str) and n.strip())
+    inters = []
+    for e in cfg.get('issuing_intermediates', []) or []:
+        if isinstance(e, dict) and isinstance(e.get('cn'), str):
+            spki = e.get('spki_sha256')
+            inters.append({'cn': e['cn'],
+                           'spki_sha256': spki.lower() if isinstance(spki, str) and spki else None})
+    return {
+        'publishers': pubs or DEFAULT_TRUSTED_PUBLISHERS,
+        'issuing_intermediates': inters,
+        'rejected_issuers': tuple(cfg.get('rejected_issuers', []) or ()),
+        'rejected_leaf_cns': tuple(cfg.get('rejected_leaf_cns', []) or ()),
+    }
+
+
+def trusted_publishers(config_path: str = None):
+    '''Allowlisted publisher names (leaf CN and O).'''
+    return load_policy(config_path)['publishers']
+
+
+# ---------------------------------------------------------------- TOCTOU
+def read_for_verify(path: str, limit: int = MAX_VERIFY_BYTES):
+    '''Opens the file ONCE (no symlink following, regular files only),
+    fstats it and reads it. Returns (data, stat_key). Raises ValueError if
+    the file is not a regular file or is bigger than `limit`.'''
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise ValueError('not a regular file')
+        if st.st_size > limit:
+            raise ValueError(f'file is {st.st_size} bytes, bigger than the analysed buffer')
+        with os.fdopen(os.dup(fd), 'rb') as f:
+            data = f.read(limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) != st.st_size:
+        raise ValueError('file changed while it was read')
+    return data, stat_key(st)
+
+
+def stat_key(st):
+    return (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+
+
+def _unchanged(path, key) -> bool:
+    try:
+        return stat_key(os.stat(path, follow_symlinks=False)) == key
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------- check 1
 def precheck_pe(path: str):
-    '''Pure-Python structural check (no dependency). Returns
-    ('ok', info) or (status, detail) with status unsigned / invalid.'''
-    size = os.path.getsize(path)
+    '''precheck_data() on a file read from disk (tests, tools).'''
     with open(path, 'rb') as f:
-        head = f.read(4096)
-        if len(head) < 0x40 or head[:2] != b'MZ':
-            return 'invalid', 'not a PE file'
-        e_lfanew = struct.unpack_from('<I', head, 0x3c)[0]
-        if e_lfanew + 24 + 2 > len(head) or head[e_lfanew:e_lfanew + 4] != b'PE\0\0':
-            return 'invalid', 'no PE signature'
-        opt = e_lfanew + 24
-        magic = struct.unpack_from('<H', head, opt)[0]
-        if magic == 0x10b:
-            nrva_off, dirs = opt + 92, opt + 96
-        elif magic == 0x20b:
-            nrva_off, dirs = opt + 108, opt + 112
-        else:
-            return 'invalid', f'unknown optional header magic 0x{magic:04x}'
-        if dirs + 5 * 8 > len(head):
-            return 'invalid', 'optional header truncated'
-        if struct.unpack_from('<I', head, nrva_off)[0] < 5:
-            return 'unsigned', 'no security data directory'
-        cert_off, cert_size = struct.unpack_from('<II', head, dirs + 4 * 8)
-        if cert_off == 0 or cert_size == 0:
-            return 'unsigned', 'no certificate table'
-        if cert_size > MAX_SIGNATURE_BYTES:
-            return 'invalid', f'certificate table {cert_size} bytes is over the 1 MiB limit'
-        if cert_off + cert_size > size:
-            return 'invalid', 'certificate table runs past the end of the file'
-        if cert_off + cert_size != size:
-            return 'invalid', (f'{size - cert_off - cert_size} bytes follow the certificate '
-                               f'table (data outside the signed digest)')
-        f.seek(cert_off)
-        table = f.read(cert_size)
+        return precheck_data(f.read(MAX_VERIFY_BYTES + 1))
+
+
+def precheck_data(data: bytes):
+    '''Pure-Python structural check (no dependency) on the exact bytes that
+    were scanned. Returns ('ok', info) or (status, detail) with status
+    unsigned / invalid.'''
+    size = len(data)
+    head = data[:4096]
+    if len(head) < 0x40 or head[:2] != b'MZ':
+        return 'invalid', 'not a PE file'
+    e_lfanew = struct.unpack_from('<I', head, 0x3c)[0]
+    if e_lfanew + 24 + 2 > len(head) or head[e_lfanew:e_lfanew + 4] != b'PE\0\0':
+        return 'invalid', 'no PE signature'
+    opt = e_lfanew + 24
+    magic = struct.unpack_from('<H', head, opt)[0]
+    if magic == 0x10b:
+        nrva_off, dirs = opt + 92, opt + 96
+    elif magic == 0x20b:
+        nrva_off, dirs = opt + 108, opt + 112
+    else:
+        return 'invalid', f'unknown optional header magic 0x{magic:04x}'
+    if dirs + 5 * 8 > len(head):
+        return 'invalid', 'optional header truncated'
+    if struct.unpack_from('<I', head, nrva_off)[0] < 5:
+        return 'unsigned', 'no security data directory'
+    cert_off, cert_size = struct.unpack_from('<II', head, dirs + 4 * 8)
+    if cert_off == 0 or cert_size == 0:
+        return 'unsigned', 'no certificate table'
+    if cert_size > MAX_SIGNATURE_BYTES:
+        return 'invalid', f'certificate table {cert_size} bytes is over the 1 MiB limit'
+    if cert_off + cert_size > size:
+        return 'invalid', 'certificate table runs past the end of the file'
+    if cert_off + cert_size != size:
+        return 'invalid', (f'{size - cert_off - cert_size} bytes follow the certificate '
+                           f'table (data outside the signed digest)')
+    table = data[cert_off:cert_off + cert_size]
     entries, pos = [], 0
     while pos + 8 <= len(table):
         length, revision, cert_type = struct.unpack_from('<IHH', table, pos)
@@ -127,6 +195,9 @@ def precheck_pe(path: str):
         if revision != WIN_CERT_REVISION_2_0 or cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA:
             return 'invalid', 'WIN_CERTIFICATE is not revision 2.0 PKCS#7 signed data'
         body = table[pos + 8:pos + length]
+        # Only 30 82 (two-byte DER length) is accepted, so a PKCS#7 blob over
+        # 64 KiB is refused (fail closed). This precheck runs on Windows too
+        # (before WinVerifyTrust), so Windows refuses them as well: parity.
         if body[:2] != b'\x30\x82':
             return 'invalid', 'PKCS#7 body is not a DER SEQUENCE (30 82 LL LL)'
         der_len = 4 + int.from_bytes(body[2:4], 'big')
@@ -146,8 +217,13 @@ def precheck_pe(path: str):
 
 
 # ---------------------------------------------------------------- check 4 (store)
-def load_pinned_store(store_path: str = None, pinned_sha256=PINNED_ROOTS_SHA256) -> bytes:
+_PINNED = object()   # "use the module's PINNED_ROOTS_SHA256 at call time"
+
+
+def load_pinned_store(store_path: str = None, pinned_sha256=_PINNED) -> bytes:
     '''Returns the PEM bytes of the pinned root store, or raises StoreError.'''
+    if pinned_sha256 is _PINNED:
+        pinned_sha256 = PINNED_ROOTS_SHA256
     if not pinned_sha256:
         raise StoreError('pinned Authenticode root store not provisioned (PINNED_ROOTS_SHA256 unset)')
     path = store_path or TRUST_STORE_PATH
@@ -162,7 +238,14 @@ def load_pinned_store(store_path: str = None, pinned_sha256=PINNED_ROOTS_SHA256)
     return pem
 
 
+def _pem_to_ders(pem: bytes):
+    from asn1crypto import pem as apem
+    return [der for _, _, der in apem.unarmor(pem, multiple=True)]
+
+
 # ---------------------------------------------------------------- checks 2-6
+# Only the packages in requirements-signify.lock are used here (signify,
+# asn1crypto, certvalidator, oscrypto); `cryptography` is NOT a dependency.
 def _import_signify():
     '''Imports the signify pieces used here; raises ImportError if absent.'''
     from signify.authenticode import SignedPEFile          # noqa: F401
@@ -174,61 +257,187 @@ def _import_signify():
     return SignedPEFile, Certificate, CertificateStore
 
 
+def _as_asn1(cert):
+    from asn1crypto import x509 as ax509
+    return ax509.Certificate.load(cert.to_der)
+
+
+def _find_cert(pool, issuer, serial):
+    for cert in pool:
+        if cert.serial_number == serial and cert.issuer == issuer:
+            return cert
+    return None
+
+
 def _leaf_certificate(signed_data):
-    '''The primary signer's leaf as a cryptography certificate.'''
-    from cryptography import x509
+    '''The primary signer's leaf certificate (asn1crypto).'''
     info = signed_data.signer_info
-    for cert in signed_data.certificates:
-        if cert.serial_number == info.serial_number and cert.issuer == info.issuer:
-            return x509.load_der_x509_certificate(cert.to_der)
-    raise ValueError('signer certificate not in the signature certificate set')
+    cert = _find_cert(signed_data.certificates, info.issuer, info.serial_number)
+    if cert is None:
+        raise ValueError('signer certificate not in the signature certificate set')
+    return _as_asn1(cert)
 
 
-def _signing_time(signed_data):
-    '''Countersignature (timestamp) time, None if the signature has none.
-    A countersignature whose time cannot be read raises (fails closed).'''
+def _countersignature(signed_data):
+    '''(time, signer certificate, certificate pool) of the countersignature,
+    or None if there is none. Authenticode (CounterSignerInfo) and RFC 3161
+    countersignatures are both handled.'''
     cs = getattr(signed_data.signer_info, 'countersigner', None)
     if cs is None:
         return None
-    t = getattr(cs, 'signing_time', None)
-    if t is None and getattr(cs, 'tst_info', None) is not None:
-        t = cs.tst_info.gen_time
+    pool = list(signed_data.certificates)
+    if getattr(cs, 'signer_info', None) is not None:          # RFC 3161 token
+        pool = list(getattr(cs, 'certificates', [])) + pool
+        info = cs.signer_info
+        t = cs.tst_info.gen_time if getattr(cs, 'tst_info', None) is not None else None
+    else:                                                     # Authenticode
+        info = cs
+        t = getattr(cs, 'signing_time', None)
     if t is None:
         raise ValueError('countersignature present but its time is unreadable')
-    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    cert = _find_cert(pool, info.issuer, info.serial_number)
+    return t, cert, pool
+
+
+def _countersigner_trusted(cert, pool, when, pem) -> bool:
+    '''True only if the countersigner's chain reaches a root in the PINNED
+    store (never signify's mscerts bundle), with EKU time stamping, at the
+    countersignature time. certvalidator, no fetching, no revocation.'''
+    if cert is None:
+        return False
+    from asn1crypto import x509 as ax509
+    from certvalidator import CertificateValidator, ValidationContext
+    roots = [ax509.Certificate.load(der) for der in _pem_to_ders(pem)]
+    others = [_as_asn1(c) for c in pool if c is not cert]
+    ctx = ValidationContext(trust_roots=roots, moment=when, allow_fetching=False,
+                            revocation_mode='soft-fail', weak_hash_algos={'md2', 'md5'})
+    try:
+        CertificateValidator(_as_asn1(cert), intermediate_certs=others,
+                             validation_context=ctx).validate_usage(
+            set(), extended_key_usage={'time_stamping'})
+        return True
+    except Exception:  # noqa: BLE001 - untrusted / invalid chain: ignore the timestamp
+        return False
+
+
+def _signing_time(signed_data, pem):
+    '''The countersignature time, used ONLY if the countersigner chains to
+    the pinned store; otherwise None, so validity is checked at "now".'''
+    cs = _countersignature(signed_data)
+    if cs is None:
+        return None
+    when, cert, pool = cs
+    return when if _countersigner_trusted(cert, pool, when, pem) else None
+
+
+def _name_field(cert, key):
+    value = cert.subject.native.get(key)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value or None
 
 
 def _publisher(leaf):
-    from cryptography.x509.oid import NameOID
-    for oid in (NameOID.ORGANIZATION_NAME, NameOID.COMMON_NAME):
-        attrs = leaf.subject.get_attributes_for_oid(oid)
-        if attrs:
-            return attrs[0].value
-    return None
+    '''Publisher name: subject CN first, then O (same field on every platform).'''
+    return _name_field(leaf, 'common_name') or _name_field(leaf, 'organization_name')
+
+
+def _spki_sha256(cert) -> str:
+    return hashlib.sha256(cert['tbs_certificate']['subject_public_key_info'].dump()).hexdigest()
+
+
+def _issuing_ca(leaf, pool, pem, when):
+    '''The CA that really issued the leaf, from a path that certvalidator
+    builds and verifies cryptographically to the PINNED roots (independent
+    of signify's store handling). Returns the asn1crypto certificate.'''
+    from asn1crypto import x509 as ax509
+    from certvalidator import CertificateValidator, ValidationContext
+    roots = [ax509.Certificate.load(der) for der in _pem_to_ders(pem)]
+    ctx = ValidationContext(trust_roots=roots, moment=when, allow_fetching=False,
+                            revocation_mode='soft-fail', weak_hash_algos={'md2', 'md5'})
+    path = CertificateValidator(leaf, intermediate_certs=[_as_asn1(c) for c in pool],
+                                validation_context=ctx).validate_usage(
+        set(), extended_key_usage={'code_signing'})
+    chain = list(path)                      # root ... leaf
+    if len(chain) < 2:
+        raise ValueError('leaf is directly a root')
+    return chain[-2]
+
+
+def publisher_decision(leaf, issuer, policy) -> tuple:
+    '''(allowed, reason). Allowed only if: leaf CN and O both equal an
+    allowlisted publisher; the issuing CA is an allowlisted intermediate by
+    CN AND SPKI sha256; neither the issuer nor the leaf is on a deny list.'''
+    cn, org = _name_field(leaf, 'common_name'), _name_field(leaf, 'organization_name')
+    issuer_cn = _name_field(issuer, 'common_name')
+    if cn in policy['rejected_leaf_cns'] or issuer_cn in policy['rejected_issuers']:
+        return False, f'rejected chain (leaf {cn!r}, issuer {issuer_cn!r})'
+    if cn not in policy['publishers'] or org not in policy['publishers']:
+        return False, f'publisher not allowlisted (CN {cn!r}, O {org!r})'
+    spki = _spki_sha256(issuer)
+    for entry in policy['issuing_intermediates']:
+        if entry['cn'] == issuer_cn:
+            if not entry['spki_sha256']:
+                return False, f'issuing CA {issuer_cn!r} SPKI not pinned yet'
+            if entry['spki_sha256'] == spki:
+                return True, f'issuer {issuer_cn} (SPKI {spki[:16]}...)'
+            return False, f'issuing CA {issuer_cn!r} SPKI mismatch ({spki[:16]}...)'
+    return False, f'issuing CA {issuer_cn!r} not an allowlisted intermediate'
+
+
+def _validity(leaf):
+    v = leaf['tbs_certificate']['validity']
+    return v['not_before'].native, v['not_after'].native
 
 
 def _leaf_checks(leaf, signing_time):
     '''Our own checks on top of signify: leaf EKU code signing, and the
-    leaf valid at the timestamp (or now).'''
-    from cryptography import x509
-    from cryptography.x509.oid import ExtendedKeyUsageOID
-    try:
-        eku = leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
-    except x509.ExtensionNotFound:
+    leaf valid at the trusted timestamp (or now).'''
+    eku = leaf.extended_key_usage_value
+    if eku is None:
         return 'signer certificate has no EKU (code signing required)'
-    if ExtendedKeyUsageOID.CODE_SIGNING not in eku:
+    if 'code_signing' not in eku.native:
         return 'signer certificate EKU does not allow code signing'
     when = signing_time or datetime.now(timezone.utc)
-    nb = getattr(leaf, 'not_valid_before_utc', None) or leaf.not_valid_before.replace(tzinfo=timezone.utc)
-    na = getattr(leaf, 'not_valid_after_utc', None) or leaf.not_valid_after.replace(tzinfo=timezone.utc)
+    nb, na = _validity(leaf)
     if not nb <= when <= na:
         src = 'timestamp' if signing_time else 'now'
         return f'signer certificate not valid at {src} ({when.isoformat()})'
     return None
 
 
-def _verify_portable_inner(path, store_path, pinned_sha256, publishers):
-    status, info = precheck_pe(path)
+def _signify_verify(data, pem):
+    '''Runs signify on the buffer. Returns (primary, leaf, signing_time) or
+    a result dict on failure. TypeError (API mismatch) propagates.'''
+    SignedPEFile, Certificate, CertificateStore = _import_signify()
+    store = CertificateStore(list(Certificate.from_pems(pem)), trusted=True)
+    pe = SignedPEFile(io.BytesIO(data))
+    signed_datas = list(pe.signed_datas)
+    if not signed_datas:
+        return _result('invalid', detail='no Authenticode signature parsed')
+    primary = signed_datas[0]          # nested / extra signatures ignored
+    try:
+        # digest (2), PKCS#7 (3), chain to the pinned store with EKU code
+        # signing (4), primary only (6); no fetching, so no revocation (7)
+        pe.verify(multi_verify_mode='first',
+                  trusted_certificate_store=store,
+                  verification_context_kwargs={'allow_fetching': False,
+                                               'extended_key_usages': ['code_signing'],
+                                               'optional_eku': True})
+    except TypeError:
+        raise
+    except Exception as e:  # noqa: BLE001 - signify's verification errors
+        return _result('invalid', detail=f'signify: {type(e).__name__}: {e}')
+    leaf = _leaf_certificate(primary)
+    # (5) the countersignature time counts ONLY if the countersigner chains
+    # to OUR pinned store (strict); otherwise validity is checked at now
+    signing_time = _signing_time(primary, pem)
+    return primary, leaf, signing_time
+
+
+def _verify_portable_inner(data, store_path, pinned_sha256, policy):
+    status, info = precheck_data(data)
     if status != 'ok':
         return _result(status, detail=info)
     try:
@@ -236,51 +445,48 @@ def _verify_portable_inner(path, store_path, pinned_sha256, publishers):
     except StoreError as e:
         return _result('unavailable', detail=str(e))
     try:
-        SignedPEFile, Certificate, CertificateStore = _import_signify()
+        _import_signify()
     except ImportError as e:
         return _result('unavailable', detail=f'signify not installed: {e}')
-    store = CertificateStore(list(Certificate.from_pems(pem)), trusted=True)
-    with open(path, 'rb') as f:
-        pe = SignedPEFile(f)
-        signed_datas = list(pe.signed_datas)
-        if not signed_datas:
-            return _result('invalid', detail='no Authenticode signature parsed')
-        primary = signed_datas[0]          # nested / extra signatures ignored
-        try:
-            # digest (2), PKCS#7 (3), chain to the pinned store with EKU code
-            # signing (4), countersignature time (5), primary only (6); no
-            # fetching, so no revocation (7)
-            pe.verify(multi_verify_mode='first',
-                      trusted_certificate_store=store,
-                      verification_context_kwargs={'allow_fetching': False,
-                                                   'extended_key_usages': ['code_signing'],
-                                                   'optional_eku': True})
-        except TypeError:
-            raise                          # API mismatch: unavailable, never valid
-        except Exception as e:  # noqa: BLE001 - signify's verification errors
-            return _result('invalid', detail=f'signify: {type(e).__name__}: {e}')
-        leaf = _leaf_certificate(primary)
-        signing_time = _signing_time(primary)
+    out = _signify_verify(data, pem)
+    if isinstance(out, dict):
+        return out
+    primary, leaf, signing_time = out
     problem = _leaf_checks(leaf, signing_time)
     if problem:
         return _result('invalid', detail=problem)
-    publisher = _publisher(leaf)
-    allowed = publisher in tuple(publishers if publishers is not None else trusted_publishers())
-    return _result('valid', publisher=publisher,
-                   detail=f'signify OK (primary signature, pinned store)',
+    when = signing_time or datetime.now(timezone.utc)
+    issuer = _issuing_ca(leaf, list(primary.certificates), pem, when)
+    allowed, reason = publisher_decision(leaf, issuer, policy)
+    return _result('valid', publisher=_publisher(leaf),
+                   detail=f'signify OK (primary signature, pinned store); {reason}',
                    publisher_allowed=allowed,
+                   issuer=_name_field(issuer, 'common_name'),
+                   issuer_spki_sha256=_spki_sha256(issuer),
                    timestamp=signing_time.isoformat() if signing_time else None)
 
 
-def verify_portable(path: str, store_path: str = None, pinned_sha256=PINNED_ROOTS_SHA256,
-                    publishers=None, timeout: float = VERIFY_TIMEOUT_S):
+def verify_portable(path: str, store_path: str = None, pinned_sha256=_PINNED,
+                    publishers=None, timeout: float = VERIFY_TIMEOUT_S,
+                    data: bytes = None, scanned_stat=None, policy=None):
     '''Linux/macOS verifier (also used for the Windows parity test).
-    Any exception or a timeout gives 'unavailable'.'''
+    data/scanned_stat: the exact buffer the engine scanned and its fstat key;
+    if absent the file is read once here. Any exception, a timeout, a file
+    bigger than the buffer or a file changed since the scan: 'unavailable'.'''
+    policy = dict(policy or load_policy())
+    if publishers is not None:
+        policy['publishers'] = tuple(publishers)
     box = {}
 
     def run():
         try:
-            box['r'] = _verify_portable_inner(path, store_path, pinned_sha256, publishers)
+            buf, key = data, scanned_stat
+            if buf is None:
+                buf, key = read_for_verify(path)
+            r = _verify_portable_inner(buf, store_path, pinned_sha256, policy)
+            if key is not None and not _unchanged(path, key):
+                r = _result('unavailable', detail='file changed between scan and verification')
+            box['r'] = r
         except Exception as e:  # noqa: BLE001 - fail closed
             box['r'] = _result('unavailable', detail=f'verification error: {type(e).__name__}: {e}')
     worker = threading.Thread(target=run, daemon=True)
@@ -291,31 +497,74 @@ def verify_portable(path: str, store_path: str = None, pinned_sha256=PINNED_ROOT
     return box.get('r') or _result('unavailable', detail='no result')
 
 
-def verify_authenticode(path: str, publishers=None):
+def verify_authenticode(path: str, publishers=None, data: bytes = None, scanned_stat=None):
     '''Returns {'status': 'valid'|'invalid'|'unsigned'|'unavailable',
-    'publisher', 'publisher_allowed', 'detail', ...}.'''
-    pubs = tuple(publishers if publishers is not None else trusted_publishers())
+    'publisher', 'publisher_allowed', 'detail', 'revocation', ...}.
+    data/scanned_stat: the buffer the engine scanned and its fstat key, so
+    the verified bytes are the scanned bytes (TOCTOU).'''
+    policy = load_policy()
+    if publishers is not None:
+        policy['publishers'] = tuple(publishers)
     if sys.platform != 'win32':
-        return verify_portable(path, publishers=pubs)
-    # Same structural precheck as the portable path: stock WinVerifyTrust
-    # accepts data appended after the certificate table (CVE-2013-3900
-    # class) unless EnableCertPaddingCheck is set, so the platforms would
-    # not be at parity without it.
+        return verify_portable(path, data=data, scanned_stat=scanned_stat, policy=policy)
     try:
-        status, info = precheck_pe(path)
-    except Exception as e:  # noqa: BLE001 - fail closed
-        return _result('unavailable', detail=f'precheck error: {type(e).__name__}: {e}')
-    if status != 'ok':
-        return _result(status, detail=info)
-    try:
+        if data is None:
+            data, scanned_stat = read_for_verify(path)
+        # Same structural precheck as the portable path: stock WinVerifyTrust
+        # accepts data appended after the certificate table (CVE-2013-3900
+        # class) unless EnableCertPaddingCheck is set, and the 30 82 rule
+        # refuses PKCS#7 blobs over 64 KiB, the same as on Linux.
+        status, info = precheck_data(data)
+        if status != 'ok':
+            return _result(status, detail=info)
         result = _verify_windows(path)
+        if scanned_stat is not None and not _unchanged(path, scanned_stat):
+            return _result('unavailable', detail='file changed between scan and verification')
     except Exception as e:  # noqa: BLE001 - any failure means "not verified"
         logger.error(f'Signature verification failed for {path}: {e}')
         return _result('unavailable', detail=f'verification error: {e}')
     if result['status'] == 'valid':
-        result['publisher_allowed'] = result.get('publisher') in pubs
+        # publisher identity: the same issuer-intermediate check as Linux,
+        # on the same buffer; without signify it cannot be done -> no cap
+        result['publisher_allowed'] = False
+        try:
+            pem = load_pinned_store()
+            out = _signify_verify(data, pem)
+            if isinstance(out, dict):
+                result['detail'] += f"; issuer check: {out['detail']}"
+            else:
+                primary, leaf, signing_time = out
+                when = signing_time or datetime.now(timezone.utc)
+                issuer = _issuing_ca(leaf, list(primary.certificates), pem, when)
+                allowed, reason = publisher_decision(leaf, issuer, policy)
+                result['publisher'] = _publisher(leaf)        # CN first, as on Linux
+                result['publisher_allowed'] = allowed
+                result['detail'] += f'; {reason}'
+        except Exception as e:  # noqa: BLE001
+            result['detail'] += f'; issuer check unavailable ({type(e).__name__}: {e})'
     result['os_cert_padding_check'] = _cert_padding_check_enabled()
     return result
+
+
+def spki_report(paths):
+    '''Tool for SENTINEL: prints the issuing CA (CN + SPKI sha256) of each
+    signed file, to fill config/trusted_publishers.json after review.'''
+    pem = load_pinned_store()
+    for path in paths:
+        try:
+            data, _ = read_for_verify(path)
+            out = _signify_verify(data, pem)
+            if isinstance(out, dict):
+                print(f'{path}: {out["status"]} {out["detail"]}')
+                continue
+            primary, leaf, signing_time = out
+            issuer = _issuing_ca(leaf, list(primary.certificates), pem,
+                                 signing_time or datetime.now(timezone.utc))
+            print(f'{path}\tleaf CN={_name_field(leaf, "common_name")!r} '
+                  f'O={_name_field(leaf, "organization_name")!r}\tissuer CN='
+                  f'{_name_field(issuer, "common_name")!r}\tSPKI sha256={_spki_sha256(issuer)}')
+        except Exception as e:  # noqa: BLE001
+            print(f'{path}: error {type(e).__name__}: {e}')
 
 
 def _cert_padding_check_enabled():
@@ -422,3 +671,10 @@ def _verify_windows(path: str):  # pragma: no cover - Windows only, NOT RUN on L
     finally:
         data.dwStateAction = WTD_STATEACTION_CLOSE
         wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
+
+
+if __name__ == '__main__':   # python -m dexmond_mie.signature spki FILE...
+    if len(sys.argv) > 2 and sys.argv[1] == 'spki':
+        spki_report(sys.argv[2:])
+    else:
+        print('usage: python -m dexmond_mie.signature spki FILE.exe [...]')

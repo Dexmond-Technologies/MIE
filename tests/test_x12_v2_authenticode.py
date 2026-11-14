@@ -92,11 +92,20 @@ def test_signature_over_1mib_is_invalid(tmp_path):
                                            f'bytes is over the 1 MiB limit')
 
 
-def test_structurally_ok_but_store_not_provisioned_is_unavailable(tmp_path):
+def test_structurally_ok_but_store_not_provisioned_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(signature, 'PINNED_ROOTS_SHA256', None)
     path = _write(tmp_path, _synthetic_pe(_win_cert(), pe32_plus=True))
     assert signature.precheck_pe(path)[0] == 'ok'
     r = signature.verify_portable(path)
     assert r['status'] == 'unavailable' and 'not provisioned' in r['detail']
+
+
+def test_empty_store_file_is_unavailable(tmp_path):
+    store = tmp_path / 'empty.pem'
+    store.write_bytes(b'')
+    path = _write(tmp_path, _synthetic_pe(_win_cert()))
+    r = signature.verify_portable(path, store_path=str(store), pinned_sha256='00' * 32)
+    assert r['status'] == 'unavailable'
 
 
 def test_wrong_pinned_store_sha_is_unavailable(tmp_path):
@@ -142,17 +151,16 @@ def test_every_result_states_revocation_not_checked(tmp_path):
 
 
 def test_shipped_store_matches_pin():
-    if not signature.PINNED_ROOTS_SHA256:
-        pytest.skip('pinned root store NOT PROVISIONED (needs SENTINEL review)')
+    assert signature.PINNED_ROOTS_SHA256, 'pinned root store must be provisioned'
     with open(signature.TRUST_STORE_PATH, 'rb') as f:
         assert hashlib.sha256(f.read()).hexdigest() == signature.PINNED_ROOTS_SHA256
+    assert signature.load_pinned_store()          # loads with the shipped pin
 
 
 # ------------------------------------------------ real binaries (tiny / Windows VM)
 
 def _real_env():
     pytest.importorskip('signify')
-    pytest.importorskip('cryptography')
     folder = os.environ.get('MIE_SYSINTERNALS_DIR')
     store = os.environ.get('MIE_TEST_TRUST_STORE')
     if not folder or not store:
@@ -181,7 +189,17 @@ def test_positive_10_sysinternals_valid_microsoft():
     for path in files:
         r = _verify(path, store, sha)
         assert r['status'] == 'valid', (path, r)
-        assert r['publisher'] == 'Microsoft Corporation' and r['publisher_allowed'] is True
+        assert r['publisher'] == 'Microsoft Corporation'
+        assert r['issuer'] and r['issuer_spki_sha256']
+
+
+def test_positive_cap_allowed_when_intermediates_pinned():
+    files, store, sha = _real_env()
+    policy = signature.load_policy()
+    if not any(e['spki_sha256'] for e in policy['issuing_intermediates']):
+        pytest.skip('issuing-intermediate SPKIs NOT PINNED yet (SENTINEL review)')
+    allowed = [_verify(p, store, sha)['publisher_allowed'] for p in files]
+    assert all(allowed), allowed
 
 
 def test_neg_flipped_byte_in_signed_area(tmp_path):
@@ -218,6 +236,7 @@ def _strip_signature(data):
 
 def test_neg_self_signed_test_certificate(tmp_path):
     files, store, sha = _real_env()
+    pytest.importorskip('cryptography')     # test-only: makes the throwaway key
     tool = shutil.which('osslsigncode')
     if not tool:
         pytest.skip('osslsigncode not installed (needed to sign with a throwaway key)')
@@ -262,10 +281,8 @@ def test_neg_timestamp_outside_leaf_validity(monkeypatch):
         captured['leaf'] = real_leaf(sd)
         return captured['leaf']
 
-    def late(sd):
-        lf = captured['leaf']
-        na = getattr(lf, 'not_valid_after_utc', None) or lf.not_valid_after
-        return na + timedelta(days=1)
+    def late(sd, pem):
+        return signature._validity(captured['leaf'])[1] + timedelta(days=1)
     monkeypatch.setattr(signature, '_leaf_certificate', leaf)
     monkeypatch.setattr(signature, '_signing_time', late)
     r = _verify(files[0], store, sha)
@@ -316,6 +333,7 @@ def test_neg_pinned_store_really_used_not_os_or_bundle(tmp_path):
     ONLY a throwaway root must NOT be valid. Catches signify silently falling
     back to its bundled or the OS trust store.'''
     files, _, _ = _real_env()
+    pytest.importorskip('cryptography')     # test-only: makes the throwaway root
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -348,5 +366,234 @@ def test_windows_path_runs_precheck_appended_data_is_invalid(tmp_path, monkeypat
     clean = _write(tmp_path, _synthetic_pe(_win_cert()), 'b.exe')
     r = signature.verify_authenticode(clean)
     assert r['status'] == 'valid' and r['os_cert_padding_check'] is False
+    assert r['publisher_allowed'] is False      # issuer check could not run: no cap
     assert signature.verify_authenticode(_write(tmp_path, _synthetic_pe(None), 'c.exe'))[
         'status'] == 'unsigned'
+
+
+# ------------------------------------------------ T-TS (SENTINEL must-test)
+
+def _chains_to(cert_asn1, pool_asn1, root_asn1, when, eku):
+    '''Independent of signature.py: does cert chain to this one root?'''
+    from certvalidator import CertificateValidator, ValidationContext
+    ctx = ValidationContext(trust_roots=[root_asn1], moment=when, allow_fetching=False,
+                            revocation_mode='soft-fail', weak_hash_algos={'md2', 'md5'})
+    try:
+        CertificateValidator(cert_asn1, intermediate_certs=pool_asn1,
+                             validation_context=ctx).validate_usage(set(), extended_key_usage={eku})
+        return True
+    except Exception:
+        return False
+
+
+def _ts_case(files):
+    '''A file whose timestamp root differs from its signing root.'''
+    from asn1crypto import pem as apem, x509 as ax509
+    from signify.authenticode import SignedPEFile
+    roots = [ax509.Certificate.load(d) for _, _, d in
+             apem.unarmor(open(signature.TRUST_STORE_PATH, 'rb').read(), multiple=True)]
+    for path in files:
+        with open(path, 'rb') as f:
+            primary = list(SignedPEFile(f).signed_datas)[0]
+            cs = signature._countersignature(primary)
+            if cs is None or cs[1] is None:
+                continue
+            when, ts_cert, pool = cs
+            leaf = signature._leaf_certificate(primary)
+            pool_a = [signature._as_asn1(c) for c in pool]
+            ts_a = signature._as_asn1(ts_cert)
+        ts_root = [r for r in roots if _chains_to(ts_a, pool_a, r, when, 'time_stamping')]
+        sig_root = [r for r in roots if _chains_to(leaf, pool_a, r, when, 'code_signing')]
+        if ts_root and sig_root and ts_root[0].sha256 != sig_root[0].sha256:
+            return path, leaf, sig_root[0], ts_root[0]
+    pytest.skip('no sample whose timestamp root differs from its signing root')
+
+
+def _store(tmp_path, certs, name):
+    from asn1crypto import pem as apem
+    pem = b''.join(apem.armor('CERTIFICATE', c.dump()) for c in certs)
+    p = tmp_path / name
+    p.write_bytes(pem)
+    return str(p), hashlib.sha256(pem).hexdigest()
+
+
+def test_ts_countersigner_outside_store_is_ignored(tmp_path):
+    '''T-TS (outside): the timestamp root is NOT in the pinned store, so the
+    timestamp is ignored and the leaf is judged at "now".'''
+    files, _, _ = _real_env()
+    path, leaf, sig_root, _ = _ts_case(files)
+    store, sha = _store(tmp_path, [sig_root], 'sign_root_only.pem')
+    r = _verify(path, store, sha)
+    assert r.get('timestamp') is None, r
+    from datetime import datetime, timezone
+    nb, na = signature._validity(leaf)
+    if not nb <= datetime.now(timezone.utc) <= na:
+        assert r['status'] != 'valid', r      # expired now, timestamp not trusted
+
+
+def test_ts_countersigner_inside_store_is_used(tmp_path):
+    '''T-TS (inside): with the timestamp root in the pinned store, the
+    timestamp is used.'''
+    files, _, _ = _real_env()
+    path, _, sig_root, ts_root = _ts_case(files)
+    store, sha = _store(tmp_path, [sig_root, ts_root], 'sign_and_ts_roots.pem')
+    r = _verify(path, store, sha)
+    assert r['status'] == 'valid' and r.get('timestamp'), r
+
+
+# ------------------------------------------------ publisher identity (issuer pin)
+
+class _FakeSPKI:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def dump(self):
+        return self.raw
+
+
+class _FakeCert:
+    '''asn1crypto-shaped stand-in (PASS UNDER MOCK).'''
+    def __init__(self, cn=None, org=None, spki=b'key'):
+        self.subject = type('S', (), {'native': {k: v for k, v in
+                                                 (('common_name', cn), ('organization_name', org)) if v}})()
+        self._tbs = {'subject_public_key_info': _FakeSPKI(spki)}
+
+    def __getitem__(self, key):
+        return self._tbs
+
+
+def _policy(spki=None):
+    pol = signature.load_policy()
+    pol['issuing_intermediates'] = [
+        {'cn': 'Microsoft Code Signing PCA 2011',
+         'spki_sha256': hashlib.sha256(spki).hexdigest() if spki else None}]
+    return pol
+
+
+MS_LEAF = _FakeCert('Microsoft Corporation', 'Microsoft Corporation')
+PCA2011 = _FakeCert('Microsoft Code Signing PCA 2011', 'Microsoft Corporation', b'pca-2011-key')
+
+
+def test_issuer_pinned_by_cn_and_spki_is_allowed():
+    assert signature.publisher_decision(MS_LEAF, PCA2011, _policy(b'pca-2011-key'))[0] is True
+
+
+def test_issuer_spki_mismatch_or_not_pinned_is_not_allowed():
+    assert signature.publisher_decision(MS_LEAF, PCA2011, _policy(b'other-key'))[0] is False
+    allowed, reason = signature.publisher_decision(MS_LEAF, PCA2011, _policy(None))
+    assert allowed is False and 'not pinned' in reason
+
+
+def test_whcp_and_third_party_component_chains_rejected():
+    pol = _policy(b'pca-2011-key')
+    whcp = _FakeCert('Microsoft Windows Hardware Compatibility Publisher', 'Microsoft Corporation')
+    assert signature.publisher_decision(whcp, PCA2011, pol)[0] is False
+    tpc = _FakeCert('Microsoft Windows Third Party Component CA 2014', 'Microsoft Corporation',
+                    b'pca-2011-key')
+    assert signature.publisher_decision(MS_LEAF, tpc, pol)[0] is False
+
+
+def test_leaf_cn_and_o_must_both_match():
+    pol = _policy(b'pca-2011-key')
+    for leaf in (_FakeCert('Contoso Ltd', 'Microsoft Corporation'),
+                 _FakeCert('Microsoft Corporation', 'Contoso Ltd'),
+                 _FakeCert('Microsoft Corporation', None)):
+        assert signature.publisher_decision(leaf, PCA2011, pol)[0] is False
+
+
+def test_unlisted_issuer_not_allowed():
+    other = _FakeCert('Some Other CA', 'Microsoft Corporation', b'pca-2011-key')
+    assert signature.publisher_decision(MS_LEAF, other, _policy(b'pca-2011-key'))[0] is False
+
+
+def test_publisher_name_is_cn_first():
+    assert signature._publisher(_FakeCert('Microsoft Corporation', 'Something Else')) == \
+        'Microsoft Corporation'
+    assert signature._publisher(_FakeCert(None, 'Org Only')) == 'Org Only'
+
+
+def test_shipped_policy_has_the_three_pcas_and_denials():
+    pol = signature.load_policy()
+    assert [e['cn'] for e in pol['issuing_intermediates']] == [
+        'Microsoft Code Signing PCA 2010', 'Microsoft Code Signing PCA 2011',
+        'Microsoft Code Signing PCA 2024']
+    assert 'Microsoft Windows Hardware Compatibility Publisher' in pol['rejected_leaf_cns']
+    assert pol['publishers'] == ('Microsoft Corporation',)
+
+
+# ------------------------------------------------ timestamp strict mode
+
+def test_timestamp_used_only_if_countersigner_chains_to_pinned_store(monkeypatch):
+    from datetime import datetime, timezone
+    t = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(signature, '_countersignature', lambda sd: (t, object(), []))
+    monkeypatch.setattr(signature, '_countersigner_trusted', lambda *a: False)
+    assert signature._signing_time(None, b'pem') is None          # ignored -> "now"
+    monkeypatch.setattr(signature, '_countersigner_trusted', lambda *a: True)
+    assert signature._signing_time(None, b'pem') == t
+    monkeypatch.setattr(signature, '_countersignature', lambda sd: None)
+    assert signature._signing_time(None, b'pem') is None
+
+
+# ------------------------------------------------ TOCTOU
+
+def test_verified_bytes_are_the_scanned_buffer(tmp_path):
+    '''The on-disk file is clean; the scanned buffer has data appended: the
+    verifier judges the buffer, so the result is invalid.'''
+    path = _write(tmp_path, _synthetic_pe(_win_cert()))
+    buf, key = signature.read_for_verify(path)
+    r = signature.verify_portable(path, data=buf + b'\0' * 1024, scanned_stat=key)
+    assert r['status'] == 'invalid'
+
+
+def test_file_changed_after_scan_is_unavailable(tmp_path):
+    path = _write(tmp_path, _synthetic_pe(_win_cert()))
+    buf, key = signature.read_for_verify(path)
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    r = signature.verify_portable(path, data=buf, scanned_stat=key)
+    assert r['status'] == 'unavailable' and 'changed' in r['detail']
+
+
+def test_read_for_verify_refuses_symlink_nonregular_and_oversize(tmp_path):
+    real = _write(tmp_path, _synthetic_pe(_win_cert()))
+    link = tmp_path / 'link.exe'
+    os.symlink(real, link)
+    with pytest.raises(OSError):
+        signature.read_for_verify(str(link))
+    with pytest.raises((ValueError, OSError)):
+        signature.read_for_verify(str(tmp_path))
+    with pytest.raises(ValueError):
+        signature.read_for_verify(real, limit=100)
+    assert signature.verify_portable(str(link))['status'] == 'unavailable'
+
+
+def test_engine_no_signature_check_when_file_bigger_than_buffer(tmp_path, make_engine,
+                                                              monkeypatch):
+    from fakepe import FakeSection, patch_engine_pe
+    from dexmond_mie import core
+    patch_engine_pe(monkeypatch, sections=[FakeSection('.text', 6.0, 'RX')])
+    monkeypatch.setattr(core, 'MAX_ANALYSIS_BYTES', 1024)
+    called = []
+    engine = make_engine(signature_verifier=lambda *a, **k: called.append(1) or
+                         {'status': 'valid', 'publisher': 'Microsoft Corporation',
+                          'publisher_allowed': True})
+    path = _write(tmp_path, _synthetic_pe(_win_cert()))
+    results = engine.scan_file(path)
+    assert not called
+    assert results['details']['signature']['status'] == 'unavailable'
+    assert 'heuristics_capped_at' not in results['details']['signature']
+
+
+def test_engine_passes_scanned_buffer_to_verifier(tmp_path, make_engine, monkeypatch):
+    from fakepe import FakeSection, patch_engine_pe
+    patch_engine_pe(monkeypatch, sections=[FakeSection('.text', 6.0, 'RX')])
+    seen = {}
+
+    def verifier(path, data=None, scanned_stat=None):
+        seen['data'], seen['stat'] = data, scanned_stat
+        return {'status': 'unsigned', 'publisher': None}
+    path = _write(tmp_path, _synthetic_pe(_win_cert()))
+    make_engine(signature_verifier=verifier).scan_file(path)
+    assert seen['data'] == open(path, 'rb').read()
+    assert seen['stat'][0] == os.path.getsize(path)

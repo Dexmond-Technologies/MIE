@@ -36,7 +36,7 @@ def _pe_file(tmp_path):
 
 def _scan(tmp_path, make_engine, monkeypatch, sig, yara=(INJECTION_YARA,)):
     patch_engine_pe(monkeypatch, **SYSINTERNALS_LIKE)
-    engine = make_engine(signature_verifier=lambda path: dict(sig),
+    engine = make_engine(signature_verifier=lambda path, **kw: dict(sig),
                          trusted_publishers=('Microsoft Corporation',))
     monkeypatch.setattr(engine.yara_engine, 'scan', lambda path: [dict(m) for m in yara])
     return engine.scan_file(_pe_file(tmp_path))
@@ -44,7 +44,8 @@ def _scan(tmp_path, make_engine, monkeypatch, sig, yara=(INJECTION_YARA,)):
 
 def test_valid_trusted_signature_caps_at_low(tmp_path, make_engine, monkeypatch):
     results = _scan(tmp_path, make_engine, monkeypatch,
-                    {'status': 'valid', 'publisher': 'Microsoft Corporation'})
+                    {'status': 'valid', 'publisher': 'Microsoft Corporation',
+                     'publisher_allowed': True})
     assert results['score'] <= 29
     assert results['details']['signature']['heuristics_capped_at'] == 29
 
@@ -53,7 +54,8 @@ def test_valid_trusted_signature_caps_at_low(tmp_path, make_engine, monkeypatch)
     {'status': 'unavailable', 'publisher': None},
     {'status': 'unsigned', 'publisher': None},
     {'status': 'invalid', 'publisher': 'Microsoft Corporation'},
-    {'status': 'valid', 'publisher': 'Some Other Vendor Ltd'},
+    {'status': 'valid', 'publisher': 'Some Other Vendor Ltd', 'publisher_allowed': True},
+    {'status': 'valid', 'publisher': 'Microsoft Corporation'},   # no publisher_allowed: no cap
 ])
 def test_no_cap_without_valid_trusted_signature(tmp_path, make_engine, monkeypatch, sig):
     results = _scan(tmp_path, make_engine, monkeypatch, sig)
@@ -63,7 +65,8 @@ def test_no_cap_without_valid_trusted_signature(tmp_path, make_engine, monkeypat
 
 def test_critical_yara_not_capped_by_signature(tmp_path, make_engine, monkeypatch):
     results = _scan(tmp_path, make_engine, monkeypatch,
-                    {'status': 'valid', 'publisher': 'Microsoft Corporation'},
+                    {'status': 'valid', 'publisher': 'Microsoft Corporation',
+                     'publisher_allowed': True},
                     yara=(INJECTION_YARA, CRITICAL_YARA))
     assert results['verdict'] == 'MALICIOUS'
 

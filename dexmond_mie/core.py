@@ -134,6 +134,9 @@ class Engine:
             with open(file_path, 'rb') as f:
                 # read only what exists: read(n) allocates n bytes up front
                 data = f.read(min(results['size'] + 1, MAX_ANALYSIS_BYTES))
+                # fstat of the same descriptor: the signature check verifies
+                # exactly these bytes and refuses if the file changed (TOCTOU)
+                scanned_stat = signature.stat_key(os.fstat(f.fileno()))
         except OSError as e:
             logger.error(f'Failed to read {file_path}: {e}')
             return {'error': str(e), 'path': file_path}
@@ -248,11 +251,16 @@ class Engine:
 
         # --- Authenticode signature (X12) ---
         if pe_parsed:
-            sig = self.signature_verifier(file_path)
+            if len(data) == results['size'] and scanned_stat[0] == len(data):
+                sig = self.signature_verifier(file_path, data=data, scanned_stat=scanned_stat)
+            else:
+                sig = {'status': 'unavailable', 'publisher': None,
+                       'detail': 'file is bigger than the analysed buffer; signature not checked',
+                       'revocation': 'not checked (offline)'}
             results['details']['signature'] = sig
             # cap only for a VALID signature from an allowlisted publisher;
             # a valid signature from anyone else stays valid, without a cap
-            if (sig.get('status') == 'valid' and sig.get('publisher_allowed', True)
+            if (sig.get('status') == 'valid' and sig.get('publisher_allowed') is True
                     and sig.get('publisher') in self.trusted_publishers):
                 scorer.cap_heuristics()
                 results['details']['signature']['heuristics_capped_at'] = Scorer.SIGNED_CAP
