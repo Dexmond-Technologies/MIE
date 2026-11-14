@@ -250,7 +250,10 @@ class Engine:
         if pe_parsed:
             sig = self.signature_verifier(file_path)
             results['details']['signature'] = sig
-            if sig.get('status') == 'valid' and sig.get('publisher') in self.trusted_publishers:
+            # cap only for a VALID signature from an allowlisted publisher;
+            # a valid signature from anyone else stays valid, without a cap
+            if (sig.get('status') == 'valid' and sig.get('publisher_allowed', True)
+                    and sig.get('publisher') in self.trusted_publishers):
                 scorer.cap_heuristics()
                 results['details']['signature']['heuristics_capped_at'] = Scorer.SIGNED_CAP
 

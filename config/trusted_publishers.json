@@ -1,0 +1,4 @@
+{
+  "_comment": "Publishers whose VALID Authenticode signature caps MIE heuristics at LOW (X12). Exact leaf subject O or CN. Extending this list is an owner decision.",
+  "publishers": ["Microsoft Corporation"]
+}

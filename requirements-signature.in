@@ -1,0 +1,12 @@
+# X12 v2: pure-Python Authenticode verifier for Linux/macOS (Windows uses
+# WinVerifyTrust). signify: MIT licence. Its dependencies (asn1crypto,
+# oscrypto / cryptography, depending on the version) are MIT / BSD / Apache-2.0
+# - confirm against the resolved lock before release.
+#
+# The exact pins WITH HASHES must be generated on a machine with network
+# access and reviewed (not done on the build laptop, which is offline):
+#   pip-compile --generate-hashes requirements-signature.in -o requirements-signature.lock
+#   pip install --require-hashes -r requirements-signature.lock
+# Until then the verifier reports 'unavailable' (no cap) wherever signify
+# is missing.
+signify

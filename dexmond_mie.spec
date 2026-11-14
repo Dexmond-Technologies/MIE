@@ -8,6 +8,7 @@
 # The one-folder build is recommended for a security tool: it starts faster and
 # is easier for antivirus/SmartScreen to inspect than a single-file build.
 
+import os
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 # uvicorn and watchdog load parts of themselves dynamically, so PyInstaller
@@ -24,8 +25,12 @@ hiddenimports = (
 datas = [
     ('rules', 'rules'),
     ('data/reputation.json', 'data'),
+    ('config/trusted_publishers.json', 'config'),
 ]
 datas += collect_data_files('yara')
+# X12 v2 pinned Authenticode root store, once SENTINEL has provisioned it
+if os.path.isfile(os.path.join('trust', 'authenticode_roots.pem')):
+    datas.append(('trust/authenticode_roots.pem', 'trust'))
 
 block_cipher = None
 

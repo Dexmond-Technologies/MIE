@@ -69,14 +69,22 @@ def test_critical_yara_not_capped_by_signature(tmp_path, make_engine, monkeypatc
 
 
 @pytest.mark.skipif(sys.platform == 'win32', reason='checks the non-Windows path')
-def test_non_windows_reports_unavailable(tmp_path):
+def test_non_windows_never_valid_for_junk(tmp_path):
     p = tmp_path / 'x.exe'
     p.write_bytes(b'MZ')
-    assert signature.verify_authenticode(str(p))['status'] == 'unavailable'
+    assert signature.verify_authenticode(str(p))['status'] != 'valid'
 
 
-def test_trusted_publishers_configurable(monkeypatch):
-    monkeypatch.setenv('DEXMOND_TRUSTED_PUBLISHERS', 'A Corp; B Ltd')
-    assert signature.trusted_publishers() == ('A Corp', 'B Ltd')
-    monkeypatch.delenv('DEXMOND_TRUSTED_PUBLISHERS')
-    assert signature.trusted_publishers() == ('Microsoft Corporation',)
+def test_trusted_publishers_from_config(tmp_path):
+    cfg = tmp_path / 'trusted_publishers.json'
+    cfg.write_text('{"publishers": ["A Corp", "B Ltd"]}')
+    assert signature.trusted_publishers(str(cfg)) == ('A Corp', 'B Ltd')
+    assert signature.trusted_publishers(str(tmp_path / 'missing.json')) == ('Microsoft Corporation',)
+    assert signature.trusted_publishers() == ('Microsoft Corporation',)   # shipped config
+
+
+def test_valid_but_not_allowlisted_gets_no_cap(tmp_path, make_engine, monkeypatch):
+    results = _scan(tmp_path, make_engine, monkeypatch,
+                    {'status': 'valid', 'publisher': 'Microsoft Corporation',
+                     'publisher_allowed': False})
+    assert results['score'] >= 30
