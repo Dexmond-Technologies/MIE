@@ -19,7 +19,9 @@ class Scorer:
         'tls_callback': 20,
         'anomaly': 10,
         'reputation_malicious': 70,
-        'oversize_partial_scan': 5}
+        'oversize_partial_scan': 5,
+        'malformed_pe': 10,
+        'overlay_high_entropy': 5}
 
     def __init__(self):
         self.score = 0

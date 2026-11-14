@@ -1,5 +1,10 @@
+import bz2
 import hashlib
+import lzma
 import re
+import struct
+import zipfile
+import zlib
 import logging
 import math
 from collections import Counter
@@ -31,6 +36,87 @@ def detect_compressed_format(data: bytes):
         if data[offset:offset + len(magic)] == magic:
             return name
     return None
+
+
+_VALIDATE_BYTES = 64 * 1024
+
+
+def _gzip_ok(data: bytes) -> bool:
+    if len(data) < 18 or data[2] != 8 or data[3] & 0xE0:
+        return False
+    try:
+        out = zlib.decompressobj(31).decompress(data[:_VALIDATE_BYTES], 4096)
+        return len(out) > 0 or len(data) < 64
+    except zlib.error:
+        return False
+
+
+def _png_ok(data: bytes) -> bool:
+    # IHDR must be the first chunk, 13 bytes long, with a correct CRC
+    if len(data) < 33 or data[12:16] != b'IHDR' or struct.unpack('>I', data[8:12])[0] != 13:
+        return False
+    return zlib.crc32(data[12:29]) & 0xffffffff == struct.unpack('>I', data[29:33])[0]
+
+
+def _jpeg_ok(data: bytes) -> bool:
+    # walk the first few marker segments: FFxx + big-endian length
+    pos, seen = 2, 0
+    while pos + 4 <= len(data) and seen < 4:
+        if data[pos] != 0xFF or data[pos + 1] in (0x00, 0xFF):
+            return False
+        marker = data[pos + 1]
+        if marker == 0xDA:  # start of scan: header structure was valid
+            return seen > 0
+        length = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+        if length < 2:
+            return False
+        pos += 2 + length
+        seen += 1
+    return seen >= 2
+
+
+def _stream_ok(decompressor_factory, data: bytes) -> bool:
+    try:
+        out = decompressor_factory().decompress(data[:_VALIDATE_BYTES])
+        return len(out) > 0
+    except (OSError, EOFError, ValueError, lzma.LZMAError):
+        return False
+
+
+def _pdf_ok(data: bytes) -> bool:
+    return (re.match(rb'%PDF-[12]\.\d', data[:8]) is not None
+            and re.search(rb'\d+\s+\d+\s+obj', data[:_VALIDATE_BYTES]) is not None)
+
+
+def validate_compressed_format(fmt: str, data: bytes, path: str = None) -> bool:
+    '''True only when the container STRUCTURE checks out, not just its magic
+    bytes (which anyone can prepend to random data). Formats without a
+    validator here return False, so they are reported at a lower weight
+    instead of being exempt.'''
+    try:
+        if fmt == 'zip':
+            return path is not None and zipfile.is_zipfile(path) and _zip_members_ok(path)
+        if fmt == 'gzip':
+            return _gzip_ok(data)
+        if fmt == 'bzip2':
+            return _stream_ok(bz2.BZ2Decompressor, data)
+        if fmt == 'xz':
+            return _stream_ok(lambda: lzma.LZMADecompressor(format=lzma.FORMAT_XZ), data)
+        if fmt == 'png':
+            return _png_ok(data)
+        if fmt == 'jpeg':
+            return _jpeg_ok(data)
+        if fmt == 'pdf':
+            return _pdf_ok(data)
+    except Exception:
+        return False
+    return False
+
+
+def _zip_members_ok(path: str) -> bool:
+    '''The central directory parses and lists at least one member.'''
+    with zipfile.ZipFile(path) as zf:
+        return len(zf.infolist()) > 0
 
 
 def is_pe_data(data: bytes) -> bool:

@@ -7,7 +7,8 @@ import logging
 from typing import Dict, Any
 
 from .utils import (calculate_hashes, calculate_entropy, calculate_sliding_window_entropy,
-                    detect_compressed_format, is_pe_data, StringExtractor)
+                    detect_compressed_format, validate_compressed_format, is_pe_data,
+                    StringExtractor)
 from .pe_analyzer import PEAnalyzer
 from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
@@ -32,6 +33,11 @@ PARTIAL_VERDICT = 'SUSPICIOUS (LOW): oversize, partially scanned'
 # Non-PE files: the high-entropy-pocket finding needs more than this share of
 # 4 KiB windows above 7.2 bits (one icon or embedded blob is not enough)
 SLIDING_HIGH_SHARE = 0.25
+# A file that only CLAIMS a compressed format (magic bytes, structure not
+# validated) still gets its entropy findings, at this lower weight
+UNVALIDATED_FORMAT_WEIGHT = 5
+# Overlay (data past the last PE section, certificate cut out)
+OVERLAY_ENTROPY_MIN_BYTES = 4096
 # Archive scanning limits (guard against zip bombs)
 MAX_ARCHIVE_MEMBERS = 200
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
@@ -114,30 +120,55 @@ class Engine:
             logger.error(f'Failed to read {file_path}: {e}')
             return {'error': str(e), 'path': file_path}
 
+        # --- PE parse (before entropy, so entropy can trust the result) ---
+        # The bytes decide whether a file claims to be PE; the parser decides
+        # whether it is one. Whole-file entropy is skipped only when pefile
+        # really parsed the file (no parser differential / fail-open).
+        claims_pe = is_pe_data(data)
+        pe_analyzer = PEAnalyzer(file_path) if data[:2] == b'MZ' else None
+        pe_parsed = pe_analyzer is not None and pe_analyzer.is_valid()
+        if claims_pe and not pe_parsed:
+            if pe_analyzer is not None and pe_analyzer.available:
+                scorer.add_finding('malformed_pe',
+                                   f'File has a PE signature but does not parse as PE '
+                                   f'({pe_analyzer.parse_error})')
+            else:
+                results['details']['pe_analysis'] = 'unavailable (pefile not installed)'
+
         # --- Entropy ---
-        # PE files: entropy is judged per section in the PE analysis (with
-        # .rsrc ignored; the Authenticode certificate table lies outside the
-        # sections), not over the whole file, where resources, icons and
-        # signatures raise it. Known compressed formats are skipped for the
-        # sliding-window check.
+        # Parsed PE files: entropy is judged per section (the resource section
+        # found via its data directory is ignored) and for the overlay on its
+        # own, not over the whole file, where resources, icons and signatures
+        # raise it. Everything else (including a PE that fails to parse) gets
+        # the whole-file and sliding-window checks.
         entropy = calculate_entropy(data)
         sliding_entropy = calculate_sliding_window_entropy(data)
         results['details']['entropy'] = round(entropy, 4)
         results['details']['sliding_entropy'] = sliding_entropy
-        is_pe = is_pe_data(data)
         compressed_format = detect_compressed_format(data)
+        format_valid = (validate_compressed_format(compressed_format, data, file_path)
+                        if compressed_format else False)
         if compressed_format:
-            results['details']['compressed_format'] = compressed_format
-        if not is_pe:
+            results['details']['compressed_format'] = {'format': compressed_format,
+                                                       'structure_valid': format_valid}
+        if not pe_parsed:
             high_share = (sliding_entropy['high_entropy_windows'] / sliding_entropy['total_windows']
                           if sliding_entropy['total_windows'] else 0)
+            # validated container: exempt; magic bytes only: lower weight
+            weight = None
+            note = ''
+            if compressed_format and not format_valid:
+                weight = UNVALIDATED_FORMAT_WEIGHT
+                note = f' (claims {compressed_format}, structure not valid)'
             if entropy > 7.2:
                 scorer.add_finding('high_entropy',
-                                   f'File has very high overall entropy ({entropy:.2f}/8.00) - likely packed or encrypted')
-            elif not compressed_format and high_share > SLIDING_HIGH_SHARE:
+                                   f'File has very high overall entropy ({entropy:.2f}/8.00) - '
+                                   f'likely packed or encrypted{note}', weight_override=weight)
+            elif high_share > SLIDING_HIGH_SHARE and not format_valid:
                 scorer.add_finding('sliding_entropy_spike',
                                    f"{sliding_entropy['high_entropy_windows']} of {sliding_entropy['total_windows']} "
-                                   f"windows have high entropy (peak {sliding_entropy['max']:.2f}/8.00)")
+                                   f"windows have high entropy (peak {sliding_entropy['max']:.2f}/8.00){note}",
+                                   weight_override=weight)
 
         # --- YARA ---
         yara_matches = self.yara_engine.scan(file_path)
@@ -147,8 +178,7 @@ class Engine:
         self._add_yara_findings(scorer, yara_matches)
 
         # --- PE analysis ---
-        pe_analyzer = PEAnalyzer(file_path)
-        if pe_analyzer.is_valid():
+        if pe_parsed:
             pe_info = pe_analyzer.analyze()
             results['details']['pe_info'] = pe_info
             for warning in pe_info.get('warnings', []):
@@ -160,6 +190,11 @@ class Engine:
                     scorer.add_finding('pe_overlay', warning)
                 else:
                     scorer.add_finding('anomaly', warning)
+            overlay = pe_info.get('overlay_entropy', {})
+            if overlay.get('size', 0) >= OVERLAY_ENTROPY_MIN_BYTES and overlay.get('entropy', 0) > 7.2:
+                scorer.add_finding('overlay_high_entropy',
+                                   f"PE overlay ({overlay['size']} bytes, certificate excluded) has "
+                                   f"high entropy ({overlay['entropy']:.2f}/8.00)")
             for chain in pe_info.get('api_chains', []):
                 scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
             for chain in pe_info.get('minor_api_chains', []):

@@ -32,10 +32,16 @@ class FakeSection:
 class FakePE:
     def __init__(self, imports=None, sections=None, timestamp=0x60000000,
                  entry=0x1000, tls_callbacks=None, overlay_size=0, image_base=0x400000,
-                 is_64=False):
+                 is_64=False, resource_rva=0, security=None, overlay_data=None):
         self.FILE_HEADER = NS(Machine=0x8664 if is_64 else 0x14c, TimeDateStamp=timestamp)
+        dirs = [NS(VirtualAddress=0, Size=0) for _ in range(16)]
+        dirs[2] = NS(VirtualAddress=resource_rva, Size=0x100 if resource_rva else 0)
+        if overlay_data is not None:
+            overlay_size = len(overlay_data)
+        if security:
+            dirs[4] = NS(VirtualAddress=security[0], Size=security[1])
         self.OPTIONAL_HEADER = NS(AddressOfEntryPoint=entry, ImageBase=image_base,
-                                  DATA_DIRECTORY=[])
+                                  DATA_DIRECTORY=dirs)
         self.PE_TYPE = 0x20b if is_64 else 0x10b
         self.sections = sections if sections is not None else [FakeSection('.text', perms='RX')]
         if imports:
@@ -49,7 +55,8 @@ class FakePE:
             arr_va = image_base + 0x5000 if tls_callbacks else 0
             self.DIRECTORY_ENTRY_TLS = NS(struct=NS(AddressOfCallBacks=arr_va))
         self._overlay_size = overlay_size
-        self.__data__ = b'\0' * (0x2000 + overlay_size)
+        self.__data__ = b'\0' * 0x2000 + (overlay_data if overlay_data is not None
+                                            else b'\0' * overlay_size)
 
     # pefile-like helpers used by PEAnalyzer
     def get_imphash(self):
@@ -74,3 +81,21 @@ class FakePE:
 def analyzer(**kwargs):
     from dexmond_mie.pe_analyzer import PEAnalyzer
     return PEAnalyzer.from_pe(FakePE(**kwargs))
+
+
+def patch_engine_pe(monkeypatch, **kwargs):
+    '''Make core.PEAnalyzer return a stand-in analyzer for any path.'''
+    from dexmond_mie import core
+    monkeypatch.setattr(core, 'PEAnalyzer', lambda path: analyzer(**kwargs))
+
+
+def patch_engine_pe_fails(monkeypatch, error='DOS Header magic not found'):
+    '''Make core.PEAnalyzer behave like pefile installed but parsing failing.'''
+    from dexmond_mie import core
+    from dexmond_mie.pe_analyzer import PEAnalyzer
+
+    def _failed(path):
+        obj = PEAnalyzer.from_pe(None, path)
+        obj.parse_error = error
+        return obj
+    monkeypatch.setattr(core, 'PEAnalyzer', _failed)

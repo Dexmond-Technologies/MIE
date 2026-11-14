@@ -7,7 +7,13 @@ try:
 except ImportError:
     pefile = None
 
+from .utils import calculate_entropy
+
 logger = logging.getLogger('DEXMOND_MIE')
+
+DIR_RESOURCE = 2   # IMAGE_DIRECTORY_ENTRY_RESOURCE
+DIR_SECURITY = 4   # IMAGE_DIRECTORY_ENTRY_SECURITY (file offset, not RVA)
+MAX_OVERLAY_ENTROPY_BYTES = 32 * 1024 * 1024
 
 # Section names commonly left behind by executable packers
 PACKER_SECTIONS = {
@@ -59,6 +65,8 @@ class PEAnalyzer:
         obj = cls.__new__(cls)
         obj.file_path = file_path
         obj.pe = pe
+        obj.available = True
+        obj.parse_error = None
         return obj
 
     @classmethod
@@ -68,6 +76,8 @@ class PEAnalyzer:
         obj = cls.__new__(cls)
         obj.file_path = file_path
         obj.pe = None
+        obj.available = pefile is not None
+        obj.parse_error = None
         if pefile is None:
             return obj
         try:
@@ -82,14 +92,19 @@ class PEAnalyzer:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.pe = None
+        # available: pefile is installed; parse_error: why parsing failed
+        self.available = pefile is not None
+        self.parse_error = None
         if pefile is None:
             logger.warning('pefile is not installed; PE analysis disabled')
             return
         try:
             self.pe = pefile.PE(file_path, fast_load=False)
-        except pefile.PEFormatError:
+        except pefile.PEFormatError as e:
+            self.parse_error = str(e) or 'PEFormatError'
             logger.debug(f'Not a valid PE file: {file_path}')
         except Exception as e:
+            self.parse_error = str(e) or type(e).__name__
             logger.error(f'Failed to parse PE {file_path}: {e}')
 
     def is_valid(self) -> bool:
@@ -114,6 +129,7 @@ class PEAnalyzer:
             'api_chains': self.get_api_chains(),
             'minor_api_chains': self.get_minor_api_chains(),
             'overlay': self.get_overlay_info(),
+            'overlay_entropy': self.get_overlay_entropy(),
             'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies()}
         return results
@@ -204,6 +220,52 @@ class PEAnalyzer:
             pass
         return {'present': False, 'size': 0}
 
+    def _data_directory(self, index: int):
+        try:
+            dd = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY
+            return dd[index] if len(dd) > index else None
+        except Exception:
+            return None
+
+    def get_resource_section(self):
+        '''The section the resource data directory really points into, if that
+        section is not executable. The section NAME is not trusted (an
+        attacker can call any section ".rsrc").'''
+        entry = self._data_directory(DIR_RESOURCE)
+        if entry is None or not entry.VirtualAddress:
+            return None
+        rva = entry.VirtualAddress
+        for section in self.pe.sections:
+            span = max(section.Misc_VirtualSize, section.SizeOfRawData)
+            if section.VirtualAddress <= rva < section.VirtualAddress + span:
+                if 'X' in self._get_section_permissions(section):
+                    return None
+                return section
+        return None
+
+    def get_overlay_entropy(self) -> Dict[str, Any]:
+        '''Entropy of the data past the last section, measured on its own and
+        with the Authenticode certificate table cut out.'''
+        info = {'size': 0, 'entropy': 0.0, 'certificate_excluded': 0}
+        try:
+            offset = self.pe.get_overlay_data_offset()
+        except Exception:
+            offset = None
+        if offset is None:
+            return info
+        data = self.pe.__data__
+        end = len(data)
+        pieces = [(offset, end)]
+        cert = self._data_directory(DIR_SECURITY)
+        if cert is not None and cert.Size and cert.VirtualAddress >= offset:
+            c0, c1 = cert.VirtualAddress, min(cert.VirtualAddress + cert.Size, end)
+            pieces = [(offset, c0), (c1, end)]
+            info['certificate_excluded'] = c1 - c0
+        blob = b''.join(bytes(data[a:b]) for a, b in pieces if b > a)[:MAX_OVERLAY_ENTROPY_BYTES]
+        info['size'] = sum(max(0, b - a) for a, b in pieces)
+        info['entropy'] = round(calculate_entropy(blob), 4) if blob else 0.0
+        return info
+
     def has_tls_callbacks(self) -> bool:
         '''Checks if binary uses TLS Callbacks to execute code before main entry point.'''
         if not self.pe:
@@ -281,10 +343,12 @@ class PEAnalyzer:
 
     def _check_anomalies(self) -> List[str]:
         warnings = []
+        resource_section = self.get_resource_section()
         for section in self.pe.sections:
-            # .rsrc holds icons, images and compressed resources: high entropy
-            # there is normal and is not counted
-            if self._section_name(section).lower() != '.rsrc' and section.get_entropy() > 7:
+            # The resource section holds icons, images and compressed
+            # resources: high entropy there is normal and is not counted. It
+            # is found through the resource data directory, not by name.
+            if section is not resource_section and section.get_entropy() > 7:
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:
