@@ -1,0 +1,89 @@
+# MIE tests on GitHub runners.
+# - Linux: full pytest with real YARA and the hash-locked signify stack.
+# - Windows: only the tests that need Windows (X12 signature + Authenticode, including the
+#   WinVerifyTrust-vs-signify parity test), on Microsoft-signed Sysinternals binaries.
+# Budget rule (owner 2026-11-14): manual runs only, short timeouts, caches, no artefacts.
+# No EICAR files and no malware corpus are used here; EICAR tests skip.
+# Python 3.12: yara-python 4.5.1 has no CPython 3.13 wheel; the signify lock is all
+# pure-Python wheels, so the same hashes install on 3.12.
+name: tests
+
+on:
+  workflow_dispatch:
+  # TEMPORARY: one verification run (a dispatch-only workflow cannot start off the default
+  # branch until GitHub has registered it). Removed in the next commit.
+  push:
+    branches: [fix/false-alarms-v1]
+    paths: [.github/workflows/tests.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENGINE_DEPS: yara-python==4.5.1 pefile==2024.8.26 watchdog==6.0.0 colorama==0.4.6 pytest==9.2.0
+  MIE_EICAR_DIR: /nonexistent-no-eicar-in-ci
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-signify.lock
+            .github/workflows/tests.yml
+      - name: Install engine deps (pinned)
+        run: python -m pip install $ENGINE_DEPS
+      - name: Install signify stack (hash-locked)
+        run: python -m pip install --require-hashes -r requirements-signify.lock
+      - name: pytest
+        run: python -m pytest -q -rs
+
+  windows-x12:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-signify.lock
+            .github/workflows/tests.yml
+      - name: Install engine deps (pinned)
+        shell: pwsh
+        run: python -m pip install ($env:ENGINE_DEPS -split ' ')
+      - name: Install signify stack (hash-locked)
+        run: python -m pip install --require-hashes -r requirements-signify.lock
+      - name: Download Sysinternals Suite (official Microsoft site)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'SysinternalsSuite.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'sysinternals'
+          Invoke-WebRequest -Uri 'https://download.sysinternals.com/files/SysinternalsSuite.zip' -OutFile $zip -UseBasicParsing
+          Write-Host "SysinternalsSuite.zip sha256: $((Get-FileHash $zip -Algorithm SHA256).Hash)"
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exes = @(Get-ChildItem -LiteralPath $dir -Filter *.exe | Sort-Object Name | Select-Object -First 10)
+          Write-Host "first 10 .exe files used by the tests:"
+          foreach ($e in $exes) {
+            $s = Get-AuthenticodeSignature -LiteralPath $e.FullName
+            Write-Host "  $($e.Name)  WinVerifyTrust=$($s.Status)  signer=$($s.SignerCertificate.Subject)"
+          }
+          "MIE_SYSINTERNALS_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MIE_TEST_TRUST_STORE=$env:GITHUB_WORKSPACE\trust\authenticode_roots.pem" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: pytest (X12 signature + Authenticode, Windows parity)
+        run: python -m pytest -v -rs tests/test_x12_signature.py tests/test_x12_v2_authenticode.py
