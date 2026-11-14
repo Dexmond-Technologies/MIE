@@ -301,7 +301,9 @@ def _countersignature(signed_data):
     if getattr(cs, 'signer_info', None) is not None:          # RFC 3161 token
         pool = list(getattr(cs, 'certificates', [])) + pool
         info = cs.signer_info
-        t = cs.tst_info.gen_time if getattr(cs, 'tst_info', None) is not None else None
+        tst = getattr(cs, 'tst_info', None)
+        # signify 0.9.3: TSTInfo.signing_time (= gen_time)
+        t = (getattr(tst, 'signing_time', None) or getattr(tst, 'gen_time', None)) if tst is not None else None
     else:                                                     # Authenticode
         info = cs
         t = getattr(cs, 'signing_time', None)
@@ -436,9 +438,10 @@ def _signify_verify(data, pem):
                   ignore_parse_errors=False,
                   trusted_certificate_store=store,
                   countersignature_mode='strict',
-                  verification_context_kwargs={'allow_fetching': False,
-                                               'extended_key_usages': ['code_signing'],
-                                               'optional_eku': True})
+                  # only allow_fetching: signify passes extended_key_usages
+                  # itself (Authenticode default); our own leaf EKU check
+                  # (code signing) runs after verification
+                  verification_context_kwargs={'allow_fetching': False})
     except TypeError:
         raise
     except Exception as e:  # noqa: BLE001 - signify's verification errors
@@ -498,9 +501,18 @@ def verify_portable(path: str, store_path: str = None, pinned_sha256=_PINNED,
             buf, key = data, scanned_stat
             if buf is None:
                 buf, key = read_for_verify(path)
-            r = _verify_portable_inner(buf, store_path, pinned_sha256, policy)
+            changed = _result('unavailable', detail='file changed between scan and verification')
+            # checked BEFORE parsing (a changed file is the reason, not
+            # whatever parse error it causes) and again AFTER verification
             if key is not None and not _unchanged(path, key):
-                r = _result('unavailable', detail='file changed between scan and verification')
+                box['r'] = changed
+                return
+            try:
+                r = _verify_portable_inner(buf, store_path, pinned_sha256, policy)
+            except Exception as e:  # noqa: BLE001 - fail closed
+                r = _result('unavailable', detail=f'verification error: {type(e).__name__}: {e}')
+            if key is not None and not _unchanged(path, key):
+                r = changed
             box['r'] = r
         except Exception as e:  # noqa: BLE001 - fail closed
             box['r'] = _result('unavailable', detail=f'verification error: {type(e).__name__}: {e}')
