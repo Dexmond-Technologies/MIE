@@ -10,6 +10,7 @@ class Scorer:
         'sliding_entropy_spike': 10,
         'suspicious_import': 10,
         'api_chain': 35,
+        'api_chain_minor': 15,
         'suspicious_string': 5,
         'obfuscated_script': 25,
         'b64_executable': 30,

@@ -16,10 +16,8 @@ PACKER_SECTIONS = {
     '.mpress2', '.enigma1', '.enigma2', '.fsg', '.mew', '.y0da'}
 
 # APIs that are suspicious ON THEIR OWN. Routine APIs that every loader, UI
-# tool or installer imports (LoadLibrary*, GetProcAddress, VirtualAlloc,
-# VirtualProtect, IsDebuggerPresent, OpenProcessToken, RegSetValueEx*,
-# ShellExecute*) are not listed here; they only count as part of a chain in
-# get_api_chains().
+# tool or installer imports are not listed here (fix X3); they only count
+# inside the behavioural chains of get_api_chains() / get_minor_api_chains().
 SUSPICIOUS_IMPORTS = {
     'VirtualAllocEx', 'WriteProcessMemory',
     'ReadProcessMemory', 'CreateRemoteThread', 'CreateRemoteThreadEx',
@@ -30,11 +28,27 @@ SUSPICIOUS_IMPORTS = {
     'InternetOpenA', 'InternetOpenUrlA', 'URLDownloadToFileA', 'URLDownloadToFileW',
     'WinExec'}
 
-# Removed from the single-import list in fix X3; still used inside chains.
+# Removed from the single-import list in fix X3. Each one is still used by
+# at least one chain (tests/test_x3_imports.py checks this):
+#   LoadLibrary*, GetProcAddress, VirtualAlloc, VirtualProtect -> dynamic API
+#     resolution chain (VirtualAlloc also in the injection chain)
+#   RegSetValueEx*, ShellExecute*                             -> persistence
+#     chain (ShellExecute* also in download-and-execute)
+#   OpenProcessToken                                          -> privilege chain
+#   IsDebuggerPresent                                         -> anti-debug chain
 CHAIN_ONLY_IMPORTS = {
     'LoadLibraryA', 'LoadLibraryW', 'GetProcAddress', 'VirtualProtect', 'VirtualAlloc',
     'IsDebuggerPresent', 'OpenProcessToken', 'RegSetValueExA', 'RegSetValueExW',
     'ShellExecuteA', 'ShellExecuteW'}
+
+_LOADLIB = ('LoadLibraryA', 'LoadLibraryW', 'LoadLibraryExA', 'LoadLibraryExW', 'LdrLoadDll')
+_EXEC = ('ShellExecuteA', 'ShellExecuteW', 'ShellExecuteExA', 'ShellExecuteExW',
+         'CreateProcessA', 'CreateProcessW', 'WinExec')
+# OutputDebugString is NOT counted: nearly every program imports it
+_ANTIDEBUG_EXTRA = ('CheckRemoteDebuggerPresent', 'NtQueryInformationProcess',
+                    'ZwQueryInformationProcess', 'NtSetInformationThread')
+# A loader stub (packer, shellcode loader) imports almost nothing else
+TINY_IMPORT_TABLE = 5
 
 class PEAnalyzer:
     '''Analyzes Portable Executable (PE) files.'''
@@ -98,6 +112,7 @@ class PEAnalyzer:
             'exports': self._get_exports(),
             'resources': self._get_resources(),
             'api_chains': self.get_api_chains(),
+            'minor_api_chains': self.get_minor_api_chains(),
             'overlay': self.get_overlay_info(),
             'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies()}
@@ -144,6 +159,35 @@ class PEAnalyzer:
            any(f in all_funcs for f in ('GetAsyncKeyState', 'GetForegroundWindow')):
             chains.append('System Hooking / Keylogging Chain (SetWindowsHookEx + Input Capture)')
 
+        return chains
+
+    def get_minor_api_chains(self) -> List[str]:
+        '''Weaker behavioural chains built from routine APIs (fix X3). Each
+        scores as api_chain_minor (moderate weight), so one alone cannot
+        reach MALICIOUS without other evidence.'''
+        imports = self._get_imports()
+        all_funcs = set()
+        for funcs in imports.values():
+            all_funcs.update(funcs)
+        total = sum(len(funcs) for funcs in imports.values())
+        has = lambda names: any(f in all_funcs for f in names)  # noqa: E731
+
+        chains = []
+        if has(_LOADLIB) and 'GetProcAddress' in all_funcs:
+            if has(('VirtualAlloc', 'VirtualProtect')):
+                chains.append('Dynamic API Resolution Chain (LoadLibrary + GetProcAddress + '
+                              'VirtualAlloc/VirtualProtect)')
+            elif total <= TINY_IMPORT_TABLE:
+                chains.append(f'Dynamic API Resolution Chain (LoadLibrary + GetProcAddress, '
+                              f'only {total} imports)')
+        if has(('RegSetValueExA', 'RegSetValueExW')) and has(_EXEC):
+            chains.append('Persistence Chain (RegSetValueEx + process execution)')
+        if 'OpenProcessToken' in all_funcs and 'AdjustTokenPrivileges' in all_funcs:
+            extra = ' + LookupPrivilegeValue' if has(('LookupPrivilegeValueA',
+                                                       'LookupPrivilegeValueW')) else ''
+            chains.append(f'Privilege Adjustment Chain (OpenProcessToken + AdjustTokenPrivileges{extra})')
+        if 'IsDebuggerPresent' in all_funcs and has(_ANTIDEBUG_EXTRA):
+            chains.append('Anti-Debug Chain (IsDebuggerPresent + a second anti-debug API)')
         return chains
 
     def get_overlay_info(self) -> Dict[str, Any]:

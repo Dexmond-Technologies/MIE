@@ -162,6 +162,8 @@ class Engine:
                     scorer.add_finding('anomaly', warning)
             for chain in pe_info.get('api_chains', []):
                 scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
+            for chain in pe_info.get('minor_api_chains', []):
+                scorer.add_finding('api_chain_minor', f"Behavioral API Chain detected: {chain}")
             suspicious_imports = pe_analyzer.get_suspicious_imports()
             if suspicious_imports:
                 scorer.add_finding('suspicious_import',
@@ -272,6 +274,8 @@ class Engine:
                                                  'imports': pe_analyzer._get_imports()}
                 for chain in pe_analyzer.get_api_chains():
                     scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
+                for chain in pe_analyzer.get_minor_api_chains():
+                    scorer.add_finding('api_chain_minor', f"Behavioral API Chain detected: {chain}")
                 suspicious_imports = pe_analyzer.get_suspicious_imports()
                 if suspicious_imports:
                     scorer.add_finding('suspicious_import',
