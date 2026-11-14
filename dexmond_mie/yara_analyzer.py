@@ -74,6 +74,24 @@ class YaraAnalyzer:
         except yara.Error as e:
             logger.error(f'YARA scan failed on {file_path}: {e}')
             return []
+        return self._to_dicts(matches)
+
+    def scan_data(self, data: bytes, label: str = '<data>') -> List[Dict]:
+        '''Scans an in-memory buffer (a bounded window of an oversize file).'''
+        if not self.rules or not data:
+            return []
+        try:
+            matches = self.rules.match(data=data, timeout=SCAN_TIMEOUT)
+        except yara.TimeoutError:
+            logger.warning(f'YARA scan timed out on {label}')
+            return []
+        except yara.Error as e:
+            logger.error(f'YARA scan failed on {label}: {e}')
+            return []
+        return self._to_dicts(matches)
+
+    @staticmethod
+    def _to_dicts(matches) -> List[Dict]:
         results = []
         for match in matches:
             results.append({

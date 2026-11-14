@@ -47,6 +47,24 @@ class PEAnalyzer:
         obj.pe = pe
         return obj
 
+    @classmethod
+    def from_data(cls, data: bytes, file_path: str = ''):
+        '''Parses only the headers and the import table from a bounded buffer
+        (the head window of an oversize file). Never maps the file.'''
+        obj = cls.__new__(cls)
+        obj.file_path = file_path
+        obj.pe = None
+        if pefile is None:
+            return obj
+        try:
+            pe = pefile.PE(data=data, fast_load=True)
+            pe.parse_data_directories(
+                directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+            obj.pe = pe
+        except Exception as e:
+            logger.debug(f'Bounded PE parse failed for {file_path}: {e}')
+        return obj
+
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.pe = None

@@ -5,7 +5,7 @@ import logging
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from .core import Engine
+from .core import Engine, needs_alert, auto_quarantine_allowed
 
 logger = logging.getLogger('DEXMOND_REALTIME')
 
@@ -66,7 +66,7 @@ class MalwareEventHandler(FileSystemEventHandler):
         quarantined = False
         if (self.scanner and self.scanner.auto_quarantine
                 and self.scanner.quarantine_callback
-                and verdict.startswith('MALICIOUS')):
+                and auto_quarantine_allowed(results)):
             try:
                 self.scanner.quarantine_callback(path, results)
                 quarantined = True
@@ -76,7 +76,7 @@ class MalwareEventHandler(FileSystemEventHandler):
 
         if self.result_callback:
             self.result_callback(results)
-        if score >= ALERT_THRESHOLD and self.notification_callback:
+        if needs_alert(results, ALERT_THRESHOLD) and self.notification_callback:
             suffix = ' - quarantined' if quarantined else ''
             self.notification_callback(
                 'DEXMOND MIE Alert',

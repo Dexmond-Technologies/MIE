@@ -18,12 +18,17 @@ logger = logging.getLogger('DEXMOND_MIE')
 
 # Cap the amount of data loaded for entropy/string analysis
 MAX_ANALYSIS_BYTES = 32 * 1024 * 1024
-# Files larger than this are hashed and checked against the reputation list
-# only. YARA maps the whole file and pefile maps it too, so a 1 GiB file
-# peaked at 2.1 GiB RSS; above the limit both are skipped and the result
-# says so (verdict SKIPPED_VERDICT, details.skipped).
+# Files larger than this are not mapped whole: YARA's match(file) and pefile
+# both map the file, and a 1 GiB file peaked at 2.1 GiB RSS. Above the limit
+# the engine does a bounded partial scan instead (X14): YARA on the first
+# and last OVERSIZE_WINDOW_BYTES via match(data=...), strings/IOCs on the
+# same windows, and the PE header + import table parsed from the head
+# window. Padding a file past the limit therefore does not make it unseen.
 MAX_SCAN_BYTES = 256 * 1024 * 1024
-SKIPPED_VERDICT = 'SKIPPED (SIZE LIMIT)'
+OVERSIZE_WINDOW_BYTES = 16 * 1024 * 1024
+# Verdict when the partial scan finds nothing: a visible LOW, not CLEAN and
+# not a silent skip. Kept out of auto-quarantine (see auto_quarantine_allowed).
+PARTIAL_VERDICT = 'SUSPICIOUS (LOW): oversize, partially scanned'
 # Non-PE files: the high-entropy-pocket finding needs more than this share of
 # 4 KiB windows above 7.2 bits (one icon or embedded blob is not enough)
 SLIDING_HIGH_SHARE = 0.25
@@ -44,9 +49,12 @@ class Engine:
     '''Orchestrates the malware inspection process.'''
 
     def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json',
-                 use_reputation: bool = True, max_scan_bytes: int = None):
+                 use_reputation: bool = True, max_scan_bytes: int = None,
+                 oversize_window_bytes: int = None):
         self.rules_dir = rules_dir
         self.max_scan_bytes = MAX_SCAN_BYTES if max_scan_bytes is None else max_scan_bytes
+        self.oversize_window_bytes = (OVERSIZE_WINDOW_BYTES if oversize_window_bytes is None
+                                      else oversize_window_bytes)
         # use_reputation=False is the measuring mode (CLI --no-reputation):
         # the known-hash list is not consulted, so detection by YARA and the
         # heuristics can be measured on its own.
@@ -95,26 +103,9 @@ class Engine:
                 logger.info(f"Reputation hit: TRUSTED ({rep['label']})")
                 return results
 
-        # --- Size limit: stated skip, never a silent CLEAN ---
+        # --- Size limit: bounded partial scan, never blind, never CLEAN ---
         if results['size'] > self.max_scan_bytes:
-            results['yara'] = []
-            results['details']['skipped'] = {
-                'reason': 'size limit',
-                'limit_bytes': self.max_scan_bytes,
-                'stages': ['entropy', 'yara', 'pe', 'strings', 'archive']}
-            if rep_malicious:
-                scorer.add_finding('reputation_malicious',
-                                   f"Known malicious file (reputation: {rep_malicious['label']})")
-                scorer.set_floor(MALICIOUS_FLOOR)
-                results['verdict'] = scorer.get_verdict()
-            else:
-                results['verdict'] = SKIPPED_VERDICT
-            results['findings'] = scorer.findings
-            results['score'] = scorer.get_score()
-            results['scan_time'] = round(time.time() - start_time, 3)
-            logger.warning(f"Skipped content analysis of {file_path}: "
-                           f"{results['size']} bytes is over the {self.max_scan_bytes}-byte size limit")
-            return results
+            return self._scan_oversize(file_path, results, scorer, rep_malicious, start_time)
 
         try:
             with open(file_path, 'rb') as f:
@@ -153,15 +144,7 @@ class Engine:
         results['yara'] = [m['rule'] for m in yara_matches]
         if yara_matches:
             results['details']['yara_matches'] = yara_matches
-        for match in yara_matches:
-            severity = str(match['meta'].get('severity', '')).lower()
-            description = match['meta'].get('description', match['rule'])
-            if severity == 'critical':
-                scorer.add_finding('critical_yara',
-                                   f"Critical YARA match: {match['rule']} ({description})")
-            else:
-                scorer.add_finding('yara_match',
-                                   f"YARA match: {match['rule']} ({description})")
+        self._add_yara_findings(scorer, yara_matches)
 
         # --- PE analysis ---
         pe_analyzer = PEAnalyzer(file_path)
@@ -233,6 +216,89 @@ class Engine:
                 results['details']['auto_generated_rule'] = gen_rule
 
         logger.info(f"Scan complete: {results['verdict']} (score {results['score']}) in {results['scan_time']}s")
+        return results
+
+    @staticmethod
+    def _add_yara_findings(scorer: Scorer, yara_matches, where: str = ''):
+        for match in yara_matches:
+            severity = str(match['meta'].get('severity', '')).lower()
+            description = match['meta'].get('description', match['rule'])
+            if severity == 'critical':
+                scorer.add_finding('critical_yara',
+                                   f"Critical YARA match{where}: {match['rule']} ({description})")
+            else:
+                scorer.add_finding('yara_match',
+                                   f"YARA match{where}: {match['rule']} ({description})")
+
+    def _scan_oversize(self, file_path, results, scorer, rep_malicious, start_time):
+        '''Bounded partial scan of a file over max_scan_bytes. Memory stays at
+        about two windows (default 2 x 16 MiB) whatever the file size.'''
+        size = results['size']
+        window = min(self.oversize_window_bytes, self.max_scan_bytes)
+        try:
+            with open(file_path, 'rb') as f:
+                head = f.read(window)
+                f.seek(max(size - window, len(head)))
+                tail = f.read(window)
+        except OSError as e:
+            logger.error(f'Failed to read {file_path}: {e}')
+            return {'error': str(e), 'path': file_path}
+        windows = [('head', head)] + ([('tail', tail)] if tail else [])
+        results['details']['partial_scan'] = {
+            'reason': 'size limit',
+            'limit_bytes': self.max_scan_bytes,
+            'window_bytes': window,
+            'scanned': [name for name, _ in windows] + ['pe_header_imports'],
+            'not_scanned': ['middle of file', 'entropy', 'archive members']}
+
+        # YARA on each window (rules see the window, so filesize and offsets
+        # are relative to it)
+        yara_rules = []
+        for name, chunk in windows:
+            matches = self.yara_engine.scan_data(chunk, f'{file_path} [{name}]')
+            for m in matches:
+                m['window'] = name
+            yara_rules.extend(m['rule'] for m in matches)
+            if matches:
+                results['details'].setdefault('yara_matches', []).extend(matches)
+            self._add_yara_findings(scorer, matches, f' ({name} window)')
+        results['yara'] = sorted(set(yara_rules))
+
+        # PE header and import table from the head window only
+        if is_pe_data(head):
+            pe_analyzer = PEAnalyzer.from_data(head, file_path)
+            if pe_analyzer.is_valid():
+                results['details']['pe_info'] = {'is_pe': True, 'partial': True,
+                                                 'imports': pe_analyzer._get_imports()}
+                for chain in pe_analyzer.get_api_chains():
+                    scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
+                suspicious_imports = pe_analyzer.get_suspicious_imports()
+                if suspicious_imports:
+                    scorer.add_finding('suspicious_import',
+                                       f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
+
+        # Strings / IOCs on the windows
+        for name, chunk in windows:
+            _, iocs = StringExtractor.extract_ascii_unicode(chunk, 5)
+            for key in ('b64_executable', 'obfuscated_script'):
+                if key in iocs:
+                    scorer.add_finding(key, f"{key} pattern in {name} window: "
+                                            f"{', '.join(iocs[key][:3])[:200]}")
+
+        scorer.add_finding('oversize_partial_scan',
+                           f'File is {size} bytes, over the {self.max_scan_bytes}-byte limit: '
+                           f'only the first and last {window} bytes and the PE header were scanned')
+        if rep_malicious:
+            scorer.add_finding('reputation_malicious',
+                               f"Known malicious file (reputation: {rep_malicious['label']})")
+            scorer.set_floor(MALICIOUS_FLOOR)
+        results['findings'] = scorer.findings
+        results['score'] = scorer.get_score()
+        verdict = scorer.get_verdict()
+        results['verdict'] = PARTIAL_VERDICT if verdict == 'SUSPICIOUS (LOW)' else verdict
+        results['scan_time'] = round(time.time() - start_time, 3)
+        logger.warning(f"Partial scan of {file_path}: {size} bytes is over the "
+                       f"{self.max_scan_bytes}-byte limit -> {results['verdict']}")
         return results
 
     @staticmethod
@@ -333,3 +399,23 @@ class Engine:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((member.name, out))
         return extracted
+
+
+def is_partial_scan(results: Dict[str, Any]) -> bool:
+    '''True when the file was too large for a full scan (X14).'''
+    return bool(results.get('details', {}).get('partial_scan'))
+
+
+def needs_alert(results: Dict[str, Any], threshold: int = 30) -> bool:
+    '''Real-time alert rule: score at or over the threshold, or a partial
+    scan of an oversize file (which must be visible, not silent).'''
+    return results.get('score', 0) >= threshold or is_partial_scan(results)
+
+
+def auto_quarantine_allowed(results: Dict[str, Any]) -> bool:
+    '''Auto-quarantine only confirmed MALICIOUS verdicts; an oversize file
+    with nothing found in its partial scan is never auto-quarantined.'''
+    verdict = results.get('verdict', '')
+    if is_partial_scan(results) and verdict == PARTIAL_VERDICT:
+        return False
+    return verdict.startswith('MALICIOUS')

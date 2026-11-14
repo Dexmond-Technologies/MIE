@@ -10,7 +10,7 @@ from collections import deque
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .core import Engine
+from .core import Engine, needs_alert
 from .realtime import RealtimeScanner, ALERT_THRESHOLD
 from .quarantine import QuarantineManager
 from . import paths
@@ -108,6 +108,8 @@ def _on_realtime_result(results):
     score = results.get('score', 0)
     if score >= ALERT_THRESHOLD:
         _stats['threats'] += 1
+    # oversize partial scans are shown in the activity feed too (visible alert)
+    if needs_alert(results, ALERT_THRESHOLD):
         _activity.appendleft({
             'time': time.strftime('%H:%M:%S'),
             'filename': results.get('filename', '?'),
@@ -634,7 +636,7 @@ async function toggleAutoQuarantine() {
 
 function verdictColor(v) {
   if (v.includes('MALICIOUS')) return 'var(--danger)';
-  if (v.includes('SUSPICIOUS') || v.includes('SKIPPED')) return 'var(--warn)';
+  if (v.includes('SUSPICIOUS')) return 'var(--warn)';
   return 'var(--clean)';
 }
 
