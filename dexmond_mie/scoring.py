@@ -41,6 +41,16 @@ class Scorer:
             'description': description,
             'weight': weight})
 
+    def add_floor_finding(self, category: str, description: str, floor: int):
+        '''Records a finding that raises the score to at least `floor`
+        instead of adding to it (an archive takes its worst member's score).'''
+        self.set_floor(floor)
+        self.findings.append({
+            'category': category,
+            'description': description,
+            'weight': floor,
+            'mode': 'floor'})
+
     def get_score(self) -> int:
         '''Returns the final score, capped at 100.'''
         return min(max(self.score, self.floor), 100)

@@ -236,11 +236,15 @@ class Engine:
                 results['details']['archive'] = archive
                 worst = archive['worst_score']
                 if worst > 0:
-                    scorer.add_finding(
-                        'critical_yara' if worst >= 70 else 'yara_match',
-                        f"Archive contains a threat: {archive['worst_member']} "
-                        f"({archive['worst_verdict']}, score {worst})",
-                        weight_override=worst)
+                    # The archive's verdict is at least its worst member's
+                    # (a floor), NOT the member score added on top of the
+                    # container's own findings, and not labelled as YARA
+                    # unless the member really had a YARA match.
+                    scorer.add_floor_finding(
+                        'archive_member',
+                        f"Archive member {archive['worst_member']}: "
+                        f"{archive['worst_verdict']} (score {worst})",
+                        worst)
 
         if rep_malicious:
             scorer.add_finding('reputation_malicious',
