@@ -472,6 +472,7 @@ class PEAnalyzer:
 
     def _check_anomalies(self) -> List[str]:
         warnings = []
+        wx_sections = []
         resource_section = self.get_resource_section()
         for section in self.pe.sections:
             # The resource section holds icons, images and compressed
@@ -488,7 +489,10 @@ class PEAnalyzer:
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:
-                warnings.append(f'Section {self._section_name(section)} is both writable and executable')
+                wx_sections.append(self._section_name(section))
+        if wx_sections:
+            # counted once per file, however many W+X sections there are
+            warnings.append(f"Writable and executable section(s): {', '.join(wx_sections)}")
         if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
             warnings.append('Entry point is zero')
         if self.has_tls_callbacks():
