@@ -334,3 +334,19 @@ def test_neg_pinned_store_really_used_not_os_or_bundle(tmp_path):
     store.write_bytes(pem)
     r = _verify(files[0], str(store), hashlib.sha256(pem).hexdigest())
     assert r['status'] != 'valid', r
+
+
+def test_windows_path_runs_precheck_appended_data_is_invalid(tmp_path, monkeypatch):
+    '''Parity: even if WinVerifyTrust says valid (no EnableCertPaddingCheck),
+    data appended after the certificate table makes the result invalid.'''
+    monkeypatch.setattr(signature.sys, 'platform', 'win32')
+    monkeypatch.setattr(signature, '_verify_windows',
+                        lambda p: signature._result('valid', publisher='Microsoft Corporation'))
+    monkeypatch.setattr(signature, '_cert_padding_check_enabled', lambda: False)
+    appended = _write(tmp_path, _synthetic_pe(_win_cert(), trailing=b'\0' * 1024))
+    assert signature.verify_authenticode(appended)['status'] == 'invalid'
+    clean = _write(tmp_path, _synthetic_pe(_win_cert()), 'b.exe')
+    r = signature.verify_authenticode(clean)
+    assert r['status'] == 'valid' and r['os_cert_padding_check'] is False
+    assert signature.verify_authenticode(_write(tmp_path, _synthetic_pe(None), 'c.exe'))[
+        'status'] == 'unsigned'

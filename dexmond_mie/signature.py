@@ -297,6 +297,16 @@ def verify_authenticode(path: str, publishers=None):
     pubs = tuple(publishers if publishers is not None else trusted_publishers())
     if sys.platform != 'win32':
         return verify_portable(path, publishers=pubs)
+    # Same structural precheck as the portable path: stock WinVerifyTrust
+    # accepts data appended after the certificate table (CVE-2013-3900
+    # class) unless EnableCertPaddingCheck is set, so the platforms would
+    # not be at parity without it.
+    try:
+        status, info = precheck_pe(path)
+    except Exception as e:  # noqa: BLE001 - fail closed
+        return _result('unavailable', detail=f'precheck error: {type(e).__name__}: {e}')
+    if status != 'ok':
+        return _result(status, detail=info)
     try:
         result = _verify_windows(path)
     except Exception as e:  # noqa: BLE001 - any failure means "not verified"
@@ -304,7 +314,29 @@ def verify_authenticode(path: str, publishers=None):
         return _result('unavailable', detail=f'verification error: {e}')
     if result['status'] == 'valid':
         result['publisher_allowed'] = result.get('publisher') in pubs
+    result['os_cert_padding_check'] = _cert_padding_check_enabled()
     return result
+
+
+def _cert_padding_check_enabled():
+    '''True/False if the Windows EnableCertPaddingCheck setting can be read,
+    None otherwise (informational only; MIE's own precheck always runs).'''
+    if sys.platform != 'win32':
+        return None
+    try:  # pragma: no cover - Windows only
+        import winreg
+        for key in (r'Software\Microsoft\Cryptography\Wintrust\Config',
+                    r'Software\Wow6432Node\Microsoft\Cryptography\Wintrust\Config'):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+                    value, _ = winreg.QueryValueEx(k, 'EnableCertPaddingCheck')
+                    if str(value) == '1':
+                        return True
+            except OSError:
+                continue
+        return False
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _verify_windows(path: str):  # pragma: no cover - Windows only, NOT RUN on Linux
