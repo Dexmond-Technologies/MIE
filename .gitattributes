@@ -1,0 +1,2 @@
+# The shipped Authenticode root store is pinned by SHA-256: never convert its line endings.
+trust/*.pem binary
