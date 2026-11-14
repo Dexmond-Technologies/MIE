@@ -124,7 +124,7 @@ class PEAnalyzer:
         results = {
             'is_pe': True,
             'machine_type': hex(self.pe.FILE_HEADER.Machine),
-            'timestamp': str(datetime.datetime.utcfromtimestamp(self.pe.FILE_HEADER.TimeDateStamp)),
+            'timestamp': self._timestamp_text(self.pe.FILE_HEADER.TimeDateStamp),
             'compile_time': self.pe.FILE_HEADER.TimeDateStamp,
             'entry_point': hex(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint),
             'image_base': hex(self.pe.OPTIONAL_HEADER.ImageBase),
@@ -139,7 +139,8 @@ class PEAnalyzer:
             'overlay_entropy': self.get_overlay_entropy(),
             'certificate': self.parse_certificate_table(),
             'tls_callbacks': self.has_tls_callbacks(),
-            'warnings': self._check_anomalies()}
+            'warnings': self._check_anomalies(),
+            'notes': self._notes()}
         return results
 
     def get_imphash(self) -> str:
@@ -452,6 +453,23 @@ class PEAnalyzer:
                 resources.append({'type': type_name, 'entries': count})
         return resources
 
+    @staticmethod
+    def _timestamp_text(ts: int) -> str:
+        try:
+            return str(datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).replace(tzinfo=None))
+        except (OverflowError, OSError, ValueError):
+            return f'0x{ts:08x} (out of range)'
+
+    def _notes(self) -> List[str]:
+        '''Report-only observations (never scored).'''
+        notes = []
+        ts = self.pe.FILE_HEADER.TimeDateStamp
+        if ts == 0 or ts > 2147483647:
+            # reproducible builds (MSVC /Brepro, Go, zig) write 0 or a hash
+            notes.append(f'Compile timestamp is 0 or out of range (0x{ts:08x}); '
+                         f'normal for reproducible builds, not scored')
+        return notes
+
     def _check_anomalies(self) -> List[str]:
         warnings = []
         resource_section = self.get_resource_section()
@@ -471,8 +489,6 @@ class PEAnalyzer:
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:
                 warnings.append(f'Section {self._section_name(section)} is both writable and executable')
-        if self.pe.FILE_HEADER.TimeDateStamp == 0 or self.pe.FILE_HEADER.TimeDateStamp > 2147483647:
-            warnings.append('Suspicious compilation timestamp')
         if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
             warnings.append('Entry point is zero')
         if self.has_tls_callbacks():
