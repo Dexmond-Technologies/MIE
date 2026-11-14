@@ -268,9 +268,26 @@ class PEAnalyzer:
 
     def has_tls_callbacks(self) -> bool:
         '''Checks if binary uses TLS Callbacks to execute code before main entry point.'''
+        # A TLS *directory* alone is normal (mingw, MSVC and Go binaries all
+        # have one). Only a non-empty callback array counts: AddressOfCallBacks
+        # must be set and its first entry must be a non-zero pointer.
         if not self.pe:
             return False
-        return hasattr(self.pe, 'DIRECTORY_ENTRY_TLS') and bool(getattr(self.pe, 'DIRECTORY_ENTRY_TLS', None))
+        tls = getattr(self.pe, 'DIRECTORY_ENTRY_TLS', None)
+        if not tls:
+            return False
+        try:
+            array_va = tls.struct.AddressOfCallBacks
+            if not array_va:
+                return False
+            rva = array_va - self.pe.OPTIONAL_HEADER.ImageBase
+            if getattr(self.pe, 'PE_TYPE', 0x10b) == 0x20b:
+                first = self.pe.get_qword_at_rva(rva)
+            else:
+                first = self.pe.get_dword_at_rva(rva)
+            return bool(first)
+        except Exception:
+            return False
 
     def get_packer_sections(self) -> List[str]:
         '''Returns section names matching known packer signatures.'''

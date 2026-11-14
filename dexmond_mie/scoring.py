@@ -16,7 +16,7 @@ class Scorer:
         'b64_executable': 30,
         'packer_detected': 25,
         'pe_overlay': 15,
-        'tls_callback': 20,
+        'tls_callback': 5,
         'anomaly': 10,
         'reputation_malicious': 70,
         'oversize_partial_scan': 5,

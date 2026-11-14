@@ -186,11 +186,17 @@ class Engine:
         if pe_parsed:
             pe_info = pe_analyzer.analyze()
             results['details']['pe_info'] = pe_info
+            packer_sections = pe_analyzer.get_packer_sections()
+            entropy_warnings = [w for w in pe_info.get('warnings', []) if 'entropy' in w]
             for warning in pe_info.get('warnings', []):
                 if 'entropy' in warning:
                     scorer.add_finding('high_entropy', warning)
                 elif 'TLS Callbacks' in warning:
-                    scorer.add_finding('tls_callback', warning)
+                    # TLS callbacks are scored (weight 5) only together with a
+                    # packer or high-entropy-section signal; otherwise they are
+                    # reported in pe_info.tls_callbacks only
+                    if packer_sections or entropy_warnings:
+                        scorer.add_finding('tls_callback', warning)
                 elif 'overlay' in warning:
                     scorer.add_finding('pe_overlay', warning)
                 else:
@@ -208,7 +214,6 @@ class Engine:
             if suspicious_imports:
                 scorer.add_finding('suspicious_import',
                                    f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
-            packer_sections = pe_analyzer.get_packer_sections()
             if packer_sections:
                 scorer.add_finding('packer_detected',
                                    f"Packer section names detected: {', '.join(packer_sections)}")
