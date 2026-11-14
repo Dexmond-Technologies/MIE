@@ -157,6 +157,8 @@ def status():
         'rules_dir': RULES_DIR,
         'yara_loaded': engine.yara_engine.rules is not None,
         'rules_count': engine.yara_engine.rules_count,
+        'yara_status': engine.yara_engine.status,
+        'yara_errors': engine.yara_engine.errors,
         'scans': _stats['scans'],
         'threats': _stats['threats'],
         'reputation': engine.reputation.counts,
@@ -580,7 +582,12 @@ async function refresh() {
       (await afetch('/status')).json(),
       (await afetch('/api/quarantine')).json()]);
     $('ver').textContent = s.version;
-    $('rules').textContent = s.yara_loaded ? s.rules_count : 'off';
+    // F2: a visible YARA-OFF / DEGRADED state, never a silent "off"
+    const ys = s.yara_status || (s.yara_loaded ? 'ON' : 'YARA-OFF');
+    $('rules').textContent = ys === 'ON' ? s.rules_count
+      : (ys === 'DEGRADED' ? s.rules_count + ' (DEGRADED)' : 'YARA-OFF');
+    $('rules').style.color = ys === 'ON' ? '' : 'var(--danger)';
+    $('rules').title = (s.yara_errors || []).map((e) => e.file + ': ' + e.error).join('\n');
     const rep = s.reputation || {malicious: 0, trusted: 0};
     $('repLine').textContent = rep.malicious + ' known-bad / ' + rep.trusted + ' trusted hashes';
     $('scans').textContent = s.scans;

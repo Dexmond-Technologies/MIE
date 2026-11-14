@@ -32,6 +32,9 @@ def print_results(results, output_format='console'):
     print(f'''\n{Fore.CYAN}=== DEXMOND MIE Scan Results ==={Style.RESET_ALL}''')
     print(f'''File: {results.get('path')}''')
     print(f'''Verdict: {color_verdict(results.get('verdict'))} (Score: {results.get('score')}/100)''')
+    yara_status = results.get('details', {}).get('yara_status')
+    if yara_status and yara_status != 'ON':
+        print(f'''{Fore.RED}YARA status: {yara_status} (rule-based detection is not complete){Style.RESET_ALL}''')
     print('Hashes:')
     for k, v in results.get('hashes', {}).items():
         print(f'''  {k.upper()}: {v}''')
@@ -190,6 +193,13 @@ def run():
         engine = Engine(args.rules_dir, paths.reputation_db(),
                         use_reputation=not args.no_reputation,
                         auto_evolution=True if args.auto_evolution else None)
+        yara_info = engine.yara_engine.status_info()
+        if yara_info['status'] != 'ON':
+            print(f'''{Fore.RED}WARNING: YARA status {yara_info['status']}: '''
+                  f'''{yara_info['rule_files']} rule file(s) loaded, '''
+                  f'''{len(yara_info['errors'])} failed{Style.RESET_ALL}''', file=sys.stderr)
+            for err in yara_info['errors']:
+                print(f'''  {err['file']}: {err['error']}''', file=sys.stderr)
         target_path = os.path.abspath(args.target)
         if os.path.isfile(target_path):
             results = engine.scan_file(target_path)

@@ -102,7 +102,7 @@ class Engine:
             'scan_time': 0,
             'verdict': 'UNKNOWN',
             'score': 0,
-            'details': {}}
+            'details': {'yara_status': self.yara_engine.status}}
         scorer = Scorer()
 
         # --- Reputation lookup ---
