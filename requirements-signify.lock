@@ -1,0 +1,7 @@
+# signify lock for MIE X12 (SENTINEL 2026-11-14). Target: CPython 3.13, x86_64 Linux (tiny). Install with: pip install --require-hashes -r requirements-signify.lock
+asn1crypto==1.5.1 --hash=sha256:db4e40728b728508912cbb3d44f19ce188f218e9eba635821bb4b68564f8fd67
+certvalidator==0.11.1 --hash=sha256:77520b269f516d4fb0902998d5bd0eb3727fe153b659aa1cb828dcf12ea6b8de
+mscerts==2026.10.27 --hash=sha256:7152052d6b23bbfe23bf26844dc9c2da00299dfb1f48c62889743b6396bcfaab
+oscrypto==1.3.0 --hash=sha256:2b2f1d2d42ec152ca90ccb5682f3e051fb55986e1b170ebde472b133713e7085
+signify==0.9.3 --hash=sha256:c67f327e34e480e18ff7c4d56f48703dc40e12bd77a4cccfebc0fd0e1fd4e3da
+typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

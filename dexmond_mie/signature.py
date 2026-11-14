@@ -48,7 +48,7 @@ PUBLISHERS_CONFIG = os.path.join(_ROOT, 'config', 'trusted_publishers.json')
 # sha256 of trust/authenticode_roots.pem. None = the reviewed store has NOT
 # been provisioned yet, so every portable check returns 'unavailable'.
 # Setting it is a SENTINEL-reviewed commit together with the PEM file.
-PINNED_ROOTS_SHA256 = None
+PINNED_ROOTS_SHA256 = "59934744aa41b1432da5196f37e97bac269df7be62bb02d65b74d08d80b6d2c4"  # SENTINEL-provisioned 2026-11-14: Microsoft Root CA 2011, 2010, 2001 (see trust/README)
 DEFAULT_TRUSTED_PUBLISHERS = ('Microsoft Corporation',)
 MAX_SIGNATURE_BYTES = 1024 * 1024
 VERIFY_TIMEOUT_S = 2.0
