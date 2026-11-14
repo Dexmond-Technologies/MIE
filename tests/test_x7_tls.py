@@ -44,3 +44,17 @@ def test_tls_callbacks_with_packer_scored_5(tmp_path, make_engine, monkeypatch):
     tls = [f for f in results['findings'] if f['category'] == 'tls_callback']
     assert len(tls) == 1 and tls[0]['weight'] == 5
     assert Scorer.WEIGHTS['tls_callback'] == 5
+
+
+def test_tls_gate_opened_by_resource_slack_entropy(tmp_path, make_engine, monkeypatch):
+    '''Old semantics restored: ANY entropy warning (here: high entropy
+    outside the resource data entries) opens the TLS-callback gate.'''
+    import os
+    rsrc = FakeSection('.rsrc', 7.9, 'R', va=0x3000, data=b'\0' * 512 + os.urandom(8192))
+    patch_engine_pe(monkeypatch, tls_callbacks=[0x401000], resource_rva=0x3000,
+                    resources=[(0x3000, 512)],
+                    sections=[FakeSection('.text', 6.0, 'RX'), rsrc])
+    results = make_engine().scan_file(_pe_file(tmp_path))
+    assert any('outside its resource data entries' in w
+               for w in results['details']['pe_info']['warnings'])
+    assert 'tls_callback' in _cats(results)

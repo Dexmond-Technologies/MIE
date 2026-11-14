@@ -89,3 +89,35 @@ def test_upx_names_without_yara_confirm_nothing(tmp_path, make_engine, monkeypat
     results = _scan(tmp_path, make_engine, monkeypatch, yara=())
     assert 'packer_confirmed' not in results['details']
     assert results['score'] >= 30
+
+
+def test_duplicate_upx1_name_rejects_confirmation(tmp_path, make_engine, monkeypatch):
+    '''A second section also named UPX1 (high entropy, RWX) must not be
+    folded into the packing cap: section identity is the index, and a
+    repeated name rejects the confirmation altogether.'''
+    pe = dict(UPX_PE)
+    pe['sections'] = UPX_PE['sections'] + [FakeSection('UPX1', 7.9, 'RWX', raw_size=0x4000,
+                                                       va=0x1A000)]
+    results = _scan(tmp_path, make_engine, monkeypatch, **pe)
+    assert 'packer_confirmed' not in results['details']
+    assert not any(f.get('family') == 'packing' for f in results['findings'])
+
+
+def test_name_with_embedded_nul_or_non_ascii_rejects_confirmation(tmp_path, make_engine,
+                                                                  monkeypatch):
+    for bad in (b'.te\0xt', b'.t\xe9xt'):
+        extra = FakeSection('.text', 6.0, 'RX', raw_size=0x1000, va=0x1B000)
+        extra.Name = bad.ljust(8, b'\0')
+        pe = dict(UPX_PE)
+        pe['sections'] = UPX_PE['sections'] + [extra]
+        results = _scan(tmp_path, make_engine, monkeypatch, **pe)
+        assert 'packer_confirmed' not in results['details'], bad
+
+
+def test_confirmed_sections_are_indices():
+    from fakepe import analyzer
+    a = analyzer(**UPX_PE)
+    assert a.confirmed_upx_sections(['Packer_UPX']) == {0, 1}
+    a._check_anomalies()
+    assert a.high_entropy_sections == [1]
+    assert a.wx_sections == [0, 1]

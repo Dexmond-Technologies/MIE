@@ -180,22 +180,25 @@ class Engine:
             # the packer's real section layout), and only for the packer's
             # OWN sections. A fake marker folds nothing: every other finding
             # keeps its own weight outside the cap.
-            own = pe_analyzer.confirmed_upx_sections(packer_yara)
+            own = pe_analyzer.confirmed_upx_sections(packer_yara)   # section indices
+            names = [pe_analyzer._section_name(sec) for sec in pe_analyzer.pe.sections]
             if own:
-                results['details']['packer_confirmed'] = sorted(own)
+                results['details']['packer_confirmed'] = [names[i] for i in sorted(own)]
             pack = lambda in_packer: 'packing' if in_packer else None  # noqa: E731
             he_sections = pe_info.get('high_entropy_sections', [])
-            for name in he_sections:
+            for idx in he_sections:
                 scorer.add_finding('high_entropy',
-                                   f'Section {name} has very high entropy (packed/encrypted?)',
-                                   family=pack(name in own))
+                                   f'Section {names[idx]} has very high entropy (packed/encrypted?)',
+                                   family=pack(idx in own))
             wx = pe_info.get('wx_sections', [])
-            for group, in_packer in (([n for n in wx if n in own], True),
-                                     ([n for n in wx if n not in own], False)):
+            for group, in_packer in (([i for i in wx if i in own], True),
+                                     ([i for i in wx if i not in own], False)):
                 if group:
                     scorer.add_finding('wx_section',
-                                       f"Writable and executable section(s): {', '.join(group)}",
+                                       f"Writable and executable section(s): "
+                                       f"{', '.join(names[i] for i in group)}",
                                        family=pack(in_packer))
+            any_entropy_warning = any('entropy' in w for w in pe_info.get('warnings', []))
             for warning in pe_info.get('warnings', []):
                 if '(packed/encrypted?)' in warning or 'Writable and executable' in warning:
                     continue  # scored per section above
@@ -203,9 +206,9 @@ class Engine:
                     scorer.add_finding('high_entropy', warning)
                 elif 'TLS Callbacks' in warning:
                     # TLS callbacks are scored (weight 5) only together with a
-                    # packer or high-entropy-section signal; otherwise they are
+                    # packer or any entropy signal; otherwise they are
                     # reported in pe_info.tls_callbacks only
-                    if packer_sections or packer_yara or he_sections:
+                    if packer_sections or packer_yara or he_sections or any_entropy_warning:
                         scorer.add_finding('tls_callback', warning,
                                            family=pack(pe_info.get('tls_callback_section') in own))
                 elif 'overlay' in warning:

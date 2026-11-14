@@ -140,6 +140,7 @@ class PEAnalyzer:
             'certificate': self.parse_certificate_table(),
             'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies(),
+            # section identity is the INDEX (names can be duplicated/spoofed)
             'high_entropy_sections': list(self.high_entropy_sections),
             'wx_sections': list(self.wx_sections),
             'tls_callback_section': self.tls_callback_section(),
@@ -405,14 +406,15 @@ class PEAnalyzer:
             return False
 
     def section_at_rva(self, rva: int):
-        for section in self.pe.sections:
+        '''Index of the section containing rva, or None.'''
+        for index, section in enumerate(self.pe.sections):
             span = max(section.Misc_VirtualSize, section.SizeOfRawData)
             if section.VirtualAddress <= rva < section.VirtualAddress + span:
-                return section
+                return index
         return None
 
     def tls_callback_section(self):
-        '''Name of the section the first TLS callback points into.'''
+        '''Index of the section the first TLS callback points into.'''
         if not self.has_tls_callbacks():
             return None
         try:
@@ -423,32 +425,48 @@ class PEAnalyzer:
                 first = self.pe.get_qword_at_rva(rva)
             else:
                 first = self.pe.get_dword_at_rva(rva)
-            section = self.section_at_rva(first - base)
-            return self._section_name(section) if section is not None else None
+            return self.section_at_rva(first - base)
         except Exception:
             return None
+
+    def _section_names_clean(self) -> bool:
+        '''Every raw section name is ASCII, has no NUL before its padding,
+        and no name repeats.'''
+        seen = set()
+        for section in self.pe.sections:
+            raw = bytes(section.Name)
+            name = raw.rstrip(b'\0')
+            if b'\0' in name or any(b < 0x20 or b > 0x7e for b in name):
+                return False
+            if name in seen:
+                return False
+            seen.add(name)
+        return True
 
     def confirmed_upx_sections(self, yara_rules) -> set:
         '''UPX is CONFIRMED only when the Packer_UPX YARA rule matched AND the
         section layout is the one UPX writes: UPX0 (no raw data, non-zero
         virtual size, executable) and UPX1 (raw data, executable) with the
-        entry point inside UPX1. A UPX string or section name alone is not
-        confirmation. Returns the packer's own section names, or an empty
-        set.'''
+        entry point inside UPX1, and every section name clean (ASCII, no
+        embedded NUL, no duplicates). Returns the packer's own section
+        INDICES, or an empty set.'''
         if 'Packer_UPX' not in set(yara_rules or ()):
             return set()
-        by_name = {self._section_name(s): s for s in self.pe.sections}
-        upx0, upx1 = by_name.get('UPX0'), by_name.get('UPX1')
-        if upx0 is None or upx1 is None:
+        if not self._section_names_clean():
             return set()
+        by_name = {self._section_name(s): i for i, s in enumerate(self.pe.sections)}
+        i0, i1 = by_name.get('UPX0'), by_name.get('UPX1')
+        if i0 is None or i1 is None:
+            return set()
+        upx0, upx1 = self.pe.sections[i0], self.pe.sections[i1]
         if upx0.SizeOfRawData != 0 or not upx0.Misc_VirtualSize or not upx1.SizeOfRawData:
             return set()
         if 'X' not in self._get_section_permissions(upx0) or \
                 'X' not in self._get_section_permissions(upx1):
             return set()
-        if self.section_at_rva(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint) is not upx1:
+        if self.section_at_rva(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint) != i1:
             return set()
-        return {'UPX0', 'UPX1'}
+        return {i0, i1}
 
     def get_packer_sections(self) -> List[str]:
         '''Returns section names matching known packer signatures.'''
@@ -538,10 +556,10 @@ class PEAnalyzer:
 
     def _check_anomalies(self) -> List[str]:
         warnings = []
-        self.high_entropy_sections = []
+        self.high_entropy_sections = []      # indices into pe.sections
         wx_sections = []
         resource_section = self.get_resource_section()
-        for section in self.pe.sections:
+        for index, section in enumerate(self.pe.sections):
             # The resource section holds icons, images and compressed
             # resources: high entropy there is normal and is not counted. It
             # is found through the resource data directory, not by name.
@@ -553,15 +571,16 @@ class PEAnalyzer:
                     warnings.append(f'Section {self._section_name(section)} has very high entropy '
                                     f'outside its resource data entries')
             elif section.get_entropy() > 7:
-                self.high_entropy_sections.append(self._section_name(section))
+                self.high_entropy_sections.append(index)
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:
-                wx_sections.append(self._section_name(section))
-        self.wx_sections = wx_sections
+                wx_sections.append(index)
+        self.wx_sections = wx_sections       # indices into pe.sections
         if wx_sections:
             # counted once per file, however many W+X sections there are
-            warnings.append(f"Writable and executable section(s): {', '.join(wx_sections)}")
+            names = ', '.join(self._section_name(self.pe.sections[i]) for i in wx_sections)
+            warnings.append(f"Writable and executable section(s): {names}")
         if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
             warnings.append('Entry point is zero')
         if self.has_tls_callbacks():
