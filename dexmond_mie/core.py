@@ -17,6 +17,12 @@ logger = logging.getLogger('DEXMOND_MIE')
 
 # Cap the amount of data loaded for entropy/string analysis
 MAX_ANALYSIS_BYTES = 32 * 1024 * 1024
+# Files larger than this are hashed and checked against the reputation list
+# only. YARA maps the whole file and pefile maps it too, so a 1 GiB file
+# peaked at 2.1 GiB RSS; above the limit both are skipped and the result
+# says so (verdict SKIPPED_VERDICT, details.skipped).
+MAX_SCAN_BYTES = 256 * 1024 * 1024
+SKIPPED_VERDICT = 'SKIPPED (SIZE LIMIT)'
 # Archive scanning limits (guard against zip bombs)
 MAX_ARCHIVE_MEMBERS = 200
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
@@ -34,8 +40,9 @@ class Engine:
     '''Orchestrates the malware inspection process.'''
 
     def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json',
-                 use_reputation: bool = True):
+                 use_reputation: bool = True, max_scan_bytes: int = None):
         self.rules_dir = rules_dir
+        self.max_scan_bytes = MAX_SCAN_BYTES if max_scan_bytes is None else max_scan_bytes
         # use_reputation=False is the measuring mode (CLI --no-reputation):
         # the known-hash list is not consulted, so detection by YARA and the
         # heuristics can be measured on its own.
@@ -83,6 +90,27 @@ class Engine:
                 results['scan_time'] = round(time.time() - start_time, 3)
                 logger.info(f"Reputation hit: TRUSTED ({rep['label']})")
                 return results
+
+        # --- Size limit: stated skip, never a silent CLEAN ---
+        if results['size'] > self.max_scan_bytes:
+            results['yara'] = []
+            results['details']['skipped'] = {
+                'reason': 'size limit',
+                'limit_bytes': self.max_scan_bytes,
+                'stages': ['entropy', 'yara', 'pe', 'strings', 'archive']}
+            if rep_malicious:
+                scorer.add_finding('reputation_malicious',
+                                   f"Known malicious file (reputation: {rep_malicious['label']})")
+                scorer.set_floor(MALICIOUS_FLOOR)
+                results['verdict'] = scorer.get_verdict()
+            else:
+                results['verdict'] = SKIPPED_VERDICT
+            results['findings'] = scorer.findings
+            results['score'] = scorer.get_score()
+            results['scan_time'] = round(time.time() - start_time, 3)
+            logger.warning(f"Skipped content analysis of {file_path}: "
+                           f"{results['size']} bytes is over the {self.max_scan_bytes}-byte size limit")
+            return results
 
         try:
             with open(file_path, 'rb') as f:

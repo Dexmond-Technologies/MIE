@@ -260,8 +260,14 @@ def scan_path(payload: dict):
 @app.post('/api/scan/upload')
 async def scan_upload(file: UploadFile = File(...)):
     suffix = os.path.splitext(file.filename or '')[1]
+    # Stream the upload to disk in chunks: reading it whole would put a large
+    # file in memory before the engine's size limit can apply.
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
         tmp_path = tmp.name
     try:
         results = engine.scan_file(tmp_path)
@@ -628,7 +634,7 @@ async function toggleAutoQuarantine() {
 
 function verdictColor(v) {
   if (v.includes('MALICIOUS')) return 'var(--danger)';
-  if (v.includes('SUSPICIOUS')) return 'var(--warn)';
+  if (v.includes('SUSPICIOUS') || v.includes('SKIPPED')) return 'var(--warn)';
   return 'var(--clean)';
 }
 

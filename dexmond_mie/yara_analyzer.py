@@ -10,6 +10,9 @@ except ImportError:
 logger = logging.getLogger('DEXMOND_MIE')
 
 SCAN_TIMEOUT = 60
+# yara's match(file) maps the whole file; never hand it a file above this
+# size (the engine applies the same limit and records the skip).
+MAX_YARA_FILE_BYTES = 256 * 1024 * 1024
 
 
 class YaraAnalyzer:
@@ -54,6 +57,14 @@ class YaraAnalyzer:
     def scan(self, file_path: str) -> List[Dict]:
         '''Scans a file with compiled rules.'''
         if not self.rules:
+            return []
+        try:
+            size = os.path.getsize(file_path)
+        except OSError as e:
+            logger.error(f'YARA scan failed on {file_path}: {e}')
+            return []
+        if size > MAX_YARA_FILE_BYTES:
+            logger.warning(f'YARA skipped on {file_path}: {size} bytes is over the size limit')
             return []
         try:
             matches = self.rules.match(file_path, timeout=SCAN_TIMEOUT)
