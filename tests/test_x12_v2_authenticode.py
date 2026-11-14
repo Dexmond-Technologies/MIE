@@ -309,3 +309,28 @@ def test_parity_windows_vs_signify():
         w = signature._verify_windows(path)
         p = _verify(path, store, sha)
         assert (w['status'], w['publisher']) == (p['status'], p['publisher']), path
+
+
+def test_neg_pinned_store_really_used_not_os_or_bundle(tmp_path):
+    '''A real Microsoft-signed file checked against a pinned store that holds
+    ONLY a throwaway root must NOT be valid. Catches signify silently falling
+    back to its bundled or the OS trust store.'''
+    files, _, _ = _real_env()
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime as dt
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'Throwaway Test Root')])
+    now = dt.datetime.now(dt.timezone.utc)
+    root = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(key, hashes.SHA256()))
+    pem = root.public_bytes(serialization.Encoding.PEM)
+    store = tmp_path / 'only_throwaway.pem'
+    store.write_bytes(pem)
+    r = _verify(files[0], str(store), hashlib.sha256(pem).hexdigest())
+    assert r['status'] != 'valid', r
