@@ -10,7 +10,10 @@ IMAGE_SCN_MEM_WRITE = 0x80000000
 
 class FakeSection:
     def __init__(self, name, entropy=5.0, perms='R', raw_size=0x1000, va=0x1000,
-                 raw_ptr=0x400):
+                 raw_ptr=0x400, data=None):
+        self._data = data if data is not None else b'\0' * raw_size
+        if data is not None:
+            raw_size = len(data)
         self.Name = name.encode().ljust(8, b'\0')
         self._entropy = entropy
         self.Characteristics = 0
@@ -28,11 +31,15 @@ class FakeSection:
     def get_entropy(self):
         return self._entropy
 
+    def get_data(self):
+        return self._data
+
 
 class FakePE:
     def __init__(self, imports=None, sections=None, timestamp=0x60000000,
                  entry=0x1000, tls_callbacks=None, overlay_size=0, image_base=0x400000,
-                 is_64=False, resource_rva=0, security=None, overlay_data=None):
+                 is_64=False, resource_rva=0, security=None, overlay_data=None,
+                 resources=None):
         self.FILE_HEADER = NS(Machine=0x8664 if is_64 else 0x14c, TimeDateStamp=timestamp)
         dirs = [NS(VirtualAddress=0, Size=0) for _ in range(16)]
         dirs[2] = NS(VirtualAddress=resource_rva, Size=0x100 if resource_rva else 0)
@@ -54,6 +61,14 @@ class FakePE:
         if tls_callbacks is not None:
             arr_va = image_base + 0x5000 if tls_callbacks else 0
             self.DIRECTORY_ENTRY_TLS = NS(struct=NS(AddressOfCallBacks=arr_va))
+        # resources: list of (rva, size) data entries -> a 3-level tree like
+        # pefile's DIRECTORY_ENTRY_RESOURCE
+        if resources is not None:
+            leaves = [NS(data=NS(struct=NS(OffsetToData=r, Size=z)), directory=None)
+                      for r, z in resources]
+            self.DIRECTORY_ENTRY_RESOURCE = NS(entries=[NS(
+                name=None, struct=NS(Id=10), data=None,
+                directory=NS(entries=[NS(data=None, directory=NS(entries=leaves))]))])
         self._overlay_size = overlay_size
         self.__data__ = b'\0' * 0x2000 + (overlay_data if overlay_data is not None
                                             else b'\0' * overlay_size)

@@ -46,7 +46,9 @@ def test_non_pe_large_share_fires_with_weight_10(tmp_path, make_engine):
     assert len(spikes) == 1 and spikes[0]['weight'] == 10
 
 
-def test_valid_png_structure_is_exempt(tmp_path, make_engine):
+def test_png_is_reduced_not_exempt(tmp_path, make_engine):
+    '''A PNG is never unpacked, so its entropy is never fully exempt: the
+    finding stays, at the reduced weight.'''
     import struct
     import zlib
     ihdr = b'IHDR' + struct.pack('>IIBBBBB', 64, 64, 8, 2, 0, 0, 0)
@@ -55,9 +57,9 @@ def test_valid_png_structure_is_exempt(tmp_path, make_engine):
     p = tmp_path / 'img.png'
     p.write_bytes(png + _text(32 * 1024) + os.urandom(32 * 1024))
     results = make_engine().scan_file(str(p))
-    assert results['details']['compressed_format'] == {'format': 'png', 'structure_valid': True}
-    assert 'sliding_entropy_spike' not in _cats(results)
     assert detect_compressed_format(p.read_bytes()) == 'png'
+    spikes = [f for f in results['findings'] if f['category'] == 'sliding_entropy_spike']
+    assert len(spikes) == 1 and spikes[0]['weight'] == 5
 
 
 def _pe_file(tmp_path, body):
@@ -96,32 +98,73 @@ def test_pe_without_pefile_is_not_exempt(tmp_path, make_engine, monkeypatch):
     assert results['details']['pe_analysis'].startswith('unavailable')
 
 
-def test_overlay_entropy_measured_without_certificate(tmp_path, make_engine, monkeypatch):
-    cert = b'\x30\x82' + bytes(range(256)) * 16          # stand-in cert blob
+def _win_cert(body_len=1024, revision=0x0200, cert_type=0x0002, der=b'\x30\x82'):
+    body = der + bytes(range(256)) * (body_len // 256)
+    length = 8 + len(body)
+    blob = struct.pack('<IHH', length, revision, cert_type) + body
+    return blob + b'\0' * ((-len(blob)) % 8)
+
+
+def test_overlay_entropy_measured_without_valid_certificate(tmp_path, make_engine, monkeypatch):
+    cert = _win_cert(4096)
     overlay = cert + os.urandom(16 * 1024)
-    patch_engine_pe(monkeypatch, overlay_data=overlay,
-                    security=(0x2000, len(cert)))
+    patch_engine_pe(monkeypatch, overlay_data=overlay, security=(0x2000, len(cert)))
     results = make_engine().scan_file(_pe_file(tmp_path, b'\0' * 1024))
     info = results['details']['pe_info']['overlay_entropy']
+    assert results['details']['pe_info']['certificate']['valid']
     assert info['certificate_excluded'] == len(cert)
     assert info['size'] == 16 * 1024
     assert 'overlay_high_entropy' in _cats(results)
+    assert 'malformed_certificate_table' not in _cats(results)
 
 
-def test_resource_section_found_by_directory_not_name():
-    # real resource section (via data directory), not executable: exempt
-    a = analyzer(sections=[FakeSection('.text', 6.0, 'RX', va=0x1000),
-                           FakeSection('.rsrc', 7.9, 'R', va=0x3000)], resource_rva=0x3000)
+def test_malformed_certificate_is_not_excluded_and_flagged(tmp_path, make_engine, monkeypatch):
+    for bad in (_win_cert(4096, revision=0x0100), _win_cert(4096, cert_type=0x0001),
+                _win_cert(4096, der=b'\xde\xad')):
+        overlay = bad + os.urandom(16 * 1024)
+        patch_engine_pe(monkeypatch, overlay_data=overlay, security=(0x2000, len(bad)))
+        results = make_engine().scan_file(_pe_file(tmp_path, b'\0' * 1024))
+        assert results['details']['pe_info']['overlay_entropy']['certificate_excluded'] == 0
+        assert 'malformed_certificate_table' in _cats(results)
+
+
+def test_oversized_certificate_declaration_is_flagged_not_excluded(tmp_path, make_engine,
+                                                                   monkeypatch):
+    # declared Size also covers a random payload after the real entry
+    cert = _win_cert(1024)
+    overlay = cert + os.urandom(32 * 1024)
+    patch_engine_pe(monkeypatch, overlay_data=overlay, security=(0x2000, len(overlay)))
+    results = make_engine().scan_file(_pe_file(tmp_path, b'\0' * 1024))
+    assert results['details']['pe_info']['overlay_entropy']['certificate_excluded'] == 0
+    assert 'malformed_certificate_table' in _cats(results)
+    assert 'overlay_high_entropy' in _cats(results)
+
+
+def test_resource_exemption_needs_parsed_tree_and_covers_only_entries():
+    def sec(data, perms='R'):
+        return FakeSection('.rsrc', 7.9, perms, va=0x3000, data=data)
+    icon = os.urandom(8 * 1024)
+    # parsed tree, entries cover the high-entropy bytes, rest is zeros: exempt
+    a = analyzer(sections=[sec(icon + b'\0' * 4096)], resource_rva=0x3000,
+                 resources=[(0x3000, len(icon))])
     assert not any('entropy' in w for w in a._check_anomalies())
-    # a section NAMED .rsrc that the resource directory does not point to
-    b = analyzer(sections=[FakeSection('.text', 6.0, 'RX', va=0x1000),
-                           FakeSection('.rsrc', 7.9, 'R', va=0x3000)], resource_rva=0)
-    assert any('.rsrc' in w and 'entropy' in w for w in b._check_anomalies())
-    # the resource directory points into an EXECUTABLE section: not exempt
-    c = analyzer(sections=[FakeSection('.rsrc', 7.9, 'RX', va=0x3000)], resource_rva=0x3000)
-    assert any('entropy' in w for w in c._check_anomalies())
-    d = analyzer(sections=[FakeSection('.text', 7.6, 'RX')])
-    assert any('.text' in w and 'entropy' in w for w in d._check_anomalies())
+    # parsed tree, but random bytes OUTSIDE the data entries: flagged
+    b = analyzer(sections=[sec(b'\0' * 512 + os.urandom(8 * 1024))], resource_rva=0x3000,
+                 resources=[(0x3000, 512)])
+    assert any('outside its resource data entries' in w for w in b._check_anomalies())
+    # data directory set but no parsed resource tree: not exempt
+    c = analyzer(sections=[sec(icon)], resource_rva=0x3000)
+    assert any('.rsrc' in w and 'entropy' in w for w in c._check_anomalies())
+    # writable or executable resource section: not exempt
+    for perms in ('RW', 'RX'):
+        d = analyzer(sections=[sec(icon, perms)], resource_rva=0x3000,
+                     resources=[(0x3000, len(icon))])
+        assert any('entropy' in w for w in d._check_anomalies()), perms
+    # a section NAMED .rsrc with no resource directory at all: not exempt
+    f = analyzer(sections=[sec(icon)], resource_rva=0)
+    assert any('entropy' in w for w in f._check_anomalies())
+    g = analyzer(sections=[FakeSection('.text', 7.6, 'RX')])
+    assert any('.text' in w and 'entropy' in w for w in g._check_anomalies())
 
 
 def test_fake_magic_does_not_switch_off_detector(tmp_path, make_engine):
@@ -135,13 +178,13 @@ def test_fake_magic_does_not_switch_off_detector(tmp_path, make_engine):
         assert len(spikes) == 1 and spikes[0]['weight'] == 5, (magic, results['findings'])
 
 
-def test_valid_gzip_structure_is_exempt(tmp_path, make_engine):
+def test_plain_gzip_is_reduced_not_exempt(tmp_path, make_engine):
     import gzip
     p = tmp_path / 'data.gz'
     p.write_bytes(gzip.compress(os.urandom(64 * 1024)))
     results = make_engine().scan_file(str(p))
-    assert results['details']['compressed_format'] == {'format': 'gzip', 'structure_valid': True}
-    assert 'sliding_entropy_spike' not in _cats(results)
+    he = [f for f in results['findings'] if f['category'] == 'high_entropy']
+    assert len(he) == 1 and he[0]['weight'] == 5
 
 
 def test_is_pe_requires_pe_signature():

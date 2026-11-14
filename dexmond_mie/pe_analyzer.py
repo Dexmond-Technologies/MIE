@@ -1,5 +1,6 @@
 import datetime
 import logging
+import struct
 from typing import Dict, Any, List
 
 try:
@@ -14,6 +15,12 @@ logger = logging.getLogger('DEXMOND_MIE')
 DIR_RESOURCE = 2   # IMAGE_DIRECTORY_ENTRY_RESOURCE
 DIR_SECURITY = 4   # IMAGE_DIRECTORY_ENTRY_SECURITY (file offset, not RVA)
 MAX_OVERLAY_ENTROPY_BYTES = 32 * 1024 * 1024
+WIN_CERT_REVISION_2_0 = 0x0200
+WIN_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
+# resource-section bytes OUTSIDE the resource data entries that are enough
+# to judge their entropy
+MIN_RESOURCE_SLACK_BYTES = 1024
+MAX_RESOURCE_ENTRIES = 10000
 
 # Section names commonly left behind by executable packers
 PACKER_SECTIONS = {
@@ -130,6 +137,7 @@ class PEAnalyzer:
             'minor_api_chains': self.get_minor_api_chains(),
             'overlay': self.get_overlay_info(),
             'overlay_entropy': self.get_overlay_entropy(),
+            'certificate': self.parse_certificate_table(),
             'tls_callbacks': self.has_tls_callbacks(),
             'warnings': self._check_anomalies()}
         return results
@@ -228,20 +236,103 @@ class PEAnalyzer:
             return None
 
     def get_resource_section(self):
-        '''The section the resource data directory really points into, if that
-        section is not executable. The section NAME is not trusted (an
-        attacker can call any section ".rsrc").'''
+        '''The section that holds a resource tree pefile really parsed, if
+        that section is neither executable nor writable. Neither the section
+        NAME nor the data-directory field alone is trusted.'''
+        res = getattr(self.pe, 'DIRECTORY_ENTRY_RESOURCE', None)
         entry = self._data_directory(DIR_RESOURCE)
-        if entry is None or not entry.VirtualAddress:
+        if res is None or not getattr(res, 'entries', None) or entry is None or not entry.VirtualAddress:
             return None
         rva = entry.VirtualAddress
         for section in self.pe.sections:
             span = max(section.Misc_VirtualSize, section.SizeOfRawData)
             if section.VirtualAddress <= rva < section.VirtualAddress + span:
-                if 'X' in self._get_section_permissions(section):
+                perms = self._get_section_permissions(section)
+                if 'X' in perms or 'W' in perms:
                     return None
                 return section
         return None
+
+    def get_resource_data_ranges(self) -> List[tuple]:
+        '''(rva, size) of every resource DATA entry pefile parsed.'''
+        ranges = []
+        res = getattr(self.pe, 'DIRECTORY_ENTRY_RESOURCE', None)
+        stack = [(e, 0) for e in getattr(res, 'entries', []) or []]
+        while stack and len(ranges) < MAX_RESOURCE_ENTRIES:
+            node, depth = stack.pop()
+            data = getattr(node, 'data', None)
+            if data is not None and getattr(data, 'struct', None) is not None:
+                ranges.append((data.struct.OffsetToData, data.struct.Size))
+            directory = getattr(node, 'directory', None)
+            if directory is not None and depth < 4:
+                stack.extend((e, depth + 1) for e in getattr(directory, 'entries', []) or [])
+        return ranges
+
+    def resource_slack_entropy(self, section) -> Dict[str, Any]:
+        '''Entropy of the resource section's bytes that are NOT inside a
+        resource data entry (where a hidden payload would sit).'''
+        raw = section.get_data()
+        covered = []
+        for rva, size in self.get_resource_data_ranges():
+            start = max(rva - section.VirtualAddress, 0)
+            end = min(rva - section.VirtualAddress + size, len(raw))
+            if start < end:
+                covered.append((start, end))
+        pieces, pos = [], 0
+        for start, end in sorted(covered):
+            if start > pos:
+                pieces.append(bytes(raw[pos:start]))
+            pos = max(pos, end)
+        pieces.append(bytes(raw[pos:]))
+        slack = b''.join(pieces)
+        return {'size': len(slack), 'entropy': calculate_entropy(slack) if slack else 0.0}
+
+    def parse_certificate_table(self) -> Dict[str, Any]:
+        '''Validates the Authenticode certificate table (WIN_CERTIFICATE
+        entries) before any of it is excluded from entropy: dwLength in
+        bounds, wRevision 0x0200, wCertificateType 0x0002 (PKCS#7 signed
+        data), body starting as a DER SEQUENCE (30 82). This checks the
+        structure only; it does NOT verify the signature.'''
+        entry = self._data_directory(DIR_SECURITY)
+        if entry is None or not entry.Size:
+            return {'present': False, 'valid': False, 'parsed_size': 0, 'problems': []}
+        data = self.pe.__data__
+        flen = len(data)
+        off, size = entry.VirtualAddress, entry.Size
+        info = {'present': True, 'offset': off, 'declared_size': size, 'valid': False,
+                'parsed_size': 0, 'entries': 0, 'problems': []}
+        problems = info['problems']
+        if off <= 0 or off >= flen:
+            problems.append('certificate table offset outside the file')
+            return info
+        if off + size > flen:
+            problems.append('certificate table runs past the end of the file')
+        end = min(off + size, flen)
+        pos = off
+        while pos + 8 <= end:
+            length, revision, cert_type = struct.unpack_from('<IHH', data, pos)
+            if length < 10 or pos + length > end:
+                problems.append(f'bad dwLength {length} at offset {pos}')
+                break
+            if revision != WIN_CERT_REVISION_2_0:
+                problems.append(f'wRevision 0x{revision:04x} is not 0x0200')
+                break
+            if cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA:
+                problems.append(f'wCertificateType 0x{cert_type:04x} is not PKCS#7 (0x0002)')
+                break
+            if bytes(data[pos + 8:pos + 10]) != b'\x30\x82':
+                problems.append('certificate body is not PKCS#7 DER')
+                break
+            info['entries'] += 1
+            pos += (length + 7) & ~7
+        if not problems and end - pos >= 8:
+            problems.append(f'declared size is {end - pos} bytes larger than the certificates in it')
+        if info['entries'] and not problems:
+            info['valid'] = True
+            info['parsed_size'] = min(pos, end) - off
+        elif not info['entries'] and not problems:
+            problems.append('no certificate entries')
+        return info
 
     def get_overlay_entropy(self) -> Dict[str, Any]:
         '''Entropy of the data past the last section, measured on its own and
@@ -256,9 +347,12 @@ class PEAnalyzer:
         data = self.pe.__data__
         end = len(data)
         pieces = [(offset, end)]
-        cert = self._data_directory(DIR_SECURITY)
-        if cert is not None and cert.Size and cert.VirtualAddress >= offset:
-            c0, c1 = cert.VirtualAddress, min(cert.VirtualAddress + cert.Size, end)
+        # only a VALID certificate table is cut out, and only as far as its
+        # parsed entries reach (never the declared Size)
+        cert = self.parse_certificate_table()
+        if cert['valid'] and cert['offset'] >= offset:
+            c0 = cert['offset']
+            c1 = min(c0 + cert['parsed_size'], end)
             pieces = [(offset, c0), (c1, end)]
             info['certificate_excluded'] = c1 - c0
         blob = b''.join(bytes(data[a:b]) for a, b in pieces if b > a)[:MAX_OVERLAY_ENTROPY_BYTES]
@@ -365,7 +459,14 @@ class PEAnalyzer:
             # The resource section holds icons, images and compressed
             # resources: high entropy there is normal and is not counted. It
             # is found through the resource data directory, not by name.
-            if section is not resource_section and section.get_entropy() > 7:
+            if section is resource_section:
+                # exempt only the resource data entries themselves; the rest
+                # of the section is still judged
+                slack = self.resource_slack_entropy(section)
+                if slack['size'] >= MIN_RESOURCE_SLACK_BYTES and slack['entropy'] > 7:
+                    warnings.append(f'Section {self._section_name(section)} has very high entropy '
+                                    f'outside its resource data entries')
+            elif section.get_entropy() > 7:
                 warnings.append(f'Section {self._section_name(section)} has very high entropy (packed/encrypted?)')
             perms = self._get_section_permissions(section)
             if 'W' in perms and 'X' in perms:

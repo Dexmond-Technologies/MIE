@@ -7,8 +7,7 @@ import logging
 from typing import Dict, Any
 
 from .utils import (calculate_hashes, calculate_entropy, calculate_sliding_window_entropy,
-                    detect_compressed_format, validate_compressed_format, is_pe_data,
-                    StringExtractor)
+                    detect_compressed_format, is_pe_data, StringExtractor)
 from .pe_analyzer import PEAnalyzer
 from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
@@ -33,9 +32,14 @@ PARTIAL_VERDICT = 'SUSPICIOUS (LOW): oversize, partially scanned'
 # Non-PE files: the high-entropy-pocket finding needs more than this share of
 # 4 KiB windows above 7.2 bits (one icon or embedded blob is not enough)
 SLIDING_HIGH_SHARE = 0.25
-# A file that only CLAIMS a compressed format (magic bytes, structure not
-# validated) still gets its entropy findings, at this lower weight
-UNVALIDATED_FORMAT_WEIGHT = 5
+# Entropy findings on a compressed/archive format keep this reduced weight.
+# The ONLY full exemption: an archive whose members were all unpacked and
+# scanned and whose members cover the whole file (archive coverage).
+REDUCED_ENTROPY_WEIGHT = 5
+# Trailing zero padding allowed after the last tar member
+MAX_TAR_PADDING = 1024 * 1024
+# Slack allowed after a zip member that uses a data descriptor
+ZIP_DESCRIPTOR_SLACK = 24
 # Overlay (data past the last PE section, certificate cut out)
 OVERLAY_ENTROPY_MIN_BYTES = 4096
 # Archive scanning limits (guard against zip bombs)
@@ -48,7 +52,6 @@ MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_DEPTH = 3
 # Score floor applied for a malicious reputation hit (forces MALICIOUS)
 MALICIOUS_FLOOR = 70
-ARCHIVE_EXTENSIONS = ('.zip', '.jar', '.apk', '.tar', '.tar.gz', '.tgz', '.tar.bz2')
 
 
 class Engine:
@@ -115,7 +118,8 @@ class Engine:
 
         try:
             with open(file_path, 'rb') as f:
-                data = f.read(MAX_ANALYSIS_BYTES)
+                # read only what exists: read(n) allocates n bytes up front
+                data = f.read(min(results['size'] + 1, MAX_ANALYSIS_BYTES))
         except OSError as e:
             logger.error(f'Failed to read {file_path}: {e}')
             return {'error': str(e), 'path': file_path}
@@ -135,45 +139,14 @@ class Engine:
             else:
                 results['details']['pe_analysis'] = 'unavailable (pefile not installed)'
 
-        # --- Entropy ---
-        # Parsed PE files: entropy is judged per section (the resource section
-        # found via its data directory is ignored) and for the overlay on its
-        # own, not over the whole file, where resources, icons and signatures
-        # raise it. Everything else (including a PE that fails to parse) gets
-        # the whole-file and sliding-window checks.
+        # --- Entropy (measured here, scored after the archive scan) ---
         entropy = calculate_entropy(data)
         sliding_entropy = calculate_sliding_window_entropy(data)
         results['details']['entropy'] = round(entropy, 4)
         results['details']['sliding_entropy'] = sliding_entropy
         compressed_format = detect_compressed_format(data)
-        format_valid = (validate_compressed_format(compressed_format, data, file_path)
-                        if compressed_format else False)
         if compressed_format:
-            results['details']['compressed_format'] = {'format': compressed_format,
-                                                       'structure_valid': format_valid}
-        if not pe_parsed:
-            high_share = (sliding_entropy['high_entropy_windows'] / sliding_entropy['total_windows']
-                          if sliding_entropy['total_windows'] else 0)
-            # validated container: exempt; magic bytes only: lower weight
-            weight = None
-            note = ''
-            if compressed_format and not format_valid:
-                weight = UNVALIDATED_FORMAT_WEIGHT
-                note = f' (claims {compressed_format}, structure not valid)'
-            if entropy > 7.2 and format_valid:
-                # recognised archive/compressed container: high entropy is its
-                # nature; archive members are scanned on their own (X5)
-                results['details']['entropy_note'] = (f'whole-file entropy not scored: '
-                                                      f'valid {compressed_format} container')
-            elif entropy > 7.2:
-                scorer.add_finding('high_entropy',
-                                   f'File has very high overall entropy ({entropy:.2f}/8.00) - '
-                                   f'likely packed or encrypted{note}', weight_override=weight)
-            elif high_share > SLIDING_HIGH_SHARE and not format_valid:
-                scorer.add_finding('sliding_entropy_spike',
-                                   f"{sliding_entropy['high_entropy_windows']} of {sliding_entropy['total_windows']} "
-                                   f"windows have high entropy (peak {sliding_entropy['max']:.2f}/8.00){note}",
-                                   weight_override=weight)
+            results['details']['compressed_format'] = compressed_format
 
         # --- YARA ---
         yara_matches = self.yara_engine.scan(file_path)
@@ -201,6 +174,11 @@ class Engine:
                     scorer.add_finding('pe_overlay', warning)
                 else:
                     scorer.add_finding('anomaly', warning)
+            cert = pe_info.get('certificate', {})
+            if cert.get('present') and not cert.get('valid'):
+                scorer.add_finding('malformed_certificate_table',
+                                   f"Authenticode certificate table is malformed or oversized: "
+                                   f"{'; '.join(cert.get('problems', []))}")
             overlay = pe_info.get('overlay_entropy', {})
             if overlay.get('size', 0) >= OVERLAY_ENTROPY_MIN_BYTES and overlay.get('entropy', 0) > 7.2:
                 scorer.add_finding('overlay_high_entropy',
@@ -234,8 +212,12 @@ class Engine:
             scorer.add_finding('obfuscated_script',
                                f"Obfuscated script pattern detected: {', '.join(iocs['obfuscated_script'][:3])}")
 
-        # --- Archive inspection (scan contents of zips/tars) ---
-        if _depth < MAX_ARCHIVE_DEPTH and self._is_archive(file_path):
+        # --- Archive inspection (by content, not extension) ---
+        archive = None
+        is_archive = self._is_archive(file_path)
+        if is_archive and _depth >= MAX_ARCHIVE_DEPTH:
+            results['details']['archive_not_unpacked'] = 'depth limit'
+        if is_archive and _depth < MAX_ARCHIVE_DEPTH:
             archive = self._scan_archive(file_path, _depth, _budget)
             if archive:
                 results['details']['archive'] = archive
@@ -250,6 +232,19 @@ class Engine:
                         f"Archive member {archive['worst_member']}: "
                         f"{archive['worst_verdict']} (score {worst})",
                         worst)
+
+        # --- Entropy scoring ---
+        # Parsed PE files: judged per section and overlay (PE analysis), not
+        # over the whole file. Everything else, including a PE that fails to
+        # parse, gets the whole-file and sliding-window checks:
+        #   - an archive fully covered by scanned members: exempt (members
+        #     were scanned on their own);
+        #   - any other compressed/archive format (png, jpeg, pdf, gz, ...),
+        #     or an archive whose member scan was incomplete: reduced weight;
+        #   - everything else: full weight.
+        if not pe_parsed:
+            self._score_entropy(scorer, results, entropy, sliding_entropy,
+                                compressed_format, is_archive, archive)
 
         if rep_malicious:
             scorer.add_finding('reputation_malicious',
@@ -355,28 +350,69 @@ class Engine:
         return results
 
     @staticmethod
+    def _score_entropy(scorer, results, entropy, sliding_entropy, compressed_format,
+                       is_archive, archive):
+        coverage = (archive or {}).get('coverage', {})
+        if is_archive and archive and archive.get('members_scanned', 0) > 0 and coverage.get('complete'):
+            if entropy > 7.2 or sliding_entropy['high_entropy_windows']:
+                results['details']['entropy_note'] = ('entropy not scored: every member of this '
+                                                      'archive was unpacked and scanned')
+            return
+        weight, note = None, ''
+        if is_archive:
+            weight = REDUCED_ENTROPY_WEIGHT
+            reasons = ', '.join(coverage.get('reasons', [])) or results['details'].get(
+                'archive_not_unpacked', 'archive not unpacked')
+            note = f' (archive, member scan incomplete: {reasons})'
+        elif compressed_format:
+            weight = REDUCED_ENTROPY_WEIGHT
+            note = f' ({compressed_format} format, contents not unpacked)'
+        total = sliding_entropy['total_windows']
+        high_share = sliding_entropy['high_entropy_windows'] / total if total else 0
+        if entropy > 7.2:
+            scorer.add_finding('high_entropy',
+                               f'File has very high overall entropy ({entropy:.2f}/8.00) - '
+                               f'likely packed or encrypted{note}', weight_override=weight)
+        elif high_share > SLIDING_HIGH_SHARE:
+            scorer.add_finding('sliding_entropy_spike',
+                               f"{sliding_entropy['high_entropy_windows']} of {total} windows have "
+                               f"high entropy (peak {sliding_entropy['max']:.2f}/8.00){note}",
+                               weight_override=weight)
+
+    @staticmethod
     def _is_archive(file_path: str) -> bool:
-        lower = file_path.lower()
-        if lower.endswith(ARCHIVE_EXTENSIONS):
+        '''Decided by content (zip central directory / tar header, plain or
+        gz/bz2/xz compressed), not by file extension.'''
+        try:
             return zipfile.is_zipfile(file_path) or tarfile.is_tarfile(file_path)
-        return False
+        except Exception:
+            return False
 
     def _scan_archive(self, file_path: str, _depth: int = 0, _budget: Dict[str, int] = None) -> Dict[str, Any]:
-        '''Extracts archive members to a temp dir and scans each one.'''
+        '''Extracts archive members to a temp dir and scans each one.
+        summary['coverage'] says whether every member was unpacked and
+        scanned and the members cover the whole file.'''
         summary = {'members_scanned': 0, 'threats': [], 'member_yara': [], 'worst_score': 0,
                    'worst_member': None, 'worst_verdict': 'CLEAN'}
         try:
             with tempfile.TemporaryDirectory(prefix='dexmond_arc_') as tmpdir:
                 if _budget is None:
                     _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
-                members = self._extract_safely(file_path, tmpdir, _budget)
+                members, coverage = self._extract_safely(file_path, tmpdir, _budget)
                 for member_name, member_path in members:
                     sub = self.scan_file(member_path, _depth=_depth + 1, _budget=_budget)
                     if 'error' in sub:
+                        coverage['reasons'].append(f'member not scanned: {member_name}')
                         continue
+                    sub_details = sub.get('details', {})
+                    if sub_details.get('archive_not_unpacked'):
+                        coverage['reasons'].append(f'nested archive not unpacked (depth): {member_name}')
+                    elif sub_details.get('archive') and not sub_details['archive'].get(
+                            'coverage', {}).get('complete'):
+                        coverage['reasons'].append(f'nested archive incomplete: {member_name}')
                     summary['members_scanned'] += 1
                     member_rules = list(sub.get('yara', []))
-                    for entry in sub.get('details', {}).get('archive', {}).get('member_yara', []):
+                    for entry in sub_details.get('archive', {}).get('member_yara', []):
                         member_rules.extend(entry['rules'])
                     if member_rules:
                         summary['member_yara'].append({'member': member_name,
@@ -391,19 +427,58 @@ class Engine:
                         summary['worst_score'] = score
                         summary['worst_member'] = member_name
                         summary['worst_verdict'] = sub.get('verdict', 'UNKNOWN')
-        except (OSError, zipfile.BadZipFile, tarfile.TarError) as e:
+                coverage['complete'] = not coverage['reasons']
+                summary['coverage'] = coverage
+        except (OSError, EOFError, ValueError, zipfile.BadZipFile, tarfile.TarError) as e:
             logger.warning(f'Archive scan failed for {file_path}: {e}')
             return {}
         return summary
 
     @staticmethod
+    def _zip_covers_file(file_path: str, zf: zipfile.ZipFile, infos) -> list:
+        '''Returns reasons the zip members do NOT cover the file ([] = full
+        coverage): local header at offset 0, members back to back up to the
+        central directory, end record at the very end of the file.'''
+        reasons = []
+        size = os.path.getsize(file_path)
+        with open(file_path, 'rb') as f:
+            if f.read(4) != b'PK\x03\x04':
+                reasons.append('no local header at offset 0')
+            pos, slack = 0, 0
+            for info in sorted(infos, key=lambda i: i.header_offset):
+                if not (pos <= info.header_offset <= pos + slack):
+                    reasons.append(f'gap or overlap before member {info.filename}')
+                    break
+                f.seek(info.header_offset)
+                lh = f.read(30)
+                if len(lh) < 30 or lh[:4] != b'PK\x03\x04':
+                    reasons.append(f'bad local header for {info.filename}')
+                    break
+                name_len = int.from_bytes(lh[26:28], 'little')
+                extra_len = int.from_bytes(lh[28:30], 'little')
+                pos = info.header_offset + 30 + name_len + extra_len + info.compress_size
+                slack = ZIP_DESCRIPTOR_SLACK if info.flag_bits & 0x08 else 0
+            start_dir = getattr(zf, 'start_dir', None)
+            if not reasons and (start_dir is None or not (pos <= start_dir <= pos + slack)):
+                reasons.append('data between the last member and the central directory')
+            eocd = size - 22 - len(zf.comment or b'')
+            f.seek(max(eocd, 0))
+            if eocd < 0 or f.read(4) != b'PK\x05\x06':
+                reasons.append('data after the end-of-central-directory record')
+        return reasons
+
+    @staticmethod
     def _extract_safely(file_path: str, dest_dir: str, budget: Dict[str, int] = None):
-        '''Returns (name, extracted_path) for archive members, guarding against
-        path traversal, zip bombs, and excessive member counts. The budget
-        (members, bytes) is shared with nested archives and is decremented.'''
+        '''Returns ([(name, extracted_path)], coverage) for archive members,
+        guarding against path traversal, zip bombs, and excessive member
+        counts. The budget (members, bytes) is shared with nested archives and
+        is decremented. coverage['reasons'] lists every member that was NOT
+        extracted and any file data the members do not account for.'''
         if budget is None:
             budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         extracted = []
+        coverage = {'complete': False, 'reasons': []}
+        reasons = coverage['reasons']
         dest_real = os.path.realpath(dest_dir)
 
         def _target(name):
@@ -422,13 +497,22 @@ class Engine:
 
         if zipfile.is_zipfile(file_path):
             with zipfile.ZipFile(file_path) as zf:
-                for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
-                    if info.is_dir() or info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                infos = zf.infolist()
+                reasons.extend(Engine._zip_covers_file(file_path, zf, infos))
+                if len(infos) > MAX_ARCHIVE_MEMBERS:
+                    reasons.append(f'more than {MAX_ARCHIVE_MEMBERS} members')
+                for info in infos[:MAX_ARCHIVE_MEMBERS]:
+                    if info.is_dir():
+                        continue
+                    if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                        reasons.append(f'member over size limit: {info.filename}')
                         continue
                     out = _target(info.filename)
                     if not out:
+                        reasons.append(f'unsafe member path: {info.filename}')
                         continue
                     if not _take(info.file_size):
+                        reasons.append('member/byte budget exhausted')
                         break
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     with zf.open(info) as src, open(out, 'wb') as dst:
@@ -436,22 +520,45 @@ class Engine:
                     extracted.append((info.filename, out))
         elif tarfile.is_tarfile(file_path):
             with tarfile.open(file_path) as tf:
+                stopped = False
                 for member in tf:
-                    if not member.isfile() or member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                    if member.isdir():
+                        continue
+                    if not member.isfile():
+                        reasons.append(f'non-regular member: {member.name}')
+                        continue
+                    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                        reasons.append(f'member over size limit: {member.name}')
                         continue
                     out = _target(member.name)
                     if not out:
+                        reasons.append(f'unsafe member path: {member.name}')
                         continue
                     if not _take(member.size):
+                        reasons.append('member/byte budget exhausted')
+                        stopped = True
                         break
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     extracted_file = tf.extractfile(member)
                     if extracted_file is None:
+                        reasons.append(f'member not readable: {member.name}')
                         continue
                     with extracted_file as src, open(out, 'wb') as dst:
                         dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
                     extracted.append((member.name, out))
-        return extracted
+                if not stopped:
+                    # members + end padding must account for the whole
+                    # (decompressed) stream: only zero bytes may follow
+                    try:
+                        tf.fileobj.seek(tf.offset)
+                        rest = tf.fileobj.read(MAX_TAR_PADDING + 1)
+                        if len(rest) > MAX_TAR_PADDING or rest.count(0) != len(rest):
+                            reasons.append('data after the last tar member')
+                    except (OSError, EOFError, ValueError) as e:
+                        reasons.append(f'tar end not readable: {e}')
+        else:
+            reasons.append('not a zip or tar archive')
+        return extracted, coverage
 
 
 def is_partial_scan(results: Dict[str, Any]) -> bool:

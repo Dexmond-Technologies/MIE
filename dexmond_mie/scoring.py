@@ -21,7 +21,8 @@ class Scorer:
         'reputation_malicious': 70,
         'oversize_partial_scan': 5,
         'malformed_pe': 10,
-        'overlay_high_entropy': 5}
+        'overlay_high_entropy': 5,
+        'malformed_certificate_table': 10}
 
     def __init__(self):
         self.score = 0
