@@ -13,6 +13,7 @@ from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
 from .reputation import ReputationDB
 from .auto_evolution import AutoEvolutionEngine
+from . import signature
 
 logger = logging.getLogger('DEXMOND_MIE')
 
@@ -63,8 +64,14 @@ class Engine:
 
     def __init__(self, rules_dir: str = './rules', reputation_db: str = './data/reputation.json',
                  use_reputation: bool = True, max_scan_bytes: int = None,
-                 oversize_window_bytes: int = None):
+                 oversize_window_bytes: int = None, signature_verifier=None,
+                 trusted_publishers=None):
         self.rules_dir = rules_dir
+        # X12: real Authenticode verification (Windows WinVerifyTrust);
+        # elsewhere it reports 'unavailable' and no cap is applied
+        self.signature_verifier = signature_verifier or signature.verify_authenticode
+        self.trusted_publishers = tuple(trusted_publishers if trusted_publishers is not None
+                                        else signature.trusted_publishers())
         self.max_scan_bytes = MAX_SCAN_BYTES if max_scan_bytes is None else max_scan_bytes
         self.oversize_window_bytes = (OVERSIZE_WINDOW_BYTES if oversize_window_bytes is None
                                       else oversize_window_bytes)
@@ -232,6 +239,14 @@ class Engine:
             if packer_evidence:
                 scorer.add_finding('packer_detected',
                                    f"Packer detected: {', '.join(packer_evidence)}")
+
+        # --- Authenticode signature (X12) ---
+        if pe_parsed:
+            sig = self.signature_verifier(file_path)
+            results['details']['signature'] = sig
+            if sig.get('status') == 'valid' and sig.get('publisher') in self.trusted_publishers:
+                scorer.cap_heuristics()
+                results['details']['signature']['heuristics_capped_at'] = Scorer.SIGNED_CAP
 
         # --- Strings / IOCs ---
         strings, iocs = StringExtractor.extract_ascii_unicode(data, 5)

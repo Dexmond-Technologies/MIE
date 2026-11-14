@@ -45,9 +45,21 @@ class Scorer:
         'packing': 25,
     }
 
+    # Never lowered by a trusted signature: hard evidence, not heuristics
+    UNCAPPABLE_FAMILIES = {'critical_yara', 'reputation_malicious'}
+    # Highest score a heuristic-only file reaches under a trusted signature
+    SIGNED_CAP = 29
+
     def __init__(self):
         self.floor = 0
+        self.heuristic_cap = None
         self.findings: List[Dict] = []
+
+    def cap_heuristics(self, cap: int = None):
+        '''A valid signature from a trusted publisher (X12): the heuristic
+        families together count at most `cap` (LOW). Critical YARA, the
+        reputation list and floors are not affected.'''
+        self.heuristic_cap = self.SIGNED_CAP if cap is None else cap
 
     def set_floor(self, floor: int):
         '''Sets a minimum score (used for a malicious reputation hit).'''
@@ -89,7 +101,12 @@ class Scorer:
 
     @property
     def score(self) -> int:
-        return sum(self.family_scores().values())
+        fams = self.family_scores()
+        hard = sum(v for f, v in fams.items() if f in self.UNCAPPABLE_FAMILIES)
+        soft = sum(v for f, v in fams.items() if f not in self.UNCAPPABLE_FAMILIES)
+        if self.heuristic_cap is not None:
+            soft = min(soft, self.heuristic_cap)
+        return hard + soft
 
     def get_score(self) -> int:
         '''Returns the final score, capped at 100.'''
