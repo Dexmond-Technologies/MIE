@@ -15,19 +15,37 @@ PACKER_SECTIONS = {
     '.vmp0', '.vmp1', '.vmp2', '.petite', '.nsp0', '.nsp1', '.mpress1',
     '.mpress2', '.enigma1', '.enigma2', '.fsg', '.mew', '.y0da'}
 
+# APIs that are suspicious ON THEIR OWN. Routine APIs that every loader, UI
+# tool or installer imports (LoadLibrary*, GetProcAddress, VirtualAlloc,
+# VirtualProtect, IsDebuggerPresent, OpenProcessToken, RegSetValueEx*,
+# ShellExecute*) are not listed here; they only count as part of a chain in
+# get_api_chains().
 SUSPICIOUS_IMPORTS = {
-    'VirtualAlloc', 'VirtualAllocEx', 'VirtualProtect', 'WriteProcessMemory',
+    'VirtualAllocEx', 'WriteProcessMemory',
     'ReadProcessMemory', 'CreateRemoteThread', 'CreateRemoteThreadEx',
     'NtCreateThreadEx', 'QueueUserAPC', 'SetWindowsHookExA', 'SetWindowsHookExW',
-    'LdrLoadDll', 'LoadLibraryA', 'LoadLibraryW', 'GetProcAddress',
-    'IsDebuggerPresent', 'CheckRemoteDebuggerPresent', 'NtQueryInformationProcess',
-    'AdjustTokenPrivileges', 'OpenProcessToken', 'CryptEncrypt', 'CryptDecrypt',
+    'LdrLoadDll',
+    'CheckRemoteDebuggerPresent', 'NtQueryInformationProcess',
+    'AdjustTokenPrivileges', 'CryptEncrypt', 'CryptDecrypt',
     'InternetOpenA', 'InternetOpenUrlA', 'URLDownloadToFileA', 'URLDownloadToFileW',
-    'WinExec', 'ShellExecuteA', 'ShellExecuteW', 'RegSetValueExA', 'RegSetValueExW'}
+    'WinExec'}
 
+# Removed from the single-import list in fix X3; still used inside chains.
+CHAIN_ONLY_IMPORTS = {
+    'LoadLibraryA', 'LoadLibraryW', 'GetProcAddress', 'VirtualProtect', 'VirtualAlloc',
+    'IsDebuggerPresent', 'OpenProcessToken', 'RegSetValueExA', 'RegSetValueExW',
+    'ShellExecuteA', 'ShellExecuteW'}
 
 class PEAnalyzer:
     '''Analyzes Portable Executable (PE) files.'''
+
+    @classmethod
+    def from_pe(cls, pe, file_path: str = ''):
+        '''Wraps an already-parsed PE object (used by tests).'''
+        obj = cls.__new__(cls)
+        obj.file_path = file_path
+        obj.pe = pe
+        return obj
 
     def __init__(self, file_path: str):
         self.file_path = file_path
