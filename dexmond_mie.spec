@@ -8,6 +8,8 @@
 # The one-folder build is recommended for a security tool: it starts faster and
 # is easier for antivirus/SmartScreen to inspect than a single-file build.
 
+import glob
+import importlib.util
 import os
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
@@ -22,8 +24,11 @@ hiddenimports = (
 
 # Bundle the YARA rules and the seed reputation list next to the app. These are
 # extracted to the temporary resource dir and found via dexmond_mie/paths.py.
-datas = [
-    ('rules', 'rules'),
+# Only the reviewed live rule files (rules/*.yar). Never rules/proposed/ or
+# rules/auto_generated.yar (F1: proposals are not loaded until approved).
+datas = [(f, 'rules') for f in sorted(glob.glob(os.path.join('rules', '*.yar')))
+         if os.path.basename(f) != 'auto_generated.yar']
+datas += [
     ('data/reputation.json', 'data'),
     ('config/trusted_publishers.json', 'config'),
 ]
@@ -31,6 +36,13 @@ datas += collect_data_files('yara')
 # X12 v2 pinned Authenticode root store, once SENTINEL has provisioned it
 if os.path.isfile(os.path.join('trust', 'authenticode_roots.pem')):
     datas.append(('trust/authenticode_roots.pem', 'trust'))
+# X12 publisher check on Windows needs signify (requirements-signify.lock);
+# without it a valid signature is never treated as an allowlisted publisher.
+if importlib.util.find_spec('signify') is not None:
+    hiddenimports += collect_submodules('signify')
+    for pkg in ('mscerts', 'certvalidator', 'oscrypto', 'asn1crypto'):
+        if importlib.util.find_spec(pkg) is not None:
+            datas += collect_data_files(pkg)
 
 block_cipher = None
 
@@ -61,7 +73,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # No UPX: MIE's own Packer_UPX rule and packer heuristics flag UPX-packed
+    # files, so a packed MIE would flag itself (release audit 2026-11-18).
+    upx=False,
     console=False,          # windowed app; set True to see logs while debugging
     disable_windowed_traceback=False,
     target_arch=None,
@@ -75,7 +89,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='DexmondMIE',
 )

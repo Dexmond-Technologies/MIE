@@ -2,7 +2,10 @@
 # - Linux: full pytest with real YARA and the hash-locked signify stack.
 # - Windows: only the tests that need Windows (X12 signature + Authenticode, including the
 #   WinVerifyTrust-vs-signify parity test), on Microsoft-signed Sysinternals binaries.
-# Budget rule (owner 2026-11-14): manual runs only, short timeouts, caches, no artefacts.
+# - Windows build: full pytest on Windows, PyInstaller one-folder build (no UPX),
+#   static bundle check, zip + SHA-256, kept 14 days as an UNSIGNED TEST BUILD.
+# Budget rule (owner 2026-11-14): manual runs only, short timeouts, caches. The one
+# artefact (the Windows test build, 14 days) was added for the sale work (2026-11-18).
 # No EICAR files and no malware corpus are used here; EICAR tests skip.
 # Python 3.12: yara-python 4.5.1 has no CPython 3.13 wheel; the signify lock is all
 # pure-Python wheels, so the same hashes install on 3.12.
@@ -86,3 +89,59 @@ jobs:
           "MIE_TEST_TRUST_STORE=$env:GITHUB_WORKSPACE\trust\authenticode_roots.pem" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: pytest (X12 signature + Authenticode, Windows parity)
         run: python -m pytest -v -rs tests/test_x12_signature.py tests/test_x12_v2_authenticode.py
+
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      # Byte-exact checkout: the bundled trust/authenticode_roots.pem must keep its
+      # pinned SHA-256 inside the exe (scripts/check_bundle.py checks it).
+      - name: Keep line endings exactly as committed
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-windows-build.txt
+            requirements-signify.lock
+      - name: Install app, build and test deps (exact top-level pins)
+        run: python -m pip install -r requirements-windows-build.txt
+      - name: Install signify stack (hash-locked)
+        run: python -m pip install --require-hashes -r requirements-signify.lock
+      - name: pytest (full suite on Windows)
+        run: python -m pytest -q -rs
+      - name: Build (PyInstaller one-folder, no UPX)
+        run: python -m PyInstaller --noconfirm --clean dexmond_mie.spec
+      - name: Static bundle check
+        run: python scripts/check_bundle.py dist/DexmondMIE
+      # UNSIGNED TEST BUILD: not code-signed, no production licence key, false-alarm
+      # rate not yet re-measured. For testing only, not for sale.
+      - name: Zip and checksum the test build
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path dexmond_mie/__init__.py -Pattern "__version__ = '([^']+)'").Matches[0].Groups[1].Value
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $name = "DexmondMIE-$version-$short-windows-x64-UNSIGNED-TEST.zip"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $zip = Join-Path 'release' $name
+          Compress-Archive -Path dist/DexmondMIE -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $name" -Encoding ascii
+          "UNSIGNED TEST BUILD, not for sale: $name sha256=$hash" >> $env:GITHUB_STEP_SUMMARY
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "short_sha=$short" >> $env:GITHUB_OUTPUT
+      - name: Keep the test build and its checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mie-windows-unsigned-test-${{ steps.build.outputs.short_sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            release/${{ steps.build.outputs.name }}
+            release/${{ steps.build.outputs.name }}.sha256
