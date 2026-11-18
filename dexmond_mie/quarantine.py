@@ -8,8 +8,9 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger('DEXMOND_MIE')
 
-# Stored files are XOR-obfuscated so they cannot execute and are not
-# re-detected by scans while sitting in quarantine.
+# Stored files are XOR-ed with one fixed byte (obfuscation, NOT encryption:
+# anyone with the file can undo it) so they are not run by accident and not
+# re-flagged by scans while sitting in quarantine. Restore undoes it exactly.
 XOR_KEY = 0xA5
 CHUNK_SIZE = 1024 * 1024
 
@@ -19,7 +20,8 @@ _QID_RE = re.compile(r'^[a-f0-9]{16}$')
 
 
 class QuarantineManager:
-    '''Moves detected files into an isolated, neutralized store.'''
+    '''Moves a flagged file into the quarantine folder: writes a copy XOR-ed
+    with XOR_KEY, deletes the original, keeps the metadata for restore.'''
 
     def __init__(self, quarantine_dir: str = './quarantine'):
         os.makedirs(quarantine_dir, exist_ok=True)

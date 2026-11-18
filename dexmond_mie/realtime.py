@@ -84,7 +84,9 @@ class MalwareEventHandler(FileSystemEventHandler):
 
 
 class RealtimeScanner:
-    '''Always-on background protection watching user folders for new files.'''
+    '''Folder watcher: scans files created in or moved into the watched user
+    folders, after they are written, while the app runs. Files changed in
+    place are not rescanned; nothing is blocked before it is opened.'''
 
     def __init__(self, rules_dir, notification_callback=None, result_callback=None,
                  engine=None, quarantine_callback=None):
@@ -124,7 +126,7 @@ class RealtimeScanner:
             watch_dirs = [watch_dirs]
         watch_dirs = [d for d in watch_dirs if os.path.isdir(d)]
         if not watch_dirs:
-            logger.warning('No valid watch directories; realtime protection not started')
+            logger.warning('No valid watch directories; folder monitoring not started')
             return []
         handler = MalwareEventHandler(self.engine, self.notification_callback,
                                       self.result_callback, scanner=self)
@@ -133,7 +135,7 @@ class RealtimeScanner:
             self.observer.schedule(handler, d, recursive=True)
         self.observer.start()
         self.watched = watch_dirs
-        logger.info(f'Realtime protection active, watching: {", ".join(watch_dirs)}')
+        logger.info(f'Folder monitoring active, watching: {", ".join(watch_dirs)}')
         return self.watched
 
     def stop(self):
@@ -143,4 +145,4 @@ class RealtimeScanner:
         self.observer.join()
         self.observer = None
         self.watched = []
-        logger.info('Realtime protection stopped')
+        logger.info('Folder monitoring stopped')

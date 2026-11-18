@@ -130,7 +130,7 @@ def run_background(host=DEFAULT_HOST, port=DEFAULT_PORT):
     logger = logging.getLogger('DEXMOND_MIE')
     os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
     url = _start_server(host, port)
-    logger.info(f'Protection running in background; dashboard at {url}')
+    logger.info(f'Folder monitoring running in background; dashboard at {url}')
     try:
         from .tray import run_tray
         run_tray(None)
@@ -147,7 +147,7 @@ def run():
     parser = argparse.ArgumentParser(description='DEXMOND MIE - Lightweight Malware Inspection Engine')
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     subparsers.add_parser('gui', help='Launch the Graphical User Interface')
-    subparsers.add_parser('background', help='Launch in background with tray icon and realtime scan')
+    subparsers.add_parser('background', help='Run in the background: tray icon and folder monitoring')
     scan_parser = subparsers.add_parser('scan', help='Scan a file or directory')
     scan_parser.add_argument('target', help='File or directory to scan')
     scan_parser.add_argument('--rules-dir', default=paths.rules_dir(), help='Path to YARA rules directory')

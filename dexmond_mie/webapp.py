@@ -445,11 +445,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 </header>
 <main>
   <p style="text-align: center; color: var(--ink-soft); margin-bottom: 24px; font-size: 14px;">
-    MIE is a stress-free antimalware. You don't need to do anything as long as active monitoring and autoquarantine are turned on!
+    MIE is a second-opinion file scanner: it checks files with its own pattern rules and heuristics.
+    It has not been tested against real malware, so keep your regular security software turned on.
+    Folder monitoring checks new files in your Downloads, Desktop, Documents and Temp folders while MIE is running.
   </p>
   <div class="strip">
     <div class="tile">
-      <p class="eyebrow">Real-time protection</p>
+      <p class="eyebrow">Folder monitoring</p>
       <div class="protection">
         <div class="shield" id="shield">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -470,14 +472,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
       </label>
     </div>
     <div class="tile stat-tile">
-      <p class="eyebrow">Threat definitions</p>
-      <b id="rules">&ndash;</b><span>YARA rule sets loaded</span>
+      <p class="eyebrow">Detection rules</p>
+      <b id="rules">&ndash;</b><span>YARA rule files loaded (built in, not updated online)</span>
       <span id="repLine" style="display:block;margin-top:6px">&ndash;</span>
     </div>
     <div class="tile stat-tile">
       <p class="eyebrow">This session</p>
       <b><span id="scans">0</span> / <span id="threats" style="color:var(--danger)">0</span></b>
-      <span>files scanned / threats found</span>
+      <span>files scanned / files flagged</span>
     </div>
   </div>
 
@@ -498,7 +500,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
       <div class="card">
         <p class="eyebrow">Recent detections</p>
         <ul class="activity-list" id="activity"></ul>
-        <p class="empty-note" id="activityEmpty">No threats detected yet. Protection is watching your folders.</p>
+        <p class="empty-note" id="activityEmpty">Nothing flagged yet.</p>
       </div>
       <div class="card">
         <p class="eyebrow">Quarantine</p>
@@ -540,7 +542,7 @@ function renderProtection(p) {
     btn.className = 'danger-outline';
   } else {
     $('protState').textContent = 'Off';
-    $('protDetail').textContent = 'New files are not being checked. Turn protection back on.';
+    $('protDetail').textContent = 'New files are not being checked. Turn monitoring back on.';
     $('shield').classList.add('off');
     $('shieldPath').setAttribute('fill', '#b3372b');
     btn.textContent = 'Turn on';
@@ -556,8 +558,8 @@ function renderActivity(items) {
   ul.innerHTML = items.map((a) => {
     const cls = a.verdict.includes('MALICIOUS') ? 'danger' : 'warn';
     const action = a.quarantined
-      ? '<span class="chip clean">isolated</span>'
-      : '<button class="mini secondary" data-q="add" data-path="' + esc(a.path) + '">Isolate</button>';
+      ? '<span class="chip clean">quarantined</span>'
+      : '<button class="mini secondary" data-q="add" data-path="' + esc(a.path) + '">Quarantine</button>';
     return '<li><span class="t mono">' + esc(a.time) + '</span>' +
            '<span class="f">' + esc(a.filename) + '</span>' +
            '<span class="chip ' + cls + '">' + a.score + '</span>' + action + '</li>';
@@ -609,7 +611,7 @@ document.addEventListener('click', async (e) => {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({path: btn.dataset.path})});
-      if (btn.id === 'reportQBtn') { btn.textContent = 'Isolated'; }
+      if (btn.id === 'reportQBtn') { btn.textContent = 'Quarantined'; }
     } else if (kind === 'restore') {
       await afetch('/api/quarantine/' + btn.dataset.id + '/restore', {method: 'POST'});
     } else if (kind === 'delete') {

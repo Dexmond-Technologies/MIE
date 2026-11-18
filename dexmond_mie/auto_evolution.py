@@ -133,7 +133,7 @@ class AutoEvolutionEngine:
         if reputation_db and sha256:
             label = f'isolated-threat ({filename})' if filename else 'isolated-threat'
             reputation_db.add_malicious(sha256, label)
-            logger.info(f'Auto-Evolution: Learned malicious hash {sha256[:12]}...')
+            logger.info(f'Known-hash list: added {sha256[:12]}... as known-bad (quarantined by the user)')
 
     @staticmethod
     def on_restore(reputation_db, sha256: str, filename: str = ''):
@@ -141,7 +141,7 @@ class AutoEvolutionEngine:
         if reputation_db and sha256:
             label = f'user-restored ({filename})' if filename else 'user-restored'
             reputation_db.add_trusted(sha256, label)
-            logger.info(f'Auto-Evolution: Learned trusted hash {sha256[:12]}...')
+            logger.info(f'Known-hash list: added {sha256[:12]}... as trusted (restored by the user)')
 
 
 def _split_rules(text: str) -> List[str]:
