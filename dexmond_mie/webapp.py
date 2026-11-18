@@ -719,7 +719,7 @@ function render(d) {
   if (arc) {
     html += '<div class="section"><p class="eyebrow">Archive contents</p>' +
       '<dl class="kv"><dt>Members</dt><dd>' + arc.members_scanned + ' scanned</dd>' +
-      '<dt>Threats</dt><dd>' + arc.threats.length + '</dd></dl>';
+      '<dt>Flagged members</dt><dd>' + arc.threats.length + '</dd></dl>';
     if (arc.threats.length) {
       html += '<table><tr><th>Member</th><th>Verdict</th><th style="text-align:right">Score</th></tr>';
       for (const t of arc.threats) {

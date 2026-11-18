@@ -12,6 +12,7 @@ FA-2: the "-enc" PowerShell IOC must be a command-line token (a prefix of
       -EncodedCommand from -enc on), not a substring of "Content-Encoding",
       "--encoding" or "-encrypt".'''
 import struct
+import sys
 
 import pytest
 
@@ -188,3 +189,23 @@ def test_every_reported_chain_has_its_api_list(imports):
         assert any(chain.startswith(prefix) for prefix in CHAIN_APIS), chain
     imported = {f for funcs in imports.values() for f in funcs}
     assert a.scored_import_names() <= imported and a.scored_import_names()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='needs a real Windows PE on the runner')
+def test_pefile_reports_name_offsets_fa1_relies_on():
+    '''FA-1 suppresses by pefile ImportData.name_offset. If pefile ever drops
+    it, FA-1 silently does nothing: this makes that a CI failure.'''
+    pefile = pytest.importorskip('pefile')
+    pe = pefile.PE(sys.executable)
+    with open(sys.executable, 'rb') as f:
+        data = f.read()
+    named = [imp for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])
+             for imp in entry.imports if imp.name]
+    assert named
+    for imp in named:
+        off = imp.name_offset
+        assert isinstance(off, int)
+        assert data[off:off + len(imp.name)] == imp.name
+        assert data[off + len(imp.name)] == 0
+        assert not 0x20 <= data[off - 1] <= 0x7e
+    pe.close()
