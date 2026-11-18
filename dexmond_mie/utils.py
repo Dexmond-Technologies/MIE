@@ -113,7 +113,14 @@ class StringExtractor:
         'email': re.compile('[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}'),
         'bitcoin': re.compile('\\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\\b'),
         'base64': re.compile('(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?'),
-        'powershell': re.compile('powershell(?:\\.exe)?|pwsh(?:\\.exe)?|-enc|-encodedcommand', re.IGNORECASE),
+        # -enc ... -EncodedCommand: PowerShell accepts any prefix of
+        # -EncodedCommand from -enc on, with one or two dashes, as its own
+        # command-line token. Fix FA-2: the token must start after a
+        # non-word, non-dash character and end at a non-word character, so
+        # "Content-Encoding", "--encoding", "-encrypt" no longer match.
+        'powershell': re.compile('powershell(?:\\.exe)?|pwsh(?:\\.exe)?|'
+                                 '(?<![\\w-])--?enc(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?(?![\\w-])',
+                                 re.IGNORECASE),
         'suspicious_api': re.compile('(VirtualAlloc|CreateRemoteThread|WriteProcessMemory|LdrLoadDll|ReflectiveLoader)', re.IGNORECASE),
         'b64_executable': re.compile('TVqQAAMAAAA4A[A-Za-z0-9+/=]+'),
         'obfuscated_script': re.compile('(\\[char\\[\\]\\]|Invoke-Expression|iex\\s*\\(|FromBase64String|Bypass\\s+-noprofile)', re.IGNORECASE)}

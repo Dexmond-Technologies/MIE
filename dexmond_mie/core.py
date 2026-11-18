@@ -177,8 +177,11 @@ class Engine:
             scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer_yara)}")
 
         # --- PE analysis ---
+        imported_names = set()
         if pe_parsed:
             pe_info = pe_analyzer.analyze()
+            imported_names = {name for funcs in pe_info.get('imports', {}).values()
+                              for name in funcs}
             results['details']['pe_info'] = pe_info
             packer_sections = pe_analyzer.get_packer_sections()
             # Signals that packing itself causes are folded into the capped
@@ -268,6 +271,20 @@ class Engine:
         # --- Strings / IOCs ---
         strings, iocs = StringExtractor.extract_ascii_unicode(data, 5)
         results['details']['string_count'] = len(strings)
+        if imported_names and 'suspicious_api' in iocs:
+            # A parsed PE's import name table holds every imported API name as
+            # a plain string. Those names are the import evidence, already
+            # judged by the import analysis above (single imports + chains,
+            # capped 'imports' family); counting them again here scored
+            # routine imports such as VirtualAlloc that fix X3 removed on
+            # purpose. Only API names that are NOT imported (strings for
+            # run-time resolution, embedded scripts) stay in this finding.
+            not_imported = _api_names_outside_imports(strings, imported_names)
+            if not_imported:
+                iocs['suspicious_api'] = not_imported
+            else:
+                del iocs['suspicious_api']
+                results['details']['api_strings_in_imports_only'] = True
         if iocs:
             results['details']['iocs'] = iocs
         for key in ('powershell', 'suspicious_api'):
@@ -721,6 +738,13 @@ class Engine:
                         reasons.append('data after the last tar member')
                 except Exception as e:  # noqa: BLE001
                     reasons.append(f'tar end not readable ({type(e).__name__})')
+
+
+def _api_names_outside_imports(strings, imported_names):
+    '''suspicious_api matches from the strings that are not exactly an
+    imported function name (fix FA-1). Sorted, de-duplicated.'''
+    pattern = StringExtractor.PATTERNS['suspicious_api']
+    return sorted({m for s in strings if s not in imported_names for m in pattern.findall(s)})
 
 
 def is_partial_scan(results: Dict[str, Any]) -> bool:
