@@ -9,8 +9,8 @@ GitHub CI (workflow `tests`, manual trigger).
 
 | Item | Commit | What |
 |---|---|---|
-| CI failures of run 43558751324 | 08df58f, see below | Linux: an oversize file whose window matched a rule but scored LOW was labelled "oversize, partially scanned" (meant for "nothing found"). Windows: `read_for_verify` followed symbolic links (no `O_NOFOLLOW` on Windows); now lstat + refusal of symlinks/junctions (name-surrogate reparse tags only, so OneDrive cloud files are still verified) + same-file check. Both were product bugs; the tests were right. INC-2026-11-14-002 stays OPEN until a green run. |
-| False alarms FA-1, FA-2 | 1e9d8ca, 1366527 | See section 2. |
+| CI failures of run 43558751324 | 08df58f, 6bc6d16 | Linux: an oversize file whose window matched a rule but scored LOW was labelled "oversize, partially scanned" (meant for "nothing found"). Windows: `read_for_verify` followed symbolic links (no `O_NOFOLLOW` on Windows); now lstat + refusal of symlinks/junctions (name-surrogate reparse tags only, so OneDrive cloud files are still verified) + same-file check. Both were product bugs; the tests were right. INC-2026-11-14-002 stays OPEN until a green run. |
+| False alarms FA-1, FA-2 | 1e9d8ca, 1366527, bb1a206 | See section 2. |
 | Windows build in CI | 72c6efd | Job `windows-build`: full pytest on Windows, PyInstaller one-folder build without UPX, static bundle check (`scripts/check_bundle.py`), zip + SHA-256, artefact kept 14 days. |
 | Licence by activation code | 8c5b2d2 | `dexmond_mie/licence.py`, `dexmond_mie/licence_key.py`, `scripts/check_release_key.py`, CI gate step. Not wired into the app (MIE has no paid tier). |
 | Texts | 0c67952 | Dashboard, README, logs say what the code does. |
