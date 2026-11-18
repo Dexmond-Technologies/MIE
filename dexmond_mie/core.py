@@ -436,7 +436,14 @@ class Engine:
         results['findings'] = scorer.findings
         results['score'] = scorer.get_score()
         verdict = scorer.get_verdict()
-        results['verdict'] = PARTIAL_VERDICT if verdict == 'SUSPICIOUS (LOW)' else verdict
+        # PARTIAL_VERDICT means "nothing found in the windows": only the
+        # oversize finding itself. A window finding that scores LOW keeps the
+        # normal LOW verdict, so the finding is not hidden behind the
+        # partial-scan label (details.partial_scan still records the size
+        # limit, so needs_alert() fires and auto-quarantine stays MALICIOUS-only).
+        nothing_found = all(f['category'] == 'oversize_partial_scan' for f in scorer.findings)
+        results['verdict'] = (PARTIAL_VERDICT if verdict == 'SUSPICIOUS (LOW)' and nothing_found
+                              else verdict)
         results['scan_time'] = round(time.time() - start_time, 3)
         logger.warning(f"Partial scan of {file_path}: {size} bytes is over the "
                        f"{self.max_scan_bytes}-byte limit -> {results['verdict']}")

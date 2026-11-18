@@ -29,6 +29,7 @@ pure-Python `signify` library with the pinned store. Any exception,
 timeout (2 s), missing dependency or unprovisioned / mismatching store
 gives 'unavailable', i.e. no cap (fails closed).
 '''
+import errno
 import hashlib
 import io
 import json
@@ -118,10 +119,22 @@ def read_for_verify(path: str, limit: int = MAX_VERIFY_BYTES):
     '''Opens the file ONCE (no symlink following, regular files only),
     fstats it and reads it. Returns (data, stat_key). Raises ValueError if
     the file is not a regular file or is bigger than `limit`.'''
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    pre = None
+    if not nofollow:
+        # Windows has no O_NOFOLLOW: os.open follows symbolic links and
+        # junctions. Refuse any link or reparse point by lstat first, then
+        # require that the opened file is the one lstat saw (swap race).
+        pre = os.lstat(path)
+        reparse = getattr(stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
+        if stat_mod.S_ISLNK(pre.st_mode) or getattr(pre, 'st_file_attributes', 0) & reparse:
+            raise OSError(errno.ELOOP, 'refusing to follow a symbolic link or reparse point', path)
+    flags = os.O_RDONLY | nofollow | getattr(os, 'O_BINARY', 0)
     fd = os.open(path, flags)
     try:
         st = os.fstat(fd)
+        if pre is not None and (st.st_dev, st.st_ino) != (pre.st_dev, pre.st_ino):
+            raise OSError(errno.ELOOP, 'file was replaced while it was opened', path)
         if not stat_mod.S_ISREG(st.st_mode):
             raise ValueError('not a regular file')
         if st.st_size > limit:

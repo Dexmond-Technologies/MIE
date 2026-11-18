@@ -69,6 +69,22 @@ def test_marker_in_last_window_reaches_yara_windows(tmp_path, make_engine, monke
     assert tail and MARKER in tail[0] and len(tail[0]) <= 1024
 
 
+def test_low_window_finding_is_not_labelled_nothing_found(tmp_path, make_engine, monkeypatch):
+    '''PASS UNDER MOCK: a window finding that scores LOW (high YARA 20 +
+    oversize 5 = 25) keeps the normal LOW verdict; PARTIAL_VERDICT is only for
+    "nothing found". It still alerts and is still not auto-quarantined.'''
+    big = _oversize(tmp_path, size=64 * 1024)
+    engine = make_engine(max_scan_bytes=4096, oversize_window_bytes=1024)
+    hit = {'rule': 'Dexmond_Test_Marker', 'meta': {'severity': 'high'}, 'strings': []}
+    monkeypatch.setattr(engine.yara_engine, 'scan_data',
+                        lambda data, label='': [dict(hit)] if label.endswith('[tail]') else [])
+    results = engine.scan_file(str(big))
+    assert results['verdict'] == 'SUSPICIOUS (LOW)'
+    assert results['details']['partial_scan']['reason'] == 'size limit'
+    assert core.needs_alert(results)
+    assert not core.auto_quarantine_allowed(results)
+
+
 def test_marker_in_last_mib_seen_by_real_yara(tmp_path, rules_copy, rep_copy):
     pytest.importorskip('yara')
     with open(os.path.join(rules_copy, 'zz_test_marker.yar'), 'w') as f:
