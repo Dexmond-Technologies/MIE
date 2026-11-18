@@ -13,6 +13,11 @@ name: tests
 
 on:
   workflow_dispatch:
+    inputs:
+      sale_build:
+        description: "Sale build: stop unless the production licence key is embedded (scripts/check_release_key.py)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -114,32 +119,54 @@ jobs:
         run: python -m pip install --require-hashes -r requirements-signify.lock
       - name: pytest (full suite on Windows)
         run: python -m pytest -q -rs
+      # Licence key gate (port of CypherNight's check-release-key.cjs). It refuses
+      # every tree without the production public key, so a normal run is a TEST
+      # BUILD; a run with sale_build=true stops here until the key is set.
+      - name: Release key gate
+        id: gate
+        shell: pwsh
+        env:
+          SALE_BUILD: ${{ inputs.sale_build }}
+        run: |
+          python scripts/check_release_key.py
+          if ($LASTEXITCODE -eq 0) {
+            "kind=SALE-KEY" >> $env:GITHUB_OUTPUT
+          } elseif ($env:SALE_BUILD -eq 'true') {
+            throw 'sale_build=true, but the release key gate refused this tree (no production licence key).'
+          } else {
+            "kind=TEST" >> $env:GITHUB_OUTPUT
+            "TEST BUILD: the release key gate refused this tree (expected until the production key exists)." >> $env:GITHUB_STEP_SUMMARY
+            $global:LASTEXITCODE = 0
+          }
       - name: Build (PyInstaller one-folder, no UPX)
         run: python -m PyInstaller --noconfirm --clean dexmond_mie.spec
       - name: Static bundle check
         run: python scripts/check_bundle.py dist/DexmondMIE
-      # UNSIGNED TEST BUILD: not code-signed, no production licence key, false-alarm
+      # Not code-signed; no production licence key today (gate above); false-alarm
       # rate not yet re-measured. For testing only, not for sale.
       - name: Zip and checksum the test build
         id: build
         shell: pwsh
+        env:
+          BUILD_KIND: ${{ steps.gate.outputs.kind }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = (Select-String -Path dexmond_mie/__init__.py -Pattern "__version__ = '([^']+)'").Matches[0].Groups[1].Value
           $short = $env:GITHUB_SHA.Substring(0, 7)
-          $name = "DexmondMIE-$version-$short-windows-x64-UNSIGNED-TEST.zip"
+          $label = if ($env:BUILD_KIND -eq 'SALE-KEY') { 'UNSIGNED' } else { 'UNSIGNED-TEST' }
+          $name = "DexmondMIE-$version-$short-windows-x64-$label.zip"
           New-Item -ItemType Directory -Force -Path release | Out-Null
           $zip = Join-Path 'release' $name
           Compress-Archive -Path dist/DexmondMIE -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $name" -Encoding ascii
-          "UNSIGNED TEST BUILD, not for sale: $name sha256=$hash" >> $env:GITHUB_STEP_SUMMARY
+          "$label build (not code-signed; false-alarm rate not re-measured): $name sha256=$hash" >> $env:GITHUB_STEP_SUMMARY
           "name=$name" >> $env:GITHUB_OUTPUT
           "short_sha=$short" >> $env:GITHUB_OUTPUT
       - name: Keep the test build and its checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mie-windows-unsigned-test-${{ steps.build.outputs.short_sha }}
+          name: mie-windows-unsigned-${{ steps.gate.outputs.kind }}-${{ steps.build.outputs.short_sha }}
           retention-days: 14
           if-no-files-found: error
           path: |
