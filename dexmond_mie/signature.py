@@ -115,6 +115,10 @@ def trusted_publishers(config_path: str = None):
 
 
 # ---------------------------------------------------------------- TOCTOU
+# IsReparseTagNameSurrogate(): set for symbolic links and mount points/junctions
+_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+
+
 def read_for_verify(path: str, limit: int = MAX_VERIFY_BYTES):
     '''Opens the file ONCE (no symlink following, regular files only),
     fstats it and reads it. Returns (data, stat_key). Raises ValueError if
@@ -123,12 +127,15 @@ def read_for_verify(path: str, limit: int = MAX_VERIFY_BYTES):
     pre = None
     if not nofollow:
         # Windows has no O_NOFOLLOW: os.open follows symbolic links and
-        # junctions. Refuse any link or reparse point by lstat first, then
-        # require that the opened file is the one lstat saw (swap race).
+        # junctions. Refuse links by lstat first, then require that the
+        # opened file is the one lstat saw (swap race). Only NAME-SURROGATE
+        # reparse points (symlinks, junctions) are refused: ordinary files can
+        # carry other reparse tags (OneDrive cloud files in Desktop/Documents,
+        # deduplicated files) and must still be verified.
         pre = os.lstat(path)
-        reparse = getattr(stat_mod, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
-        if stat_mod.S_ISLNK(pre.st_mode) or getattr(pre, 'st_file_attributes', 0) & reparse:
-            raise OSError(errno.ELOOP, 'refusing to follow a symbolic link or reparse point', path)
+        if stat_mod.S_ISLNK(pre.st_mode) or \
+                getattr(pre, 'st_reparse_tag', 0) & _REPARSE_TAG_NAME_SURROGATE:
+            raise OSError(errno.ELOOP, 'refusing to follow a symbolic link or junction', path)
     flags = os.O_RDONLY | nofollow | getattr(os, 'O_BINARY', 0)
     fd = os.open(path, flags)
     try:
