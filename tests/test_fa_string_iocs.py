@@ -3,10 +3,11 @@ they were written for. Synthetic benign and synthetic matching content only
 (no malware, no EICAR content). The PE is a stand-in (fakepe), so the
 engine tests are PASS UNDER MOCK; the string tests use the real regexes.
 
-FA-1: in a parsed PE, an API name that is exactly one of the file's own
-      imported function names is the import evidence (already judged by the
-      import analysis); it is no longer scored again as a suspicious string.
-      API names that are NOT imported (run-time resolution strings) still are.
+FA-1: in a parsed PE, the import hint/name-table string of an import that
+      the import analysis SCORED (SUSPICIOUS_IMPORTS or a reported chain) is
+      not scored again as a suspicious string. Suppression is by file offset:
+      the same name elsewhere in the file, names the import analysis does
+      not score, and unknown offsets still count (bypass tests below).
 FA-2: the "-enc" PowerShell IOC must be a command-line token (a prefix of
       -EncodedCommand from -enc on), not a substring of "Content-Encoding",
       "--encoding" or "-encrypt".'''
@@ -52,56 +53,98 @@ def test_encoding_words_are_not_the_powershell_parameter(text):
 
 
 # ------------------------------------------------------------- FA-1 engine
-
-def _pe_file(tmp_path, strings=b''):
-    hdr = bytearray(0x200)
-    hdr[0:2] = b'MZ'
-    hdr[0x3c:0x40] = struct.pack('<I', 0x40)
-    hdr[0x40:0x44] = b'PE\0\0'
-    p = tmp_path / 'tool.exe'
-    p.write_bytes(bytes(hdr) + b'\0' * 64 + strings + b'\0' * 4096)
-    return str(p)
+# Layout of the synthetic PE: header, then the "import hint/name table" at
+# NAME_TABLE (2 hint bytes + name + NUL per entry), then other strings at
+# ELSEWHERE. fakepe reports each import's name_offset like pefile does.
+NAME_TABLE = 0x300
+ELSEWHERE = 0x800
 
 
-def _scan(tmp_path, make_engine, monkeypatch, imports, strings):
-    patch_engine_pe(monkeypatch, sections=[FakeSection('.text', 6.0, 'RX')], imports=imports)
+def _pe_bytes(table_names, other=b''):
+    data = bytearray(0x1000)
+    data[0:2] = b'MZ'
+    data[0x3c:0x40] = struct.pack('<I', 0x40)
+    data[0x40:0x44] = b'PE\0\0'
+    offsets, pos = {}, NAME_TABLE
+    for name in table_names:
+        raw = name.encode('ascii')
+        data[pos:pos + 2] = b'\x01\x00'          # hint: high byte not printable
+        offsets[name] = pos + 2
+        data[pos + 2:pos + 2 + len(raw)] = raw
+        pos += 2 + len(raw) + 1
+    data[ELSEWHERE:ELSEWHERE + len(other)] = other
+    return bytes(data), offsets
+
+
+def _scan(tmp_path, make_engine, monkeypatch, imports, other=b'', with_offsets=True):
+    names = [f for funcs in imports.values() for f in funcs]
+    data, offsets = _pe_bytes(names, other)
+    patch_engine_pe(monkeypatch, sections=[FakeSection('.text', 6.0, 'RX')], imports=imports,
+                    import_offsets=offsets if with_offsets else None)
     engine = make_engine(signature_verifier=lambda path, **kw: {'status': 'unsigned',
                                                                  'publisher': None})
     monkeypatch.setattr(engine.yara_engine, 'scan', lambda path: [])
-    return engine.scan_file(_pe_file(tmp_path, strings))
+    p = tmp_path / 'tool.exe'
+    p.write_bytes(data)
+    return engine.scan_file(str(p))
+
+
+def _api_strings(results):
+    return results['details'].get('iocs', {}).get('suspicious_api', [])
 
 
 def _string_findings(results):
     return [f for f in results['findings'] if f['category'] == 'suspicious_string']
 
 
-def test_imported_api_name_is_not_counted_again_as_a_string(tmp_path, make_engine, monkeypatch):
-    # benign: the import name table holds "VirtualAlloc" because the file imports it
-    imports = {'KERNEL32.dll': ['VirtualAlloc', 'CreateFileW', 'ReadFile', 'CloseHandle']}
-    results = _scan(tmp_path, make_engine, monkeypatch, imports,
-                    b'\0\0VirtualAlloc\0\0CreateFileW\0\0ReadFile\0')
+# The dynamic-resolution chain fires, so VirtualAlloc is a scored import.
+DYNAMIC = {'KERNEL32.dll': ['LoadLibraryA', 'GetProcAddress', 'VirtualAlloc', 'CreateFileW',
+                            'ReadFile', 'CloseHandle']}
+
+
+def test_benign_scored_import_name_is_not_counted_twice(tmp_path, make_engine, monkeypatch):
+    results = _scan(tmp_path, make_engine, monkeypatch, DYNAMIC)
+    assert any(f['category'] == 'dynamic_resolution_chain' for f in results['findings'])
+    assert _api_strings(results) == []
     assert _string_findings(results) == []
-    assert 'suspicious_api' not in results['details'].get('iocs', {})
-    assert results['details']['api_strings_in_imports_only'] is True
+    assert results['details']['api_strings_in_scored_imports_only'] is True
 
 
-def test_api_name_not_imported_still_counts(tmp_path, make_engine, monkeypatch):
-    # matching: the name is in the file as a string for run-time resolution,
-    # but NOT in the import table
+def test_bypass_import_cannot_hide_the_same_name_elsewhere(tmp_path, make_engine, monkeypatch):
+    # matching: VirtualAlloc is imported (and scored) AND appears again as a
+    # separate string elsewhere: the second occurrence must still count
+    results = _scan(tmp_path, make_engine, monkeypatch, DYNAMIC,
+                    other=b'\0resolve VirtualAlloc at run time\0')
+    assert _api_strings(results) == ['VirtualAlloc']
+    assert len(_string_findings(results)) == 1
+
+
+def test_bypass_unscored_import_name_is_never_suppressed(tmp_path, make_engine, monkeypatch):
+    # matching: "ReflectiveLoader" listed as an import; the import analysis
+    # never scores it, so its string match stays
+    imports = {'evil.dll': ['ReflectiveLoader'], 'KERNEL32.dll': ['CreateFileW', 'ReadFile']}
+    results = _scan(tmp_path, make_engine, monkeypatch, imports)
+    assert _api_strings(results) == ['ReflectiveLoader']
+    assert len(_string_findings(results)) == 1
+
+
+def test_routine_import_outside_any_chain_is_not_suppressed(tmp_path, make_engine, monkeypatch):
+    # VirtualAlloc imported without a reported chain: not scored by the import
+    # analysis, so the string still counts (old behaviour kept)
     imports = {'KERNEL32.dll': ['VirtualAlloc', 'CreateFileW', 'ReadFile', 'CloseHandle']}
-    results = _scan(tmp_path, make_engine, monkeypatch, imports,
-                    b'\0\0VirtualAlloc\0\0WriteProcessMemory\0\0CreateRemoteThread\0')
-    found = _string_findings(results)
-    assert len(found) == 1 and 'suspicious_api' in found[0]['description']
-    assert results['details']['iocs']['suspicious_api'] == ['CreateRemoteThread',
-                                                            'WriteProcessMemory']
+    results = _scan(tmp_path, make_engine, monkeypatch, imports)
+    assert _api_strings(results) == ['VirtualAlloc']
+
+
+def test_unknown_name_offset_fails_safe(tmp_path, make_engine, monkeypatch):
+    results = _scan(tmp_path, make_engine, monkeypatch, DYNAMIC, with_offsets=False)
+    assert _api_strings(results) == ['VirtualAlloc']
 
 
 def test_imported_dangerous_api_is_still_judged_by_the_import_analysis(
         tmp_path, make_engine, monkeypatch):
     imports = {'KERNEL32.dll': ['VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread']}
-    results = _scan(tmp_path, make_engine, monkeypatch, imports,
-                    b'\0\0VirtualAllocEx\0\0WriteProcessMemory\0\0CreateRemoteThread\0')
+    results = _scan(tmp_path, make_engine, monkeypatch, imports)
     cats = {f['category'] for f in results['findings']}
     assert {'api_chain', 'suspicious_import'} <= cats
     assert results['score'] >= 30
@@ -115,8 +158,33 @@ def test_non_pe_file_keeps_api_string_finding(tmp_path, make_engine):
     assert any('suspicious_api' in f['description'] for f in _string_findings(results))
 
 
-def test_helper_drops_only_exact_import_names():
-    strings = ['VirtualAlloc', 'call VirtualAlloc here', 'WriteProcessMemory']
-    assert core._api_names_outside_imports(strings, {'VirtualAlloc'}) == [
-        'VirtualAlloc', 'WriteProcessMemory']
-    assert core._api_names_outside_imports(['VirtualAlloc'], {'VirtualAlloc'}) == []
+def test_helper_skips_only_exact_spans():
+    data = b'\0\0VirtualAlloc\0\0VirtualAlloc\0'
+    first = (2, 2 + len('VirtualAlloc'))
+    assert core._api_names_outside_spans(data, {first}) == ['VirtualAlloc']
+    second = (16, 16 + len('VirtualAlloc'))
+    assert core._api_names_outside_spans(data, {first, second}) == []
+
+
+@pytest.mark.parametrize('imports', [
+    {'K.dll': ['VirtualAllocEx', 'WriteProcessMemory', 'CreateRemoteThread']},
+    {'U.dll': ['URLDownloadToFileA'], 'S.dll': ['ShellExecuteA']},
+    {'U.dll': ['SetWindowsHookExA', 'GetAsyncKeyState']},
+    {'K.dll': ['LoadLibraryA', 'GetProcAddress', 'VirtualProtect', 'A', 'B', 'C']},
+    {'K.dll': ['LoadLibraryA', 'GetProcAddress', 'ExitProcess']},
+    {'A.dll': ['RegSetValueExW'], 'K.dll': ['CreateProcessW']},
+    {'A.dll': ['OpenProcessToken', 'AdjustTokenPrivileges']},
+    {'K.dll': ['IsDebuggerPresent', 'CheckRemoteDebuggerPresent']},
+])
+def test_every_reported_chain_has_its_api_list(imports):
+    '''scored_import_names() must know the APIs of every chain the analyzer
+    can report, or FA-1 would leave that chain's strings double-counted.'''
+    from fakepe import analyzer
+    from dexmond_mie.pe_analyzer import CHAIN_APIS
+    a = analyzer(imports=imports)
+    chains = a.get_api_chains() + a.get_minor_api_chains()
+    assert chains
+    for chain in chains:
+        assert any(chain.startswith(prefix) for prefix in CHAIN_APIS), chain
+    imported = {f for funcs in imports.values() for f in funcs}
+    assert a.scored_import_names() <= imported and a.scored_import_names()

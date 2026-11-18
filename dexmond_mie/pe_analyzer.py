@@ -63,6 +63,27 @@ _ANTIDEBUG_EXTRA = ('CheckRemoteDebuggerPresent', 'NtQueryInformationProcess',
 # A loader stub (packer, shellcode loader) imports almost nothing else
 TINY_IMPORT_TABLE = 5
 
+# The APIs each behavioural chain is built from, keyed by the start of the
+# chain's description (get_api_chains / get_minor_api_chains). Used by
+# scored_import_names(): an import is "scored" when it is in
+# SUSPICIOUS_IMPORTS or belongs to a chain that was reported for the file.
+CHAIN_APIS = {
+    'Process Injection Chain': {'VirtualAllocEx', 'VirtualAlloc', 'WriteProcessMemory',
+                                'NtWriteVirtualMemory', 'CreateRemoteThread',
+                                'NtCreateThreadEx', 'QueueUserAPC'},
+    'Remote Download & Exec Chain': {'URLDownloadToFileA', 'URLDownloadToFileW', 'InternetOpenA',
+                                     'InternetOpenUrlA', 'WinExec', 'ShellExecuteA',
+                                     'ShellExecuteW', 'CreateProcessA', 'CreateProcessW'},
+    'System Hooking / Keylogging Chain': {'SetWindowsHookExA', 'SetWindowsHookExW',
+                                          'GetAsyncKeyState', 'GetForegroundWindow'},
+    'Dynamic API Resolution Chain': set(_LOADLIB) | {'GetProcAddress', 'VirtualAlloc',
+                                                      'VirtualProtect'},
+    'Persistence Chain': {'RegSetValueExA', 'RegSetValueExW'} | set(_EXEC),
+    'Privilege Adjustment Chain': {'OpenProcessToken', 'AdjustTokenPrivileges',
+                                   'LookupPrivilegeValueA', 'LookupPrivilegeValueW'},
+    'Anti-Debug Chain': {'IsDebuggerPresent'} | set(_ANTIDEBUG_EXTRA),
+}
+
 class PEAnalyzer:
     '''Analyzes Portable Executable (PE) files.'''
 
@@ -164,6 +185,33 @@ class PEAnalyzer:
                 if func in SUSPICIOUS_IMPORTS:
                     found.append(func)
         return sorted(set(found))
+
+    def scored_import_names(self) -> set:
+        '''Imported function names the import analysis scores for this file:
+        SUSPICIOUS_IMPORTS names, and the APIs of every chain reported.'''
+        imported = {f for funcs in self._get_imports().values() for f in funcs}
+        scored = set(SUSPICIOUS_IMPORTS)
+        for chain in self.get_api_chains() + self.get_minor_api_chains():
+            for prefix, apis in CHAIN_APIS.items():
+                if chain.startswith(prefix):
+                    scored |= apis
+        return imported & scored
+
+    def scored_import_name_spans(self) -> set:
+        '''(start, end) file offsets of the hint/name-table strings of the
+        scored imports (pefile ImportData.name_offset). An import without a
+        known offset gives no span, so its string is still scored (fails
+        safe).'''
+        scored = self.scored_import_names()
+        spans = set()
+        for entry in getattr(self.pe, 'DIRECTORY_ENTRY_IMPORT', None) or []:
+            for imp in entry.imports:
+                offset = getattr(imp, 'name_offset', None)
+                if not imp.name or not isinstance(offset, int) or offset < 0:
+                    continue
+                if imp.name.decode('utf-8', 'ignore') in scored:
+                    spans.add((offset, offset + len(imp.name)))
+        return spans
 
     def get_api_chains(self) -> List[str]:
         '''Identifies combinations of API calls matching known attack behaviors.'''

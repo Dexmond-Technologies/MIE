@@ -39,7 +39,7 @@ class FakePE:
     def __init__(self, imports=None, sections=None, timestamp=0x60000000,
                  entry=0x1000, tls_callbacks=None, overlay_size=0, image_base=0x400000,
                  is_64=False, resource_rva=0, security=None, overlay_data=None,
-                 resources=None):
+                 resources=None, import_offsets=None):
         self.FILE_HEADER = NS(Machine=0x8664 if is_64 else 0x14c, TimeDateStamp=timestamp)
         dirs = [NS(VirtualAddress=0, Size=0) for _ in range(16)]
         dirs[2] = NS(VirtualAddress=resource_rva, Size=0x100 if resource_rva else 0)
@@ -53,7 +53,9 @@ class FakePE:
         self.sections = sections if sections is not None else [FakeSection('.text', perms='RX')]
         if imports:
             self.DIRECTORY_ENTRY_IMPORT = [
-                NS(dll=dll.encode(), imports=[NS(name=f.encode(), ordinal=None) for f in funcs])
+                NS(dll=dll.encode(), imports=[NS(name=f.encode(), ordinal=None,
+                                                 name_offset=(import_offsets or {}).get(f))
+                                              for f in funcs])
                 for dll, funcs in imports.items()]
         # tls_callbacks: None = no TLS directory; [] = TLS directory with an
         # empty callback array; [va, ...] = callback addresses

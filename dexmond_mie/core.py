@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import zipfile
 import tarfile
@@ -177,11 +178,13 @@ class Engine:
             scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer_yara)}")
 
         # --- PE analysis ---
-        imported_names = set()
+        import_name_spans = set()
         if pe_parsed:
             pe_info = pe_analyzer.analyze()
-            imported_names = {name for funcs in pe_info.get('imports', {}).values()
-                              for name in funcs}
+            try:
+                import_name_spans = pe_analyzer.scored_import_name_spans()
+            except Exception as e:  # noqa: BLE001 - no spans = nothing suppressed
+                logger.debug(f'Import name offsets unavailable for {file_path}: {e}')
             results['details']['pe_info'] = pe_info
             packer_sections = pe_analyzer.get_packer_sections()
             # Signals that packing itself causes are folded into the capped
@@ -271,20 +274,23 @@ class Engine:
         # --- Strings / IOCs ---
         strings, iocs = StringExtractor.extract_ascii_unicode(data, 5)
         results['details']['string_count'] = len(strings)
-        if imported_names and 'suspicious_api' in iocs:
-            # A parsed PE's import name table holds every imported API name as
-            # a plain string. Those names are the import evidence, already
-            # judged by the import analysis above (single imports + chains,
-            # capped 'imports' family); counting them again here scored
-            # routine imports such as VirtualAlloc that fix X3 removed on
-            # purpose. Only API names that are NOT imported (strings for
-            # run-time resolution, embedded scripts) stay in this finding.
-            not_imported = _api_names_outside_imports(strings, imported_names)
-            if not_imported:
-                iocs['suspicious_api'] = not_imported
+        if import_name_spans and 'suspicious_api' in iocs:
+            # Fix FA-1. A parsed PE's import hint/name table holds each
+            # imported API name as a plain string; that occurrence IS the
+            # import. When the import analysis above has scored that import
+            # (a SUSPICIOUS_IMPORTS name, or part of a reported chain), the
+            # same bytes are not scored a second time here. Suppression is by
+            # file offset: only the string that starts and ends exactly at a
+            # scored import's name entry is skipped. The same name anywhere
+            # else in the file, any name the import analysis does not score
+            # (e.g. ReflectiveLoader, or VirtualAlloc outside a chain), and
+            # every non-PE file keep this finding.
+            outside = _api_names_outside_spans(data, import_name_spans)
+            if outside:
+                iocs['suspicious_api'] = outside
             else:
                 del iocs['suspicious_api']
-                results['details']['api_strings_in_imports_only'] = True
+                results['details']['api_strings_in_scored_imports_only'] = True
         if iocs:
             results['details']['iocs'] = iocs
         for key in ('powershell', 'suspicious_api'):
@@ -740,11 +746,18 @@ class Engine:
                     reasons.append(f'tar end not readable ({type(e).__name__})')
 
 
-def _api_names_outside_imports(strings, imported_names):
-    '''suspicious_api matches from the strings that are not exactly an
-    imported function name (fix FA-1). Sorted, de-duplicated.'''
+def _api_names_outside_spans(data: bytes, spans) -> list:
+    '''suspicious_api matches over the same ASCII and UTF-16 string runs as
+    StringExtractor, except ASCII runs whose (start, end) file offsets are
+    exactly one of `spans` (the name entries of scored imports). Fix FA-1.'''
     pattern = StringExtractor.PATTERNS['suspicious_api']
-    return sorted({m for s in strings if s not in imported_names for m in pattern.findall(s)})
+    found = set()
+    for m in re.finditer(rb'[ -~]{5,}', data):
+        if (m.start(), m.end()) not in spans:
+            found.update(pattern.findall(m.group().decode('ascii', errors='ignore')))
+    for m in re.finditer(rb'(?:[ -~]\x00){5,}', data):
+        found.update(pattern.findall(m.group().decode('utf-16le', errors='ignore')))
+    return sorted(found)
 
 
 def is_partial_scan(results: Dict[str, Any]) -> bool:
