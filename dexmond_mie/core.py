@@ -148,112 +148,116 @@ class Engine:
         # really parsed the file (no parser differential / fail-open).
         claims_pe = is_pe_data(data)
         pe_analyzer = PEAnalyzer(file_path) if data[:2] == b'MZ' else None
-        pe_parsed = pe_analyzer is not None and pe_analyzer.is_valid()
-        if claims_pe and not pe_parsed:
-            if pe_analyzer is not None and pe_analyzer.available:
-                scorer.add_finding('malformed_pe',
-                                   f'File has a PE signature but does not parse as PE '
-                                   f'({pe_analyzer.parse_error})')
-            else:
-                results['details']['pe_analysis'] = 'unavailable (pefile not installed)'
-
-        # --- Entropy (measured here, scored after the archive scan) ---
-        entropy = calculate_entropy(data)
-        sliding_entropy = calculate_sliding_window_entropy(data)
-        results['details']['entropy'] = round(entropy, 4)
-        results['details']['sliding_entropy'] = sliding_entropy
-        compressed_format = detect_compressed_format(data)
-        if compressed_format:
-            results['details']['compressed_format'] = compressed_format
-
-        # --- YARA ---
-        yara_matches = self.yara_engine.scan(file_path)
-        results['yara'] = [m['rule'] for m in yara_matches]
-        if yara_matches:
-            results['details']['yara_matches'] = yara_matches
-        packer_yara = [m['rule'] for m in yara_matches if self._yara_category(m) == 'packer']
-        self._add_yara_findings(scorer, [m for m in yara_matches
-                                         if self._yara_category(m) != 'packer'])
-        if packer_yara and not pe_parsed:
-            scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer_yara)}")
-
-        # --- PE analysis ---
         import_name_spans = set()
-        if pe_parsed:
-            pe_info = pe_analyzer.analyze()
-            try:
-                import_name_spans = pe_analyzer.scored_import_name_spans()
-            except Exception as e:  # noqa: BLE001 - no spans = nothing suppressed
-                logger.debug(f'Import name offsets unavailable for {file_path}: {e}')
-            results['details']['pe_info'] = pe_info
-            packer_sections = pe_analyzer.get_packer_sections()
-            # Signals that packing itself causes are folded into the capped
-            # 'packing' family ONLY when the packer is confirmed (YARA rule +
-            # the packer's real section layout), and only for the packer's
-            # OWN sections. A fake marker folds nothing: every other finding
-            # keeps its own weight outside the cap.
-            own = pe_analyzer.confirmed_upx_sections(packer_yara)   # section indices
-            names = [pe_analyzer._section_name(sec) for sec in pe_analyzer.pe.sections]
-            if own:
-                results['details']['packer_confirmed'] = [names[i] for i in sorted(own)]
-            pack = lambda in_packer: 'packing' if in_packer else None  # noqa: E731
-            he_sections = pe_info.get('high_entropy_sections', [])
-            for idx in he_sections:
-                scorer.add_finding('high_entropy',
-                                   f'Section {names[idx]} has very high entropy (packed/encrypted?)',
-                                   family=pack(idx in own))
-            wx = pe_info.get('wx_sections', [])
-            for group, in_packer in (([i for i in wx if i in own], True),
-                                     ([i for i in wx if i not in own], False)):
-                if group:
-                    scorer.add_finding('wx_section',
-                                       f"Writable and executable section(s): "
-                                       f"{', '.join(names[i] for i in group)}",
-                                       family=pack(in_packer))
-            any_entropy_warning = any('entropy' in w for w in pe_info.get('warnings', []))
-            for warning in pe_info.get('warnings', []):
-                if '(packed/encrypted?)' in warning or 'Writable and executable' in warning:
-                    continue  # scored per section above
-                if 'entropy' in warning:
-                    scorer.add_finding('high_entropy', warning)
-                elif 'TLS Callbacks' in warning:
-                    # TLS callbacks are scored (weight 5) only together with a
-                    # packer or any entropy signal; otherwise they are
-                    # reported in pe_info.tls_callbacks only
-                    if packer_sections or packer_yara or he_sections or any_entropy_warning:
-                        scorer.add_finding('tls_callback', warning,
-                                           family=pack(pe_info.get('tls_callback_section') in own))
-                elif 'overlay' in warning:
-                    scorer.add_finding('pe_overlay', warning)
+        try:
+            pe_parsed = pe_analyzer is not None and pe_analyzer.is_valid()
+            if claims_pe and not pe_parsed:
+                if pe_analyzer is not None and pe_analyzer.available:
+                    scorer.add_finding('malformed_pe',
+                                       f'File has a PE signature but does not parse as PE '
+                                       f'({pe_analyzer.parse_error})')
                 else:
-                    scorer.add_finding('anomaly', warning)
-            cert = pe_info.get('certificate', {})
-            if cert.get('present') and not cert.get('valid'):
-                scorer.add_finding('malformed_certificate_table',
-                                   f"Authenticode certificate table is malformed or oversized: "
-                                   f"{'; '.join(cert.get('problems', []))}")
-            overlay = pe_info.get('overlay_entropy', {})
-            if overlay.get('size', 0) >= OVERLAY_ENTROPY_MIN_BYTES and overlay.get('entropy', 0) > 7.2:
-                scorer.add_finding('overlay_high_entropy',
-                                   f"PE overlay ({overlay['size']} bytes, certificate excluded) has "
-                                   f"high entropy ({overlay['entropy']:.2f}/8.00)")
-            for chain in pe_info.get('api_chains', []):
-                scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
-            for chain in pe_info.get('minor_api_chains', []):
-                category = self._minor_chain_category(chain)
-                # a confirmed UPX stub resolves its imports at run time
-                scorer.add_finding(category, f"Behavioral API Chain detected: {chain}",
-                                   family=pack(bool(own) and category == 'dynamic_resolution_chain'))
-            suspicious_imports = pe_analyzer.get_suspicious_imports()
-            if suspicious_imports:
-                scorer.add_finding('suspicious_import',
-                                   f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
-            # Packing is one signal: YARA packer rules OR section names, never
-            # both (X10)
-            packer_evidence = list(packer_sections) + packer_yara
-            if packer_evidence:
-                scorer.add_finding('packer_detected',
-                                   f"Packer detected: {', '.join(packer_evidence)}")
+                    results['details']['pe_analysis'] = 'unavailable (pefile not installed)'
+
+            # --- Entropy (measured here, scored after the archive scan) ---
+            entropy = calculate_entropy(data)
+            sliding_entropy = calculate_sliding_window_entropy(data)
+            results['details']['entropy'] = round(entropy, 4)
+            results['details']['sliding_entropy'] = sliding_entropy
+            compressed_format = detect_compressed_format(data)
+            if compressed_format:
+                results['details']['compressed_format'] = compressed_format
+
+            # --- YARA ---
+            yara_matches = self.yara_engine.scan(file_path)
+            results['yara'] = [m['rule'] for m in yara_matches]
+            if yara_matches:
+                results['details']['yara_matches'] = yara_matches
+            packer_yara = [m['rule'] for m in yara_matches if self._yara_category(m) == 'packer']
+            self._add_yara_findings(scorer, [m for m in yara_matches
+                                             if self._yara_category(m) != 'packer'])
+            if packer_yara and not pe_parsed:
+                scorer.add_finding('packer_detected', f"Packer detected: {', '.join(packer_yara)}")
+
+            # --- PE analysis ---
+            if pe_parsed:
+                pe_info = pe_analyzer.analyze()
+                try:
+                    import_name_spans = pe_analyzer.scored_import_name_spans()
+                except Exception as e:  # noqa: BLE001 - no spans = nothing suppressed
+                    logger.debug(f'Import name offsets unavailable for {file_path}: {e}')
+                results['details']['pe_info'] = pe_info
+                packer_sections = pe_analyzer.get_packer_sections()
+                # Signals that packing itself causes are folded into the capped
+                # 'packing' family ONLY when the packer is confirmed (YARA rule +
+                # the packer's real section layout), and only for the packer's
+                # OWN sections. A fake marker folds nothing: every other finding
+                # keeps its own weight outside the cap.
+                own = pe_analyzer.confirmed_upx_sections(packer_yara)   # section indices
+                names = [pe_analyzer._section_name(sec) for sec in pe_analyzer.pe.sections]
+                if own:
+                    results['details']['packer_confirmed'] = [names[i] for i in sorted(own)]
+                pack = lambda in_packer: 'packing' if in_packer else None  # noqa: E731
+                he_sections = pe_info.get('high_entropy_sections', [])
+                for idx in he_sections:
+                    scorer.add_finding('high_entropy',
+                                       f'Section {names[idx]} has very high entropy (packed/encrypted?)',
+                                       family=pack(idx in own))
+                wx = pe_info.get('wx_sections', [])
+                for group, in_packer in (([i for i in wx if i in own], True),
+                                         ([i for i in wx if i not in own], False)):
+                    if group:
+                        scorer.add_finding('wx_section',
+                                           f"Writable and executable section(s): "
+                                           f"{', '.join(names[i] for i in group)}",
+                                           family=pack(in_packer))
+                any_entropy_warning = any('entropy' in w for w in pe_info.get('warnings', []))
+                for warning in pe_info.get('warnings', []):
+                    if '(packed/encrypted?)' in warning or 'Writable and executable' in warning:
+                        continue  # scored per section above
+                    if 'entropy' in warning:
+                        scorer.add_finding('high_entropy', warning)
+                    elif 'TLS Callbacks' in warning:
+                        # TLS callbacks are scored (weight 5) only together with a
+                        # packer or any entropy signal; otherwise they are
+                        # reported in pe_info.tls_callbacks only
+                        if packer_sections or packer_yara or he_sections or any_entropy_warning:
+                            scorer.add_finding('tls_callback', warning,
+                                               family=pack(pe_info.get('tls_callback_section') in own))
+                    elif 'overlay' in warning:
+                        scorer.add_finding('pe_overlay', warning)
+                    else:
+                        scorer.add_finding('anomaly', warning)
+                cert = pe_info.get('certificate', {})
+                if cert.get('present') and not cert.get('valid'):
+                    scorer.add_finding('malformed_certificate_table',
+                                       f"Authenticode certificate table is malformed or oversized: "
+                                       f"{'; '.join(cert.get('problems', []))}")
+                overlay = pe_info.get('overlay_entropy', {})
+                if overlay.get('size', 0) >= OVERLAY_ENTROPY_MIN_BYTES and overlay.get('entropy', 0) > 7.2:
+                    scorer.add_finding('overlay_high_entropy',
+                                       f"PE overlay ({overlay['size']} bytes, certificate excluded) has "
+                                       f"high entropy ({overlay['entropy']:.2f}/8.00)")
+                for chain in pe_info.get('api_chains', []):
+                    scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
+                for chain in pe_info.get('minor_api_chains', []):
+                    category = self._minor_chain_category(chain)
+                    # a confirmed UPX stub resolves its imports at run time
+                    scorer.add_finding(category, f"Behavioral API Chain detected: {chain}",
+                                       family=pack(bool(own) and category == 'dynamic_resolution_chain'))
+                suspicious_imports = pe_analyzer.get_suspicious_imports()
+                if suspicious_imports:
+                    scorer.add_finding('suspicious_import',
+                                       f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
+                # Packing is one signal: YARA packer rules OR section names, never
+                # both (X10)
+                packer_evidence = list(packer_sections) + packer_yara
+                if packer_evidence:
+                    scorer.add_finding('packer_detected',
+                                       f"Packer detected: {', '.join(packer_evidence)}")
+        finally:
+            if pe_analyzer is not None:
+                pe_analyzer.close()
 
         # --- Authenticode signature (X12) ---
         if pe_parsed:
@@ -427,19 +431,19 @@ class Engine:
 
         # PE header and import table from the head window only
         if is_pe_data(head):
-            pe_analyzer = PEAnalyzer.from_data(head, file_path)
-            if pe_analyzer.is_valid():
-                results['details']['pe_info'] = {'is_pe': True, 'partial': True,
-                                                 'imports': pe_analyzer._get_imports()}
-                for chain in pe_analyzer.get_api_chains():
-                    scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
-                for chain in pe_analyzer.get_minor_api_chains():
-                    scorer.add_finding(self._minor_chain_category(chain),
-                                       f"Behavioral API Chain detected: {chain}")
-                suspicious_imports = pe_analyzer.get_suspicious_imports()
-                if suspicious_imports:
-                    scorer.add_finding('suspicious_import',
-                                       f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
+            with PEAnalyzer.from_data(head, file_path) as pe_analyzer:
+                if pe_analyzer.is_valid():
+                    results['details']['pe_info'] = {'is_pe': True, 'partial': True,
+                                                     'imports': pe_analyzer._get_imports()}
+                    for chain in pe_analyzer.get_api_chains():
+                        scorer.add_finding('api_chain', f"Behavioral API Chain detected: {chain}")
+                    for chain in pe_analyzer.get_minor_api_chains():
+                        scorer.add_finding(self._minor_chain_category(chain),
+                                           f"Behavioral API Chain detected: {chain}")
+                    suspicious_imports = pe_analyzer.get_suspicious_imports()
+                    if suspicious_imports:
+                        scorer.add_finding('suspicious_import',
+                                           f"Suspicious API imports: {', '.join(suspicious_imports[:10])}")
 
         # Strings / IOCs on the windows
         for name, chunk in windows:
@@ -524,7 +528,7 @@ class Engine:
         if _budget is None:
             _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         try:
-            tmp = tempfile.TemporaryDirectory(prefix='dexmond_arc_')
+            tmp = tempfile.TemporaryDirectory(prefix='dexmond_arc_', ignore_cleanup_errors=True)
         except OSError as e:
             reasons.append(f'no temp dir: {e}')
             return summary

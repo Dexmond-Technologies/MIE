@@ -1,4 +1,5 @@
 import argparse
+import io
 import sys
 import json
 import logging
@@ -11,6 +12,40 @@ from colorama import init, Fore, Style
 from .core import Engine
 from . import paths
 
+_fallback_stream = None
+_uvicorn_server = None
+
+
+def _open_fallback_stream():
+    global _fallback_stream
+    if _fallback_stream is not None and not _fallback_stream.closed:
+        return _fallback_stream
+    try:
+        log_path = os.path.join(paths.data_dir(), 'dexmond_mie.log')
+        try:
+            if os.path.isfile(log_path) and os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.replace(log_path, log_path + '.1')
+        except OSError:
+            pass
+        _fallback_stream = open(log_path, 'a', encoding='utf-8', errors='replace', buffering=1)
+    except OSError:
+        _fallback_stream = io.StringIO()
+    return _fallback_stream
+
+
+def _ensure_stdio():
+    '''In a PyInstaller windowed build (console=False), sys.stdout and
+    sys.stderr are None, which breaks print(), StreamHandler and uvicorn's
+    DefaultFormatter. Redirect missing streams to a log file (or StringIO).'''
+    if sys.stdout is None or sys.stderr is None:
+        stream = _open_fallback_stream()
+        if sys.stdout is None:
+            sys.stdout = stream
+        if sys.stderr is None:
+            sys.stderr = stream
+
+
+_ensure_stdio()
 init()
 
 DEFAULT_HOST = '127.0.0.1'
@@ -18,6 +53,7 @@ DEFAULT_PORT = int(os.environ.get('DEXMOND_PORT', '8888'))
 
 
 def setup_logging(verbose=False):
+    _ensure_stdio()
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -62,22 +98,38 @@ def color_verdict(verdict):
     return f'''{Fore.GREEN}{verdict}{Style.RESET_ALL}'''
 
 
+def _uvicorn_kwargs(host, port):
+    return {'host': host, 'port': port, 'log_level': 'warning', 'log_config': None}
+
+
 def _start_server(host, port):
     '''Starts the dashboard/API server in a background thread and waits until
     it is accepting connections. The webapp auto-starts realtime protection.'''
+    global _uvicorn_server
+    _ensure_stdio()
     import uvicorn
     from .webapp import app
-    server = threading.Thread(
-        target=uvicorn.run, args=(app,),
-        kwargs={'host': host, 'port': port, 'log_level': 'warning'},
-        daemon=True)
+    config = uvicorn.Config(app, **_uvicorn_kwargs(host, port))
+    server_obj = uvicorn.Server(config)
+    _uvicorn_server = server_obj
+    server = threading.Thread(target=server_obj.run, daemon=True)
     server.start()
-    url = f'http://{host}:{port}'
+    host_fmt = f'[{host}]' if ':' in host and not host.startswith('[') else host
+    url = f'http://{host_fmt}:{port}'
     for _ in range(50):
+        if not server.is_alive():
+            break
         try:
             import urllib.request
-            urllib.request.urlopen(url, timeout=1)
-            break
+            req = urllib.request.Request(f'{url}/status')
+            try:
+                with open(paths.token_file(), encoding='utf-8') as f:
+                    req.add_header('X-DEXMOND-Token', f.read().strip())
+            except OSError:
+                pass
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                if resp.status == 200:
+                    break
         except Exception:
             time.sleep(0.1)
     return url
@@ -134,20 +186,36 @@ def run_background(host=DEFAULT_HOST, port=DEFAULT_PORT):
     try:
         from .tray import run_tray
         run_tray(None)
-    except ImportError as e:
+    except Exception as e:
         logger.warning(f'Tray unavailable ({e}); running headless (Ctrl+C to stop)')
         try:
-            while True:
+            while _uvicorn_server is None or not _uvicorn_server.should_exit:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
 
 
+def run_serve(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    '''Headless server mode: dashboard/API server + folder monitoring only.'''
+    logger = logging.getLogger('DEXMOND_MIE')
+    os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
+    url = _start_server(host, port)
+    logger.info(f'Server running at {url}')
+    try:
+        while _uvicorn_server is None or not _uvicorn_server.should_exit:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        if _uvicorn_server is not None:
+            _uvicorn_server.should_exit = True
+
+
 def run():
+    _ensure_stdio()
     parser = argparse.ArgumentParser(description='DEXMOND MIE - Lightweight Malware Inspection Engine')
     subparsers = parser.add_subparsers(dest='command', help='Commands')
     subparsers.add_parser('gui', help='Launch the Graphical User Interface')
     subparsers.add_parser('background', help='Run in the background: tray icon and folder monitoring')
+    subparsers.add_parser('serve', help='Run the local server and folder monitoring headlessly')
     scan_parser = subparsers.add_parser('scan', help='Scan a file or directory')
     scan_parser.add_argument('target', help='File or directory to scan')
     scan_parser.add_argument('--rules-dir', default=paths.rules_dir(), help='Path to YARA rules directory')
@@ -172,6 +240,9 @@ def run():
         return
     if args.command == 'background':
         run_background()
+        return
+    if args.command == 'serve':
+        run_serve()
         return
     if args.command == 'rules':
         from .auto_evolution import list_proposed, approve_rule

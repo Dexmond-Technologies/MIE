@@ -46,8 +46,8 @@ jobs:
           cache-dependency-path: |
             requirements-signify.lock
             .github/workflows/tests.yml
-      - name: Install engine deps (pinned)
-        run: python -m pip install $ENGINE_DEPS
+      - name: Install engine and web deps (pinned)
+        run: python -m pip install $ENGINE_DEPS fastapi==0.162.0 uvicorn==0.54.0 python-multipart==0.0.33
       - name: Install signify stack (hash-locked)
         run: python -m pip install --require-hashes -r requirements-signify.lock
       - name: pytest
@@ -142,6 +142,68 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean dexmond_mie.spec
       - name: Static bundle check
         run: python scripts/check_bundle.py dist/DexmondMIE
+      - name: Smoke-test packaged DexmondMIE.exe (console=False startup & scan)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dataDir = Join-Path $env:RUNNER_TEMP 'mie-smoke-data'
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          $env:DEXMOND_DATA_DIR = $dataDir
+          $env:DEXMOND_PORT = '18888'
+          $exe = Resolve-Path 'dist\DexmondMIE\DexmondMIE.exe'
+          # Start without redirecting stdout/stderr so sys.stdout and sys.stderr are None (console=False)
+          $proc = Start-Process -FilePath $exe -ArgumentList 'background' -PassThru
+          try {
+            $tokenFile = Join-Path $dataDir '.auth_token'
+            $status = $null
+            $tok = ''
+            for ($i = 0; $i -lt 60; $i++) {
+              if ($proc.HasExited) {
+                $logFile = Join-Path $dataDir 'dexmond_mie.log'
+                if (Test-Path $logFile) { Get-Content -LiteralPath $logFile }
+                throw "DexmondMIE.exe exited prematurely with code $($proc.ExitCode)"
+              }
+              if (Test-Path $tokenFile) {
+                $tok = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+                if ($tok) {
+                  try {
+                    $status = Invoke-RestMethod -Uri 'http://127.0.0.1:18888/status' `
+                      -Headers @{'X-DEXMOND-Token' = $tok} -TimeoutSec 2
+                    if ($status.status -eq 'active') { break }
+                  } catch { }
+                }
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            if ($null -eq $status -or $status.status -ne 'active') {
+              $logFile = Join-Path $dataDir 'dexmond_mie.log'
+              if (Test-Path $logFile) { Get-Content -LiteralPath $logFile }
+              throw 'Timed out waiting for DexmondMIE.exe /status == active'
+            }
+            Write-Host "Smoke status OK: version=$($status.version) yara=$($status.yara_status) rules=$($status.rules_count)"
+            if ($status.yara_status -ne 'ON') {
+              throw "Expected yara_status=ON in packaged exe, got $($status.yara_status)"
+            }
+            $samplePe = Join-Path $dataDir 'smoke_copy.exe'
+            Copy-Item -LiteralPath "$env:SystemRoot\System32\cmd.exe" -Destination $samplePe -Force
+            $body = @{ path = $samplePe } | ConvertTo-Json -Compress
+            $scan = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:18888/api/scan' `
+              -Headers @{'X-DEXMOND-Token' = $tok; 'Content-Type' = 'application/json'} `
+              -Body $body -TimeoutSec 15
+            Write-Host "Smoke PE scan OK: verdict=$($scan.verdict) score=$($scan.score) sig=$($scan.details.signature.status)"
+            if ($scan.details.signature.detail -match 'ImportError|ModuleNotFoundError') {
+              throw "Missing module inside packaged exe signature check: $($scan.details.signature.detail)"
+            }
+            # Prove pefile closed its mmap handle: immediate file deletion must succeed (no WinError 32)
+            Remove-Item -LiteralPath $samplePe -Force
+          } finally {
+            if (-not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              $proc.WaitForExit(5000) | Out-Null
+            }
+            Remove-Item Env:DEXMOND_DATA_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:DEXMOND_PORT -ErrorAction SilentlyContinue
+          }
       # Not code-signed; no production licence key today (gate above); false-alarm
       # rate not yet re-measured. For testing only, not for sale.
       - name: Zip and checksum the test build

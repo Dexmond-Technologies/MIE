@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import stat
 import time
 import hashlib
 import logging
@@ -43,6 +44,11 @@ class QuarantineManager:
         qid = hashlib.sha256(f'{file_path}|{time.time()}'.encode()).hexdigest()[:16]
         data_path = os.path.join(self.dir, qid + '.qtn')
         self._xor_copy(file_path, data_path)
+        if not os.path.islink(file_path):
+            try:
+                os.chmod(file_path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
         os.remove(file_path)
         results = results or {}
         meta = {

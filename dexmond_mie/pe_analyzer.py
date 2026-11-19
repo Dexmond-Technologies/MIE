@@ -108,12 +108,18 @@ class PEAnalyzer:
         obj.parse_error = None
         if pefile is None:
             return obj
+        pe = None
         try:
             pe = pefile.PE(data=data, fast_load=True)
             pe.parse_data_directories(
                 directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
             obj.pe = pe
         except Exception as e:
+            if pe is not None:
+                try:
+                    pe.close()
+                except Exception:
+                    pass
             logger.debug(f'Bounded PE parse failed for {file_path}: {e}')
         return obj
 
@@ -134,6 +140,25 @@ class PEAnalyzer:
         except Exception as e:
             self.parse_error = str(e) or type(e).__name__
             logger.error(f'Failed to parse PE {file_path}: {e}')
+
+    def close(self) -> None:
+        '''Releases pefile's underlying mmap/file handle (required on Windows
+        before deleting, quarantining, or cleaning up temporary directories).'''
+        if self.pe is not None:
+            close_fn = getattr(self.pe, 'close', None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self.pe = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def is_valid(self) -> bool:
         return self.pe is not None

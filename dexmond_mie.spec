@@ -42,6 +42,7 @@ if importlib.util.find_spec('signify') is not None:
     hiddenimports += collect_submodules('signify')
     for pkg in ('mscerts', 'certvalidator', 'oscrypto', 'asn1crypto'):
         if importlib.util.find_spec(pkg) is not None:
+            hiddenimports += collect_submodules(pkg)
             datas += collect_data_files(pkg)
 
 block_cipher = None
