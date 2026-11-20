@@ -186,14 +186,16 @@ def test_s5_cross_drive_or_unc_entry_does_not_abort_later_zip_members(tmp_path, 
     assert res['score'] >= 20
 
 
-def test_s6_spoofed_zip_header_file_size_caught_as_mismatch(tmp_path, make_engine):
+def test_s6_spoofed_zip_header_file_size_caught_as_mismatch(monkeypatch, tmp_path, make_engine):
+    monkeypatch.setattr(core, 'MAX_ARCHIVE_MEMBER_BYTES', 1024)
     zpath = tmp_path / 'spoofed.zip'
     payload = b'A' * 4096
     with zipfile.ZipFile(zpath, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('zeros.bin', payload)
     raw = bytearray(zpath.read_bytes())
     # Patch uncompressed size (4096 = 0x1000) in both local header (offset 22)
-    # and central directory header to 16 bytes.
+    # and central directory header to 16 bytes so pre-check sees 16 <= 1024,
+    # while streaming decompression catches actual > 1024 before stream EOF!
     lh_uncomp = struct.unpack_from('<I', raw, 22)[0]
     assert lh_uncomp == 4096
     struct.pack_into('<I', raw, 22, 16)
@@ -206,8 +208,9 @@ def test_s6_spoofed_zip_header_file_size_caught_as_mismatch(tmp_path, make_engin
     eng = make_engine()
     res = eng.scan_file(str(zpath))
     arc = res['details']['archive']
+    assert arc['members_scanned'] == 0
     assert arc['coverage']['complete'] is False
-    assert any('mismatch' in r for r in arc['coverage']['reasons'])
+    assert any('member extraction failed' in r or 'mismatch' in r for r in arc['coverage']['reasons'])
 
 
 # --------------------------------------------------------- S-8, S-9, S-10: links & quarantine
@@ -269,7 +272,7 @@ def test_s11_auto_evolution_escapes_filename_and_rejects_duplicate_rule(tmp_path
         'score': 85,
         'filename': inj_name,
         'hashes': {'sha256': 'abcdef0123456789' * 4},
-        'details': {'iocs': {'url': ['https://bad-c2-domain.example/gate.php']}},
+        'details': {'iocs': {'suspicious_api': ['ReflectiveLoaderStageTwoMarker']}},
     }
     rname = RuleSynthesizer.generate_yara_rule('sample.bin', res, str(rules_dir))
     assert rname is not None and 'abcdef012345' in rname
