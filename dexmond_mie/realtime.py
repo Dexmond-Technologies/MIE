@@ -1,11 +1,13 @@
 import os
 import time
+import ctypes
 import logging
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .core import Engine, needs_alert, auto_quarantine_allowed
+from . import paths
 
 logger = logging.getLogger('DEXMOND_REALTIME')
 
@@ -15,6 +17,60 @@ ALERT_THRESHOLD = 30
 # their final name (which arrives as a moved event).
 IGNORED_EXTENSIONS = {'.crdownload', '.part', '.partial', '.download', '.tmp', '.qtn'}
 DEBOUNCE_SECONDS = 2.0
+
+# Windows Known Folder GUIDs (Downloads, Desktop, Documents), resolving
+# OneDrive Known Folder Move paths automatically (Finding W-4).
+_KNOWN_FOLDER_GUIDS = (
+    (0x374DE290, 0x123F, 0x4565, (0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B)),  # Downloads
+    (0xB4BFCC3A, 0xDB2C, 0x424C, (0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41)),  # Desktop
+    (0xFDD39AD0, 0x238F, 0x46AF, (0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7)),  # Documents
+)
+
+
+def _windows_known_folders():
+    if os.name != 'nt':
+        return []
+    try:
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ('Data1', ctypes.c_uint32),
+                ('Data2', ctypes.c_uint16),
+                ('Data3', ctypes.c_uint16),
+                ('Data4', ctypes.c_uint8 * 8),
+            ]
+
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        out = []
+        for d1, d2, d3, d4 in _KNOWN_FOLDER_GUIDS:
+            guid = _GUID(d1, d2, d3, (ctypes.c_uint8 * 8)(*d4))
+            ptr = ctypes.c_wchar_p()
+            hr = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(ptr))
+            if hr == 0 and ptr.value:
+                out.append(ptr.value)
+            if ptr:
+                ole32.CoTaskMemFree(ptr)
+        return out
+    except Exception as e:
+        logger.debug(f'SHGetKnownFolderPath unavailable: {e}')
+        return []
+
+
+def _is_internal_mie_path(path: str) -> bool:
+    '''True when path is inside MIE's own runtime data, scratch, or quarantine
+    folders (prevents self-scan loops — Finding W-3).'''
+    try:
+        target = os.path.abspath(path)
+        for internal in (paths.data_dir(), paths.scratch_dir(), paths.quarantine_dir()):
+            internal_abs = os.path.abspath(internal)
+            try:
+                if os.path.commonpath([target, internal_abs]) == internal_abs:
+                    return True
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return False
 
 
 class MalwareEventHandler(FileSystemEventHandler):
@@ -39,6 +95,8 @@ class MalwareEventHandler(FileSystemEventHandler):
     def _scan(self, path):
         if os.path.splitext(path)[1].lower() in IGNORED_EXTENSIONS:
             return
+        if _is_internal_mie_path(path):
+            return
         now = time.time()
         last = self._recent.get(path, 0)
         self._recent[path] = now
@@ -49,7 +107,7 @@ class MalwareEventHandler(FileSystemEventHandler):
             self._recent = {p: t for p, t in self._recent.items() if t > cutoff}
         # Give the writing process a moment to finish flushing the file
         time.sleep(0.5)
-        if not os.path.isfile(path):
+        if not paths.is_regular_non_link(path):
             return
         try:
             results = self.engine.scan_file(path)
@@ -100,18 +158,27 @@ class RealtimeScanner:
 
     @staticmethod
     def default_watch_dirs():
-        '''Folders new files typically land in. Windows is the published target;
-        other platforms get a home-folder fallback for development.'''
+        '''User folders where new files typically land (Downloads, Desktop,
+        Documents — including OneDrive Known Folder Move locations on Windows).'''
         home = os.path.expanduser('~')
         if os.name == 'nt':
-            candidates = [
+            raw = _windows_known_folders() + [
                 os.path.join(home, 'Downloads'),
                 os.path.join(home, 'Desktop'),
                 os.path.join(home, 'Documents'),
-                os.environ.get('TEMP', '')]
+            ]
         else:
-            candidates = [os.path.join(home, 'Downloads')]
-        return [d for d in candidates if d and os.path.isdir(d)]
+            raw = [os.path.join(home, 'Downloads')]
+        seen = set()
+        result = []
+        for d in raw:
+            if not d or not os.path.isdir(d):
+                continue
+            norm = os.path.normcase(os.path.abspath(d))
+            if norm not in seen and not _is_internal_mie_path(d):
+                seen.add(norm)
+                result.append(os.path.abspath(d))
+        return result
 
     @property
     def is_active(self):

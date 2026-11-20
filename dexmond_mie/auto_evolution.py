@@ -60,8 +60,11 @@ class RuleSynthesizer:
             return None
 
         filename = results.get('filename', 'sample')
-        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', filename).strip('_')
-        rule_name = f"auto_gen_{safe_name}_{int(time.time())}"
+        safe_name = (re.sub(r'[^a-zA-Z0-9_]', '_', filename).strip('_') or 'sample')[:40]
+        sha_part = re.sub(r'[^a-f0-9]', '', str((results.get('hashes') or {}).get('sha256', '')).lower())[:12]
+        suffix = sha_part or str(time.time_ns())
+        rule_name = f"auto_gen_{safe_name}_{suffix}"
+        safe_desc_filename = re.sub(r'[\x00-\x1f\x7f]', '', str(filename)).replace('\\', '\\\\').replace('"', '\\"')[:120]
 
         strings_list = results.get('details', {}).get('iocs', {})
         raw_strings = []
@@ -75,21 +78,22 @@ class RuleSynthesizer:
 
         string_defs = []
         for i, s in enumerate(candidates):
-            escaped = s.replace('\\', '\\\\').replace('"', '\\"')
+            clean_s = re.sub(r'[\x00-\x1f\x7f]', '', s)
+            escaped = clean_s.replace('\\', '\\\\').replace('"', '\\"')
             string_defs.append(f'        $s{i} = "{escaped}" ascii wide')
 
         rule_body = f"""
 rule {rule_name} {{
     meta:
-        description = "Auto-generated signature for {filename}"
+        description = "Auto-generated signature for {safe_desc_filename}"
         author = "DEXMOND MIE Auto-Evolution Engine"
         date = "{time.strftime('%Y-%m-%d')}"
-        severity = "critical"
+        severity = "medium"
         auto_generated = true
     strings:
 {chr(10).join(string_defs)}
     condition:
-        any of ($s*)
+        all of ($s*)
 }}
 """
         target_rule_file = proposed_path(rules_dir)
@@ -189,11 +193,16 @@ def approve_rule(rules_dir: str, rule_name: str, compiler=None) -> str:
         except ImportError:
             raise ValueError('yara-python is not installed: cannot validate the rule, not approved')
         compiler = lambda source: yara.compile(source=source)  # noqa: E731
+    approved_path = os.path.join(rules_dir, APPROVED_FILE)
+    existing_approved = ''
+    if os.path.isfile(approved_path):
+        with open(approved_path, encoding='utf-8', errors='ignore') as af:
+            existing_approved = af.read()
     try:
-        compiler(block)
+        compiler((existing_approved + '\n' + block) if existing_approved.strip() else block)
     except Exception as e:  # noqa: BLE001
-        raise ValueError(f'rule does not compile, not approved: {e}')
-    with open(os.path.join(rules_dir, APPROVED_FILE), 'a', encoding='utf-8') as f:
+        raise ValueError(f'rule does not compile (or conflicts with approved rules), not approved: {e}')
+    with open(approved_path, 'a', encoding='utf-8') as f:
         f.write('\n' + block.strip() + '\n')
     remaining = [b for b in blocks if _rule_name(b) != rule_name]
     with open(path, 'w', encoding='utf-8') as f:

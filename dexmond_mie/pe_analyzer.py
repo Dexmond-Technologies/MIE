@@ -32,13 +32,15 @@ PACKER_SECTIONS = {
 # tool or installer imports are not listed here (fix X3); they only count
 # inside the behavioural chains of get_api_chains() / get_minor_api_chains().
 SUSPICIOUS_IMPORTS = {
-    'VirtualAllocEx', 'WriteProcessMemory',
+    'VirtualAllocEx', 'NtAllocateVirtualMemory', 'WriteProcessMemory',
     'ReadProcessMemory', 'CreateRemoteThread', 'CreateRemoteThreadEx',
     'NtCreateThreadEx', 'QueueUserAPC', 'SetWindowsHookExA', 'SetWindowsHookExW',
     'LdrLoadDll',
     'CheckRemoteDebuggerPresent', 'NtQueryInformationProcess',
     'AdjustTokenPrivileges', 'CryptEncrypt', 'CryptDecrypt',
-    'InternetOpenA', 'InternetOpenUrlA', 'URLDownloadToFileA', 'URLDownloadToFileW',
+    'InternetOpenA', 'InternetOpenW', 'InternetOpenUrlA', 'InternetOpenUrlW',
+    'WinHttpOpen', 'WinHttpSendRequest',
+    'URLDownloadToFileA', 'URLDownloadToFileW',
     'WinExec'}
 
 # Removed from the single-import list in fix X3. Each one is still used by
@@ -68,11 +70,15 @@ TINY_IMPORT_TABLE = 5
 # scored_import_names(): an import is "scored" when it is in
 # SUSPICIOUS_IMPORTS or belongs to a chain that was reported for the file.
 CHAIN_APIS = {
-    'Process Injection Chain': {'VirtualAllocEx', 'VirtualAlloc', 'WriteProcessMemory',
-                                'NtWriteVirtualMemory', 'CreateRemoteThread',
+    'Process Injection Chain': {'VirtualAllocEx', 'VirtualAlloc', 'NtAllocateVirtualMemory',
+                                'WriteProcessMemory', 'NtWriteVirtualMemory',
+                                'CreateRemoteThread', 'CreateRemoteThreadEx',
                                 'NtCreateThreadEx', 'QueueUserAPC'},
-    'Remote Download & Exec Chain': {'URLDownloadToFileA', 'URLDownloadToFileW', 'InternetOpenA',
-                                     'InternetOpenUrlA', 'WinExec', 'ShellExecuteA',
+    'Remote Download & Exec Chain': {'URLDownloadToFileA', 'URLDownloadToFileW',
+                                     'InternetOpenA', 'InternetOpenW',
+                                     'InternetOpenUrlA', 'InternetOpenUrlW',
+                                     'WinHttpOpen', 'WinHttpSendRequest',
+                                     'WinExec', 'ShellExecuteA',
                                      'ShellExecuteW', 'CreateProcessA', 'CreateProcessW'},
     'System Hooking / Keylogging Chain': {'SetWindowsHookExA', 'SetWindowsHookExW',
                                           'GetAsyncKeyState', 'GetForegroundWindow'},
@@ -111,8 +117,10 @@ class PEAnalyzer:
         pe = None
         try:
             pe = pefile.PE(data=data, fast_load=True)
-            pe.parse_data_directories(
-                directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+            dirs = [pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]
+            if 'IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT' in pefile.DIRECTORY_ENTRY:
+                dirs.append(pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT'])
+            pe.parse_data_directories(directories=dirs)
             obj.pe = pe
         except Exception as e:
             if pe is not None:
@@ -229,7 +237,11 @@ class PEAnalyzer:
         safe).'''
         scored = self.scored_import_names()
         spans = set()
-        for entry in getattr(self.pe, 'DIRECTORY_ENTRY_IMPORT', None) or []:
+        import_dirs = (
+            list(getattr(self.pe, 'DIRECTORY_ENTRY_IMPORT', None) or [])
+            + list(getattr(self.pe, 'DIRECTORY_ENTRY_DELAY_IMPORT', None) or [])
+        )
+        for entry in import_dirs:
             for imp in entry.imports:
                 offset = getattr(imp, 'name_offset', None)
                 if not imp.name or not isinstance(offset, int) or offset < 0:
@@ -246,13 +258,16 @@ class PEAnalyzer:
         
         chains = []
         # Process Injection Chain
-        if ('VirtualAllocEx' in all_funcs or 'VirtualAlloc' in all_funcs) and \
+        if ('VirtualAllocEx' in all_funcs or 'VirtualAlloc' in all_funcs or 'NtAllocateVirtualMemory' in all_funcs) and \
            ('WriteProcessMemory' in all_funcs or 'NtWriteVirtualMemory' in all_funcs) and \
-           ('CreateRemoteThread' in all_funcs or 'NtCreateThreadEx' in all_funcs or 'QueueUserAPC' in all_funcs):
+           ('CreateRemoteThread' in all_funcs or 'CreateRemoteThreadEx' in all_funcs or 'NtCreateThreadEx' in all_funcs or 'QueueUserAPC' in all_funcs):
             chains.append('Process Injection Chain (VirtualAllocEx + WriteProcessMemory + Thread Creation)')
             
         # Remote Download & Execute Chain
-        if any(f in all_funcs for f in ('URLDownloadToFileA', 'URLDownloadToFileW', 'InternetOpenA', 'InternetOpenUrlA')) and \
+        if any(f in all_funcs for f in ('URLDownloadToFileA', 'URLDownloadToFileW',
+                                        'InternetOpenA', 'InternetOpenW',
+                                        'InternetOpenUrlA', 'InternetOpenUrlW',
+                                        'WinHttpOpen', 'WinHttpSendRequest')) and \
            any(f in all_funcs for f in ('WinExec', 'ShellExecuteA', 'ShellExecuteW', 'CreateProcessA', 'CreateProcessW')):
             chains.append('Remote Download & Exec Chain (Internet API + Execution)')
 
@@ -581,16 +596,19 @@ class PEAnalyzer:
 
     def _get_imports(self) -> Dict[str, List[str]]:
         imports = {}
-        if hasattr(self.pe, 'DIRECTORY_ENTRY_IMPORT'):
-            for entry in self.pe.DIRECTORY_ENTRY_IMPORT:
+        for attr in ('DIRECTORY_ENTRY_IMPORT', 'DIRECTORY_ENTRY_DELAY_IMPORT'):
+            for entry in getattr(self.pe, attr, None) or []:
                 dll_name = entry.dll.decode('utf-8', 'ignore') if entry.dll else 'unknown'
-                func_names = []
+                func_names = imports.setdefault(dll_name, [])
                 for imp in entry.imports:
                     if imp.name:
-                        func_names.append(imp.name.decode('utf-8', 'ignore'))
+                        name = imp.name.decode('utf-8', 'ignore')
                     elif hasattr(imp, 'ordinal'):
-                        func_names.append(f'ordinal_{imp.ordinal}')
-                imports[dll_name] = func_names
+                        name = f'ordinal_{imp.ordinal}'
+                    else:
+                        continue
+                    if name not in func_names:
+                        func_names.append(name)
         return imports
 
     def _get_exports(self) -> List[str]:
@@ -654,7 +672,8 @@ class PEAnalyzer:
             # counted once per file, however many W+X sections there are
             names = ', '.join(self._section_name(self.pe.sections[i]) for i in wx_sections)
             warnings.append(f"Writable and executable section(s): {names}")
-        if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
+        is_dll = bool(getattr(self.pe.FILE_HEADER, 'Characteristics', 0) & 0x2000)
+        if self.pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0 and not is_dll:
             warnings.append('Entry point is zero')
         if self.has_tls_callbacks():
             warnings.append('PE uses TLS Callbacks to execute code before main entry point')

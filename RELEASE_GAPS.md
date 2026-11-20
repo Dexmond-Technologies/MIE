@@ -97,22 +97,18 @@ B''.
 | 6 | Windows smoke test of the CI artefact on a clean Windows machine next to Microsoft Defender: start, dashboard, tray, folder monitoring, quarantine and restore, uninstall; memory and CPU measured. Include scanning a zip that contains an .exe (INFERRED risk: pefile keeps the member mapped, and Windows cannot delete the temp folder of a mapped file) and files in a OneDrive-backed Desktop/Documents. Hidden imports (webview, pythonnet, pystray, uvicorn) only show at first start: `check_bundle.py` does not run the exe | a session with a Windows VM |
 | 7 | Installer (none exists; the artefact is a zipped folder), autostart choice, uninstall | a session |
 | 8 | Code-signing certificate (until then: unsigned download with a warning and the SHA-256) | owner |
-| 9 | Production licence key for product "mie": offline ceremony, then set `LICENSE_PUBLIC_KEY_B64` and `PROD_PUBKEY_SHA256` in `dexmond_mie/licence_key.py`; `scripts/check_release_key.py` must pass; CI run with `sale_build=true` | owner, SENTINEL |
-| 10 | ML-DSA-65 verify library for Python (none is a dependency; the default verifier refuses everything) | SENTINEL |
-| 11 | Activation service (shared Dexmond service, SALES_ACTIVATION_SERVICE_SPEC_2026-11-18) and its response format; the client assumes `{"licence": ...}` / `{"error": ...}`; set `ACTIVATION_URL` | service session, SENTINEL |
-| 12 | The request sends `product`, `code`, `hwid`, `app_version`. The legal text (spec item 7) says code + hardware-id hash only: AGENT-LAW to accept the two extra fields or the client drops them. Privacy text must name the five hardware-id inputs (platform, arch, CPU model, CPU count, host name) | AGENT-LAW |
-| 13 | Stripe product and price for MIE, sale page, EULA, withdrawal waiver, EU-only | owner, AGENT-LAW |
-| 14 | Rule authorship record: every rule says `author = "DEXMOND MIE"` with no source note; who wrote them and from what is not recorded (first commit da2fef9, 2026-07-20). Needed before sale (licence of any borrowed rule text) | owner, a session |
+| 9 | Production licence key for product "mie": **N/A — CLOSED (owner decision 2026-11-20 00:54:48+01:00, B-3243: `"mie is free"` — MIE stays 100% Free Edition with no licence key)** | CLOSED |
+| 10 | ML-DSA-65 verify library for Python: **N/A — CLOSED (B-3243, MIE is 100% Free Edition)** | CLOSED |
+| 11 | Activation service integration for MIE: **N/A — CLOSED (B-3243, MIE is 100% Free Edition)** | CLOSED |
+| 12 | Activation request fields for MIE: **N/A — CLOSED (B-3243, MIE is 100% Free Edition)** | CLOSED |
+| 13 | Stripe product and price for MIE: **N/A — CLOSED (B-3243, MIE is 100% Free Edition)** | CLOSED |
+| 14 | Rule authorship record: every rule says `author = "DEXMOND MIE"` with no source note; who wrote them and from what is not recorded (first commit da2fef9, 2026-07-20). Needed before public release (licence of any borrowed rule text) | owner, a session |
 | 15 | Licence notices for bundled dependencies (pystray LGPL-3.0, mscerts MPL-2.0, PyInstaller bootloader, WebView2 terms); product licence; a full hash-locked lock file for the build (today: exact top-level pins only, `requirements-windows-build.txt`) | AGENT-LAW, a session |
 | 16 | Update path for program and rules; support address in the app | a session, owner |
-| 17 | Release-level security review (local API, archive handling, quarantine, signature shortcut, activation client) | SENTINEL |
+| 17 | Release-level security review (`FROM_AGY-MIE-REVIEW_2026-11-20.md` completed; fixes staged on `agy/mie-review-fixes`: `W-1`..`W-6`, `S-1`..`S-13`, `R-1`..`R-6`, `T-1`..`T-3`) | SENTINEL, r-00 |
 
-## 4. Open questions for the owner
+## 4. Owner decisions recorded (2026-11-20 00:54:48+01:00, B-3243)
 
-- **Free tier vs paid tier: OPEN.** MIE has no licence concept today and every feature is
-  free ("Free Edition"). Which features a paid licence would unlock is not decided; nothing
-  was invented here. The licence module is ready to be wired to that decision.
-- What MIE may call itself (the texts now say "second-opinion file scanner"; the product name
-  "Malware Inspection Engine" is unchanged).
-- Whether to ship with "detection of real malware not measured" stated to users, or wait for
-  the measurement (gap 4).
+- **Free vs paid:** **DECIDED (`"mie is free"`, `"mie is free key for what?"`).** MIE stays 100% Free Edition with no licence key, no activation-service integration, and no Stripe tier (closing gaps 9–13).
+- **Name & subtitle:** **DECIDED.** Keep `"DEXMOND MIE (Malware Inspection Engine)"` + subtitle `"Second-opinion file scanner"`.
+- **Release timing:** **DECIDED.** Wait until real-malware detection is measured in an isolated lab/test set (gap 4) before releasing MIE publicly (Launch 3 paid products ship first).

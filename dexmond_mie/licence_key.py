@@ -24,8 +24,9 @@ PROD_PUBKEY_SHA256 = "UNSET-PRODUCTION-KEY-NOT-YET-CREATED"
 # is a test build and can never pass the release gate. Entries are only ever
 # added (a retired production key goes here too).
 NON_PRODUCTION_PUBKEY_SHA256 = [
+    "97349bc899e85f5460ef6c69c84415e2a41830750a8b4d7c1e74d60c5e9f4d70",
 ]
 
-# Shown wherever the licence state is shown, in every build that does not
-# embed the production key.
+# MIE ships as 100% Free Edition (owner decision 2026-11-20 00:54:48+01:00: "mie is free");
+# if licensing is ever wired in later, non-production builds show this notice.
 TEST_BUILD_NOTICE = 'TEST BUILD: licences from this build are not valid for sale'

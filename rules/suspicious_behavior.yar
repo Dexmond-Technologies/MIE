@@ -22,29 +22,33 @@ rule PowerShell_Encoded_Command
         severity = "high"
         author = "DEXMOND MIE"
     strings:
-        $ps = "powershell" ascii nocase
-        $enc1 = "-encodedcommand" ascii nocase
-        $enc2 = "-enc " ascii nocase
-        $hidden = "-windowstyle hidden" ascii nocase
-        $bypass = "-executionpolicy bypass" ascii nocase
+        $ps1 = "powershell" ascii wide nocase
+        $ps2 = "pwsh" ascii wide nocase
+        $enc1 = "-encodedcommand" ascii wide nocase
+        $enc2 = "-enc " ascii wide nocase
+        $enc3 = "/enc " ascii wide nocase
+        $hidden1 = "-windowstyle hidden" ascii wide nocase
+        $hidden2 = "-w hidden" ascii wide nocase
+        $bypass1 = "-executionpolicy bypass" ascii wide nocase
+        $bypass2 = "-ep bypass" ascii wide nocase
     condition:
-        $ps and any of ($enc1, $enc2, $hidden, $bypass)
+        any of ($ps*) and any of ($enc*, $hidden*, $bypass*)
 }
 
 rule Ransomware_Note_Indicators
 {
     meta:
         description = "Strings typical of ransomware ransom notes"
-        severity = "critical"
+        severity = "high"
         author = "DEXMOND MIE"
     strings:
-        $r1 = "your files have been encrypted" ascii nocase
-        $r2 = "decrypt your files" ascii nocase
-        $r3 = "bitcoin" ascii nocase
-        $r4 = "pay the ransom" ascii nocase
-        $r5 = "restore your files" ascii nocase
+        $r1 = "your files have been encrypted" ascii wide nocase
+        $r2 = "decrypt your files" ascii wide nocase
+        $r3 = "bitcoin" ascii wide nocase
+        $r4 = "pay the ransom" ascii wide nocase
+        $r5 = "restore your files" ascii wide nocase
     condition:
-        2 of them
+        filesize < 64KB and uint16(0) != 0x5A4D and ($r1 or $r2 or $r4) and 2 of them
 }
 
 rule AntiDebug_AntiVM_Strings
@@ -52,6 +56,7 @@ rule AntiDebug_AntiVM_Strings
     meta:
         description = "Anti-debugging / anti-VM technique indicators"
         severity = "medium"
+        category = "imports"
         author = "DEXMOND MIE"
     strings:
         $d1 = "IsDebuggerPresent" ascii

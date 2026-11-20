@@ -5,6 +5,13 @@ from typing import Dict, Optional
 
 logger = logging.getLogger('DEXMOND_MIE')
 
+# Built-in EICAR test-file SHA-256 digests: never overwritten as 'trusted'
+# when testing Quarantine -> Restore (Finding R-6).
+PROTECTED_MALICIOUS = frozenset({
+    '275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f',
+    '131f95c51cc819465fa1797f6ccacf9d494aaaff46fa3eac73ae63ffbdfd8267',
+})
+
 
 class ReputationDB:
     '''Local known-hash reputation list.
@@ -25,7 +32,8 @@ class ReputationDB:
             with open(self.db_path) as f:
                 data = json.load(f)
             self.malicious = {k.lower(): v for k, v in data.get('malicious', {}).items()}
-            self.trusted = {k.lower(): v for k, v in data.get('trusted', {}).items()}
+            self.trusted = {k.lower(): v for k, v in data.get('trusted', {}).items()
+                            if k.lower() not in PROTECTED_MALICIOUS}
             logger.info(f'Reputation DB: {len(self.malicious)} known-bad, '
                         f'{len(self.trusted)} known-good hashes')
         except (OSError, json.JSONDecodeError):
@@ -46,19 +54,33 @@ class ReputationDB:
         h = sha256.lower()
         if h in self.malicious:
             return {'reputation': 'malicious', 'label': self.malicious[h]}
-        if h in self.trusted:
+        if h in self.trusted and h not in PROTECTED_MALICIOUS:
             return {'reputation': 'trusted', 'label': self.trusted[h]}
         return None
 
     def add_malicious(self, sha256: str, label: str = 'user-flagged'):
-        self.malicious[sha256.lower()] = label
-        self.trusted.pop(sha256.lower(), None)
+        h = sha256.lower()
+        self.malicious[h] = label
+        self.trusted.pop(h, None)
         self._save()
 
-    def add_trusted(self, sha256: str, label: str = 'user-trusted'):
-        self.trusted[sha256.lower()] = label
-        self.malicious.pop(sha256.lower(), None)
+    def add_trusted(self, sha256: str, label: str = 'user-trusted') -> bool:
+        h = sha256.lower()
+        if h in PROTECTED_MALICIOUS:
+            logger.info(f'Refusing to mark built-in EICAR test hash {h[:12]}... as trusted')
+            return False
+        self.trusted[h] = label
+        self.malicious.pop(h, None)
         self._save()
+        return True
+
+    def remove_trusted(self, sha256: str) -> bool:
+        h = sha256.lower()
+        if h not in self.trusted:
+            return False
+        del self.trusted[h]
+        self._save()
+        return True
 
     @property
     def counts(self) -> Dict[str, int]:

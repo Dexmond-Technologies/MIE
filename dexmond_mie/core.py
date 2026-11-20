@@ -14,6 +14,7 @@ from .yara_analyzer import YaraAnalyzer
 from .scoring import Scorer
 from .reputation import ReputationDB
 from .auto_evolution import AutoEvolutionEngine, auto_evolution_enabled_by_env
+from . import paths
 from . import signature
 
 logger = logging.getLogger('DEXMOND_MIE')
@@ -93,8 +94,10 @@ class Engine:
             _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         start_time = time.time()
         logger.info(f'Scanning file: {file_path}')
-        if not os.path.exists(file_path):
+        if not os.path.lexists(file_path):
             return {'error': 'File not found'}
+        if not paths.is_regular_non_link(file_path):
+            return {'error': 'Refusing non-regular file or symbolic link', 'path': file_path}
         results = {
             'filename': os.path.basename(file_path),
             'path': file_path,
@@ -277,6 +280,20 @@ class Engine:
 
         # --- Strings / IOCs ---
         strings, iocs = StringExtractor.extract_ascii_unicode(data, 5)
+        if results['size'] > len(data):
+            # R-5: also inspect the last 4 MiB of 32..256 MiB files so appended
+            # strings/scripts past 32 MiB are not unseen.
+            try:
+                tail_len = min(results['size'] - len(data), 4 * 1024 * 1024)
+                with open(file_path, 'rb') as tf:
+                    tf.seek(max(len(data), results['size'] - tail_len))
+                    tail_data = tf.read(tail_len)
+                tail_strings, tail_iocs = StringExtractor.extract_ascii_unicode(tail_data, 5)
+                strings.extend(tail_strings)
+                for k, vals in tail_iocs.items():
+                    iocs[k] = sorted(set(iocs.get(k, []) + vals))
+            except OSError:
+                pass
         results['details']['string_count'] = len(strings)
         if import_name_spans and 'suspicious_api' in iocs:
             # Fix FA-1. A parsed PE's import hint/name table holds each
@@ -448,6 +465,11 @@ class Engine:
         # Strings / IOCs on the windows
         for name, chunk in windows:
             _, iocs = StringExtractor.extract_ascii_unicode(chunk, 5)
+            for key in ('powershell', 'suspicious_api'):
+                if key in iocs:
+                    scorer.add_finding('suspicious_string',
+                                       f"Suspicious strings ({key}) in {name} window: "
+                                       f"{', '.join(iocs[key][:5])}")
             for key in ('b64_executable', 'obfuscated_script'):
                 if key in iocs:
                     scorer.add_finding(key, f"{key} pattern in {name} window: "
@@ -528,7 +550,8 @@ class Engine:
         if _budget is None:
             _budget = {'members': MAX_ARCHIVE_MEMBERS, 'bytes': MAX_ARCHIVE_TOTAL_BYTES}
         try:
-            tmp = tempfile.TemporaryDirectory(prefix='dexmond_arc_', ignore_cleanup_errors=True)
+            tmp = tempfile.TemporaryDirectory(prefix='dexmond_arc_', dir=paths.scratch_dir(),
+                                              ignore_cleanup_errors=True)
         except OSError as e:
             reasons.append(f'no temp dir: {e}')
             return summary
@@ -626,17 +649,26 @@ class Engine:
         dest_real = os.path.realpath(dest_dir)
 
         def _target(name):
-            out = os.path.realpath(os.path.join(dest_dir, name))
-            if os.path.commonpath([out, dest_real]) != dest_real:
-                return None  # path traversal attempt
+            if not _is_safe_archive_member_name(name):
+                return None
+            try:
+                out = os.path.realpath(os.path.join(dest_dir, name))
+                if os.path.commonpath([out, dest_real]) != dest_real:
+                    return None  # path traversal attempt
+            except (OSError, ValueError):
+                return None
             return out
 
-        def _take(size):
-            '''Reserves one member of `size` bytes from the budget.'''
-            if budget['members'] <= 0 or size > budget['bytes']:
+        def _take_member():
+            if budget['members'] <= 0:
                 return False
             budget['members'] -= 1
-            budget['bytes'] -= size
+            return True
+
+        def _take_bytes(n):
+            if n > budget['bytes']:
+                return False
+            budget['bytes'] -= n
             return True
 
         try:
@@ -646,9 +678,9 @@ class Engine:
             is_zip = False
         try:
             if is_zip:
-                Engine._extract_zip(file_path, _target, _take, extracted, reasons)
+                Engine._extract_zip(file_path, _target, _take_member, _take_bytes, extracted, reasons)
             elif tarfile.is_tarfile(file_path):
-                Engine._extract_tar(file_path, _target, _take, extracted, reasons)
+                Engine._extract_tar(file_path, _target, _take_member, _take_bytes, extracted, reasons)
             else:
                 reasons.append('not a zip or tar archive')
         except Exception as e:  # noqa: BLE001 - a crafted archive must not drop the scan
@@ -657,7 +689,7 @@ class Engine:
         return extracted, coverage
 
     @staticmethod
-    def _extract_zip(file_path, _target, _take, extracted, reasons):
+    def _extract_zip(file_path, _target, _take_member, _take_bytes, extracted, reasons):
         with zipfile.ZipFile(file_path) as zf:
             infos = zf.infolist()
             try:
@@ -669,6 +701,9 @@ class Engine:
             for info in infos[:MAX_ARCHIVE_MEMBERS]:
                 if info.is_dir():
                     continue
+                if info.flag_bits & 0x01:
+                    reasons.append(f'encrypted member: {info.filename}')
+                    continue
                 if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
                     reasons.append(f'member over size limit: {info.filename}')
                     continue
@@ -676,89 +711,204 @@ class Engine:
                 if not out:
                     reasons.append(f'unsafe member path: {info.filename}')
                     continue
-                if not _take(info.file_size):
+                if not _take_member():
                     reasons.append('member/byte budget exhausted')
                     break
+                actual = 0
+                exhausted = False
                 try:
                     os.makedirs(os.path.dirname(out), exist_ok=True)
                     with zf.open(info) as src, open(out, 'wb') as dst:
-                        dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            actual += len(chunk)
+                            if actual > MAX_ARCHIVE_MEMBER_BYTES:
+                                raise ValueError('decompressed size exceeds member limit')
+                            if not _take_bytes(len(chunk)):
+                                exhausted = True
+                                raise ValueError('archive byte budget exhausted')
+                            dst.write(chunk)
+                    if actual != info.file_size:
+                        try:
+                            os.unlink(out)
+                        except OSError:
+                            pass
+                        reasons.append(f'member size mismatch ({actual} != {info.file_size}): {info.filename}')
+                        continue
                     extracted.append((info.filename, out))
                 except Exception as e:  # noqa: BLE001
+                    try:
+                        if os.path.lexists(out):
+                            os.unlink(out)
+                    except OSError:
+                        pass
+                    if exhausted:
+                        reasons.append('member/byte budget exhausted')
+                        break
                     reasons.append(f'member extraction failed: {info.filename} ({type(e).__name__})')
 
     @staticmethod
-    def _extract_tar(file_path, _target, _take, extracted, reasons):
+    def _extract_tar(file_path, _target, _take_member, _take_bytes, extracted, reasons):
         header_overhead = 0
-        with tarfile.open(file_path) as tf:
-            stopped = False
-            while True:
-                try:
-                    member = tf.next()
-                except Exception as e:  # noqa: BLE001
-                    reasons.append(f'tar header unreadable ({type(e).__name__})')
-                    stopped = True
-                    break
-                if member is None:
-                    break
-                # pax / GNU long-name headers before the member's own header
-                header_overhead += max(0, member.offset_data - member.offset - 512)
-                if member.isdir():
-                    continue
-                if not member.isfile():
-                    reasons.append(f'non-regular member: {member.name}')
-                    continue
-                if member.size > MAX_ARCHIVE_MEMBER_BYTES:
-                    reasons.append(f'member over size limit: {member.name}')
-                    continue
-                out = _target(member.name)
-                if not out:
-                    reasons.append(f'unsafe member path: {member.name}')
-                    continue
-                if not _take(member.size):
-                    reasons.append('member/byte budget exhausted')
-                    stopped = True
-                    break
-                try:
-                    os.makedirs(os.path.dirname(out), exist_ok=True)
-                    extracted_file = tf.extractfile(member)
-                    if extracted_file is None:
-                        reasons.append(f'member not readable: {member.name}')
+        headers_seen = 0
+        max_headers = MAX_ARCHIVE_MEMBERS * 4
+        with open(file_path, 'rb') as raw_fp:
+            bounded_fp = _BoundedStream(raw_fp, MAX_ARCHIVE_TOTAL_BYTES + 64 * 1024 * 1024)
+            with tarfile.open(fileobj=bounded_fp) as tf:
+                stopped = False
+                while True:
+                    headers_seen += 1
+                    if headers_seen > max_headers:
+                        reasons.append(f'more than {max_headers} tar headers')
+                        stopped = True
+                        break
+                    try:
+                        member = tf.next()
+                    except Exception as e:  # noqa: BLE001
+                        reasons.append(f'tar header unreadable ({type(e).__name__})')
+                        stopped = True
+                        break
+                    if member is None:
+                        break
+                    # pax / GNU long-name headers before the member's own header
+                    header_overhead += max(0, member.offset_data - member.offset - 512)
+                    if member.isdir():
                         continue
-                    with extracted_file as src, open(out, 'wb') as dst:
-                        dst.write(src.read(MAX_ARCHIVE_MEMBER_BYTES))
-                    extracted.append((member.name, out))
-                    # the block padding after the member's data must be zero
-                    pad = (-member.size) % 512
-                    if pad:
-                        tf.fileobj.seek(member.offset_data + member.size)
-                        if tf.fileobj.read(pad).count(0) != pad:
-                            reasons.append(f'non-zero padding after member {member.name}')
-                except Exception as e:  # noqa: BLE001
-                    reasons.append(f'member extraction failed: {member.name} ({type(e).__name__})')
-            if header_overhead > MAX_UNCOVERED_TAR_HEADER_BYTES:
-                reasons.append(f'{header_overhead} bytes of extended (pax/GNU) headers not covered')
-            if not stopped:
-                # members + end padding must account for the whole
-                # (decompressed) stream: only zero bytes may follow
-                try:
-                    tf.fileobj.seek(tf.offset)
-                    rest = tf.fileobj.read(MAX_TAR_PADDING + 1)
-                    if len(rest) > MAX_TAR_PADDING or rest.count(0) != len(rest):
-                        reasons.append('data after the last tar member')
-                except Exception as e:  # noqa: BLE001
-                    reasons.append(f'tar end not readable ({type(e).__name__})')
+                    if not member.isfile():
+                        reasons.append(f'non-regular member: {member.name}')
+                        continue
+                    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+                        reasons.append(f'member over size limit: {member.name}')
+                        continue
+                    out = _target(member.name)
+                    if not out:
+                        reasons.append(f'unsafe member path: {member.name}')
+                        continue
+                    if not _take_member():
+                        reasons.append('member/byte budget exhausted')
+                        stopped = True
+                        break
+                    actual = 0
+                    exhausted = False
+                    try:
+                        os.makedirs(os.path.dirname(out), exist_ok=True)
+                        extracted_file = tf.extractfile(member)
+                        if extracted_file is None:
+                            reasons.append(f'member not readable: {member.name}')
+                            continue
+                        with extracted_file as src, open(out, 'wb') as dst:
+                            while True:
+                                chunk = src.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                actual += len(chunk)
+                                if actual > MAX_ARCHIVE_MEMBER_BYTES:
+                                    raise ValueError('member exceeds size limit')
+                                if not _take_bytes(len(chunk)):
+                                    exhausted = True
+                                    raise ValueError('archive byte budget exhausted')
+                                dst.write(chunk)
+                        extracted.append((member.name, out))
+                        # the block padding after the member's data must be zero
+                        pad = (-member.size) % 512
+                        if pad:
+                            tf.fileobj.seek(member.offset_data + member.size)
+                            if tf.fileobj.read(pad).count(0) != pad:
+                                reasons.append(f'non-zero padding after member {member.name}')
+                    except Exception as e:  # noqa: BLE001
+                        try:
+                            if os.path.lexists(out):
+                                os.unlink(out)
+                        except OSError:
+                            pass
+                        if exhausted:
+                            reasons.append('member/byte budget exhausted')
+                            stopped = True
+                            break
+                        reasons.append(f'member extraction failed: {member.name} ({type(e).__name__})')
+                if header_overhead > MAX_UNCOVERED_TAR_HEADER_BYTES:
+                    reasons.append(f'{header_overhead} bytes of extended (pax/GNU) headers not covered')
+                if not stopped:
+                    # members + end padding must account for the whole
+                    # (decompressed) stream: only zero bytes may follow
+                    try:
+                        tf.fileobj.seek(tf.offset)
+                        rest = tf.fileobj.read(MAX_TAR_PADDING + 1)
+                        if len(rest) > MAX_TAR_PADDING or rest.count(0) != len(rest):
+                            reasons.append('data after the last tar member')
+                    except Exception as e:  # noqa: BLE001
+                        reasons.append(f'tar end not readable ({type(e).__name__})')
+
+
+_WINDOWS_RESERVED_DEVICES = frozenset({
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+})
+
+
+def _is_safe_archive_member_name(name: str) -> bool:
+    '''Validates raw archive member names BEFORE passing them to os.path.join /
+    os.path.realpath (blocks Windows UNC //host/share SMB NTLMv2 leaks, drive
+    letters, NTFS Alternate Data Streams, .. traversal, and DOS device names).'''
+    if not isinstance(name, str) or not name or '\x00' in name or ':' in name:
+        return False
+    if name.startswith(('/', '\\')):
+        return False
+    parts = [p for p in re.split(r'[/\\]+', name) if p and p != '.']
+    if not parts:
+        return False
+    for part in parts:
+        if part == '..':
+            return False
+        stem = part.split('.', 1)[0].rstrip(' ').upper()
+        if stem in _WINDOWS_RESERVED_DEVICES:
+            return False
+    return True
+
+
+class _BoundedStream:
+    '''Wraps a binary file object and caps cumulative bytes read so compressed
+    tar streams cannot spin indefinitely skipping multi-GiB entries.'''
+
+    def __init__(self, fp, max_bytes: int):
+        self._fp = fp
+        self._remaining = max_bytes
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = self._remaining + 1
+        data = self._fp.read(min(size, self._remaining + 1))
+        self._remaining -= len(data)
+        if self._remaining < 0:
+            raise ValueError('Archive stream read budget exceeded')
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._fp.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._fp.tell()
+
+    def close(self) -> None:
+        pass
 
 
 def _api_names_outside_spans(data: bytes, spans) -> list:
     '''suspicious_api matches over the same ASCII and UTF-16 string runs as
-    StringExtractor, except ASCII runs whose (start, end) file offsets are
-    exactly one of `spans` (the name entries of scored imports). Fix FA-1.'''
+    StringExtractor, except ASCII runs or exact import-name spans matching
+    `spans` (the name entries of scored imports). Fix FA-1 + R-6.'''
     pattern = StringExtractor.PATTERNS['suspicious_api']
     found = set()
     for m in re.finditer(rb'[ -~]{5,}', data):
-        if (m.start(), m.end()) not in spans:
-            found.update(pattern.findall(m.group().decode('ascii', errors='ignore')))
+        if (m.start(), m.end()) in spans:
+            continue
+        run_text = m.group().decode('ascii', errors='ignore')
+        for sub in pattern.finditer(run_text):
+            if (m.start() + sub.start(), m.start() + sub.end()) not in spans:
+                found.add(sub.group(0))
     for m in re.finditer(rb'(?:[ -~]\x00){5,}', data):
         found.update(pattern.findall(m.group().decode('utf-16le', errors='ignore')))
     return sorted(found)

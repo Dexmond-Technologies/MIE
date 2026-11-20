@@ -12,25 +12,30 @@ and can move a flagged file into a quarantine folder.
   extraction, weighted scoring. Verdicts: CLEAN, SUSPICIOUS (LOW / MEDIUM),
   MALICIOUS.
 - **Known-hash list** — `data/reputation.json` (today: the two EICAR test-file
-  hashes). A file the user quarantines is added as known-bad; a file the user
-  restores is added as trusted, and a trusted hash is reported CLEAN from then
-  on without being scanned.
+  hashes, which stay protected from accidental whitelisting). A file the user
+  quarantines is added as known-bad; when restoring from quarantine, the user
+  can optionally mark a hash as trusted (and remove trusted hashes from the
+  dashboard at any time).
 - **Archive scanning** — looks inside `.zip` and `.tar` (also `.jar`, `.tgz`
   and similar), with path checks against zip-slip and member, size and depth
   limits against zip bombs.
 - **Folder monitoring** — while the app is running, scans files created in or
-  moved into Downloads, Desktop, Documents and Temp, after they are written.
-  Files changed in place are not rescanned, and nothing is blocked before it
-  is opened. Optional auto-quarantine of files judged MALICIOUS (off by
-  default).
+  moved into Downloads, Desktop, and Documents (including OneDrive-relocated
+  Known Folders on Windows), after they are written. Files changed in place are
+  not rescanned, and nothing is blocked before it is opened. Optional
+  auto-quarantine of files judged MALICIOUS (off by default).
 - **Quarantine** — moves the file into the quarantine folder as a copy XOR-ed
   with one fixed byte (obfuscation, not encryption) so it is not run or
-  re-flagged by accident, deletes the original, and can restore it exactly
-  or delete it.
-- **Web dashboard** — at `http://localhost:8888`, reachable from this computer
+  re-flagged by accident, deletes the original, and can restore it without
+  following symlinks or overwriting existing files.
+- **Web dashboard** — at `http://127.0.0.1:8888`, reachable from this computer
   only.
-- **Local access control** — every command endpoint requires a per-machine
-  access token (stored `0600`); a loopback-only host check blocks DNS rebinding.
+- **Local access control** — `GET /` never embeds the raw access token;
+  command endpoints require either the per-user `.auth_token` header (restricted
+  to the current OS account via `0600` / NTFS owner ACLs) or an `HttpOnly;
+  SameSite=Strict` browser session paired with a CSRF header, plus a
+  loopback-only host check against DNS rebinding. (Processes running under the
+  same OS user account already share access to that user's files.)
 
 ## Limits (read before relying on it)
 

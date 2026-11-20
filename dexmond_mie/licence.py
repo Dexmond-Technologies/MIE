@@ -132,16 +132,22 @@ def activation_request(code: str, hwid: str, app_version: str = __version__) -> 
 
 
 def _post_json(url: str, body: dict, timeout: float):
-    '''Returns (status, parsed JSON or None). Network errors raise
-    ActivationError with a plain message.'''
+    '''Returns (status, parsed JSON or None). Network errors and redirects raise
+    ActivationError (refuses HTTPS -> HTTP redirect downgrades, Finding S-12).'''
     import urllib.error
     import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, 'Redirects are refused', headers, fp)
+
+    opener = urllib.request.build_opener(_NoRedirect)
     data = json.dumps(body).encode('utf-8')
     req = urllib.request.Request(url, data=data, method='POST',
                                  headers={'Content-Type': 'application/json',
                                           'User-Agent': f'DexmondMIE/{__version__}'})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status, raw = resp.status, resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read(MAX_RESPONSE_BYTES + 1)
@@ -290,11 +296,28 @@ def licence_file() -> str:
 
 
 def save_licence(text: str, path: str = None) -> str:
+    import secrets
+    from . import paths
     path = path or licence_file()
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='ascii') as f:
-        f.write(text.strip() + '\n')
-    os.replace(tmp, path)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f'{path}.{secrets.token_hex(8)}.tmp'
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, 'O_NOFOLLOW', 0))
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, 'w', encoding='ascii') as f:
+            f.write(text.strip() + '\n')
+        paths.ensure_owner_only_file(tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 

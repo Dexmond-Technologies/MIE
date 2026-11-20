@@ -119,10 +119,12 @@ class StringExtractor:
         # non-word, non-dash character and end at a non-word character, so
         # "Content-Encoding", "--encoding", "-encrypt" no longer match.
         'powershell': re.compile('powershell(?:\\.exe)?|pwsh(?:\\.exe)?|'
-                                 '(?<![\\w-])--?enc(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?(?![\\w-])',
+                                 '(?:(?<![\\w-])--?|(?<=\\s)/)enc(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?(?![\\w/-])',
                                  re.IGNORECASE),
         'suspicious_api': re.compile('(VirtualAlloc|CreateRemoteThread|WriteProcessMemory|LdrLoadDll|ReflectiveLoader)', re.IGNORECASE),
-        'b64_executable': re.compile('TVqQAAMAAAA4A[A-Za-z0-9+/=]+'),
+        # R-1: Standard DOS/PE headers encode 4D 5A 90 00 03 00 00 00 04 00 00 00 as TVqQAAMAAAAEAAAA
+        # (not 4), plus MZP\0 (TVpQAAIAA) and minimal MZ\0\0 (TVoAAAAAA).
+        'b64_executable': re.compile('(?:TVqQAAMAAAAEAAAA|TVpQAAIAA|TVoAAAAAA)[A-Za-z0-9+/=]{24,}'),
         'obfuscated_script': re.compile('(\\[char\\[\\]\\]|Invoke-Expression|iex\\s*\\(|FromBase64String|Bypass\\s+-noprofile)', re.IGNORECASE)}
 
     @staticmethod

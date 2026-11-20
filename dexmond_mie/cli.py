@@ -102,11 +102,48 @@ def _uvicorn_kwargs(host, port):
     return {'host': host, 'port': port, 'log_level': 'warning', 'log_config': None}
 
 
+def _probe_existing_server(url: str) -> bool:
+    '''True if an existing MIE instance on `url` responds to /status with our token.'''
+    import urllib.request
+    try:
+        req = urllib.request.Request(f'{url}/status')
+        with open(paths.token_file(), encoding='utf-8') as f:
+            req.add_header('X-DEXMOND-Token', f.read().strip())
+        with urllib.request.urlopen(req, timeout=0.6) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _mint_launch_url(url: str) -> str:
+    '''Mints a single-use /launch?ticket=... URL so the window/browser receives
+    an HttpOnly session cookie without exposing AUTH_TOKEN on GET / (Finding S-1).'''
+    import urllib.parse
+    import urllib.request
+    try:
+        req = urllib.request.Request(f'{url}/api/auth/ticket', data=b'{}', method='POST',
+                                     headers={'Content-Type': 'application/json'})
+        with open(paths.token_file(), encoding='utf-8') as f:
+            req.add_header('X-DEXMOND-Token', f.read().strip())
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            payload = json.loads(resp.read(4096).decode('utf-8'))
+            ticket = payload.get('ticket', '')
+            if ticket:
+                return f'{url}/launch?ticket={urllib.parse.quote(ticket, safe="")}'
+    except Exception:
+        pass
+    return url
+
+
 def _start_server(host, port):
     '''Starts the dashboard/API server in a background thread and waits until
     it is accepting connections. The webapp auto-starts realtime protection.'''
     global _uvicorn_server
     _ensure_stdio()
+    host_fmt = f'[{host}]' if ':' in host and not host.startswith('[') else host
+    url = f'http://{host_fmt}:{port}'
+    if _probe_existing_server(url):
+        return url
     import uvicorn
     from .webapp import app
     config = uvicorn.Config(app, **_uvicorn_kwargs(host, port))
@@ -114,31 +151,29 @@ def _start_server(host, port):
     _uvicorn_server = server_obj
     server = threading.Thread(target=server_obj.run, daemon=True)
     server.start()
-    host_fmt = f'[{host}]' if ':' in host and not host.startswith('[') else host
-    url = f'http://{host_fmt}:{port}'
     for _ in range(50):
         if not server.is_alive():
             break
-        try:
-            import urllib.request
-            req = urllib.request.Request(f'{url}/status')
-            try:
-                with open(paths.token_file(), encoding='utf-8') as f:
-                    req.add_header('X-DEXMOND-Token', f.read().strip())
-            except OSError:
-                pass
-            with urllib.request.urlopen(req, timeout=1) as resp:
-                if resp.status == 200:
-                    break
-        except Exception:
-            time.sleep(0.1)
+        if _probe_existing_server(url):
+            break
+        time.sleep(0.1)
     return url
 
 
 def run_gui(host=DEFAULT_HOST, port=DEFAULT_PORT):
     '''Full desktop experience: dashboard server + system-tray icon + window.'''
     logger = logging.getLogger('DEXMOND_MIE')
-    os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
+    host_fmt = f'[{host}]' if ':' in host and not host.startswith('[') else host
+    base_url = f'http://{host_fmt}:{port}'
+    os.environ.setdefault('DEXMOND_API_URL', base_url)
+    if _probe_existing_server(base_url):
+        logger.info(f'Existing MIE instance detected at {base_url}; opening dashboard')
+        try:
+            import webbrowser
+            webbrowser.open(_mint_launch_url(base_url))
+        except Exception:
+            pass
+        return
     try:
         import uvicorn  # noqa: F401
         from .webapp import app  # noqa: F401
@@ -147,6 +182,7 @@ def run_gui(host=DEFAULT_HOST, port=DEFAULT_PORT):
                      'Install requirements.txt, or use the "scan" / "background" commands.')
         sys.exit(1)
     url = _start_server(host, port)
+    launch_url = _mint_launch_url(url)
     logger.info(f'Dashboard running at {url}')
 
     # Desktop window (pywebview) on the main thread; tray icon in a helper
@@ -154,24 +190,38 @@ def run_gui(host=DEFAULT_HOST, port=DEFAULT_PORT):
     window = None
     try:
         import webview
-        window = webview.create_window('DEXMOND MIE', url, width=1200, height=820)
+        window = webview.create_window('DEXMOND MIE', launch_url, width=1200, height=820)
     except ImportError:
         logger.info('pywebview not installed; the dashboard is available in your browser')
 
+    tray_started = False
     try:
         from .tray import run_tray
         threading.Thread(target=run_tray, args=(window,), daemon=True).start()
+        tray_started = True
     except ImportError as e:
         logger.info(f'System tray unavailable ({e})')
 
     if window is not None:
+        if tray_started and hasattr(window, 'events') and hasattr(window.events, 'closing'):
+            def _hide_instead_of_exit():
+                if _uvicorn_server is not None and _uvicorn_server.should_exit:
+                    return True
+                try:
+                    window.hide()
+                    return False
+                except Exception:
+                    return True
+            window.events.closing += _hide_instead_of_exit
         import webview
         webview.start()
+        while tray_started and (_uvicorn_server is None or not _uvicorn_server.should_exit):
+            time.sleep(0.5)
     else:
         try:
             import webbrowser
-            webbrowser.open(url)
-            while True:
+            webbrowser.open(launch_url)
+            while _uvicorn_server is None or not _uvicorn_server.should_exit:
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
@@ -180,7 +230,12 @@ def run_gui(host=DEFAULT_HOST, port=DEFAULT_PORT):
 def run_background(host=DEFAULT_HOST, port=DEFAULT_PORT):
     '''Headless/tray mode: dashboard server + realtime protection, no window.'''
     logger = logging.getLogger('DEXMOND_MIE')
-    os.environ.setdefault('DEXMOND_API_URL', f'http://{host}:{port}')
+    host_fmt = f'[{host}]' if ':' in host and not host.startswith('[') else host
+    base_url = f'http://{host_fmt}:{port}'
+    os.environ.setdefault('DEXMOND_API_URL', base_url)
+    if _probe_existing_server(base_url):
+        logger.info(f'MIE is already running at {base_url}')
+        return
     url = _start_server(host, port)
     logger.info(f'Folder monitoring running in background; dashboard at {url}')
     try:
@@ -272,15 +327,18 @@ def run():
             for err in yara_info['errors']:
                 print(f'''  {err['file']}: {err['error']}''', file=sys.stderr)
         target_path = os.path.abspath(args.target)
-        if os.path.isfile(target_path):
+        if paths.is_regular_non_link(target_path):
             results = engine.scan_file(target_path)
             print_results(results, args.output)
             return
-        if os.path.isdir(target_path):
+        if os.path.isdir(target_path) and not paths.is_symlink_or_junction(target_path):
             print(f'''Scanning directory: {target_path}''')
-            for root, _, files in os.walk(target_path):
+            for root, dirs, files in os.walk(target_path, followlinks=False):
+                dirs[:] = [d for d in dirs if not paths.is_symlink_or_junction(os.path.join(root, d))]
                 for file in files:
                     file_path = os.path.join(root, file)
+                    if not paths.is_regular_non_link(file_path):
+                        continue
                     results = engine.scan_file(file_path)
                     print_results(results, args.output)
             return
