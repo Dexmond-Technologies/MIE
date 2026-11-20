@@ -9,6 +9,7 @@ import os
 import struct
 import types
 import urllib.error
+import urllib.request
 import zipfile
 
 import pytest
@@ -277,7 +278,14 @@ def test_s11_auto_evolution_escapes_filename_and_rejects_duplicate_rule(tmp_path
     rname = RuleSynthesizer.generate_yara_rule('sample.bin', res, str(rules_dir))
     assert rname is not None and 'abcdef012345' in rname
     proposed_text = (rules_dir / 'proposed' / 'auto_generated.yar').read_text(encoding='utf-8')
-    assert 'rule injected' not in proposed_text
+    assert '\nrule injected' not in proposed_text
+    assert [ln.split()[1] for ln in proposed_text.splitlines() if ln.startswith('rule ')] == [rname]
+    try:
+        import yara
+        compiled = yara.compile(source=proposed_text)
+        assert compiled.match(data=b'benign content') == []
+    except ImportError:
+        pass
     assert 'severity = "medium"' in proposed_text
     assert 'all of ($s*)' in proposed_text
 
