@@ -1,0 +1,34 @@
+{
+  "note": "Third-party libraries of the engine. Versions follow from the vcpkg commit pinned in .github/workflows/engine.yml. engine/tools/vuln_check.py reads each version from that vcpkg checkout, resolves the upstream release tag to a commit, and asks the OSV database about that commit on every push. 'expected_version' and 'expected_commit' are filled from the first CI run and enforced from then on; null means not yet recorded.",
+  "vcpkg_commit": "5d4a3dc90c0b3773f3bac81bf41297b54328f471",
+  "libraries": {
+    "openssl": {
+      "repository": "https://github.com/openssl/openssl",
+      "tag": "openssl-{version}",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "MD5, SHA-1, SHA-256 of file bytes",
+      "expected_version": null,
+      "expected_commit": null
+    },
+    "nlohmann-json": {
+      "repository": "https://github.com/nlohmann/json",
+      "tag": "v{version}",
+      "shipped": true,
+      "touches_hostile_bytes": false,
+      "used_for": "JSON of results and of channel messages (messages come from the same user, not from scanned files)",
+      "expected_version": null,
+      "expected_commit": null
+    },
+    "catch2": {
+      "repository": "https://github.com/catchorg/Catch2",
+      "tag": "v{version}",
+      "shipped": false,
+      "touches_hostile_bytes": false,
+      "used_for": "unit tests only",
+      "expected_version": null,
+      "expected_commit": null
+    }
+  },
+  "accepted_vulnerabilities": []
+}

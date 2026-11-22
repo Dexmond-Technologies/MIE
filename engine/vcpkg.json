@@ -1,0 +1,10 @@
+{
+  "name": "mie-engine",
+  "version-string": "0.0.1",
+  "description": "Dexmond MIE stage 1 engine (C++). Dependency versions are fixed by the vcpkg commit pinned in .github/workflows/engine.yml.",
+  "dependencies": [
+    "openssl",
+    "nlohmann-json",
+    "catch2"
+  ]
+}

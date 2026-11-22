@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "profile": "parity",
+  "source": {
+    "reference_commit": "ff313e287a35b66e129ae14f783340eef07a25ad",
+    "files": ["dexmond_mie/scoring.py", "dexmond_mie/core.py", "dexmond_mie/realtime.py"],
+    "note": "Copied by hand from the Python reference. engine/tools/check_scoring_data.py compares every value with the reference source in CI. This file is data only; no C++ scoring code exists yet."
+  },
+  "weights": {
+    "yara_match": 20,
+    "critical_yara": 70,
+    "high_entropy": 15,
+    "sliding_entropy_spike": 10,
+    "suspicious_import": 10,
+    "api_chain": 35,
+    "api_chain_minor": 15,
+    "dynamic_resolution_chain": 15,
+    "suspicious_string": 5,
+    "obfuscated_script": 25,
+    "b64_executable": 30,
+    "packer_detected": 15,
+    "pe_overlay": 15,
+    "tls_callback": 5,
+    "anomaly": 10,
+    "wx_section": 10,
+    "reputation_malicious": 70,
+    "oversize_partial_scan": 5,
+    "malformed_pe": 10,
+    "overlay_high_entropy": 5,
+    "malformed_certificate_table": 10
+  },
+  "default_weight": 5,
+  "families": {
+    "packer_detected": "packing",
+    "high_entropy": "entropy",
+    "sliding_entropy_spike": "entropy",
+    "overlay_high_entropy": "entropy",
+    "suspicious_import": "imports",
+    "api_chain": "imports",
+    "api_chain_minor": "imports",
+    "dynamic_resolution_chain": "imports",
+    "yara_match": "yara",
+    "critical_yara": "critical_yara"
+  },
+  "yara_severity_weights": {
+    "critical": 70,
+    "high": 20,
+    "medium": 10,
+    "low": 5
+  },
+  "family_caps": {
+    "packing": 25,
+    "entropy": 15,
+    "imports": 35,
+    "yara": 40
+  },
+  "uncappable_families": ["critical_yara", "reputation_malicious"],
+  "signed_cap": 29,
+  "score_max": 100,
+  "verdicts": {
+    "clean_score": 0,
+    "medium_from": 30,
+    "malicious_from": 70,
+    "labels": {
+      "clean": "CLEAN",
+      "low": "SUSPICIOUS (LOW)",
+      "medium": "SUSPICIOUS (MEDIUM)",
+      "malicious": "MALICIOUS",
+      "partial": "SUSPICIOUS (LOW): oversize, partially scanned"
+    }
+  },
+  "limits": {
+    "MAX_ANALYSIS_BYTES": 33554432,
+    "MAX_SCAN_BYTES": 268435456,
+    "OVERSIZE_WINDOW_BYTES": 16777216,
+    "SLIDING_HIGH_SHARE": 0.25,
+    "REDUCED_ENTROPY_WEIGHT": 5,
+    "MAX_TAR_PADDING": 1048576,
+    "ZIP_DESCRIPTOR_SLACK": 24,
+    "MAX_UNCOVERED_ZIP_BYTES": 4096,
+    "MAX_UNCOVERED_TAR_HEADER_BYTES": 4096,
+    "OVERLAY_ENTROPY_MIN_BYTES": 4096,
+    "MAX_ARCHIVE_MEMBERS": 200,
+    "MAX_ARCHIVE_MEMBER_BYTES": 67108864,
+    "MAX_ARCHIVE_TOTAL_BYTES": 536870912,
+    "MAX_ARCHIVE_DEPTH": 3,
+    "MALICIOUS_FLOOR": 70
+  },
+  "alert_threshold": 30
+}

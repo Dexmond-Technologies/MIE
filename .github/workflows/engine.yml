@@ -1,0 +1,208 @@
+# MIE stage 1 engine (C++), built and tested on GitHub runners only.
+# - build-test: Windows (MSVC) and Ubuntu (GCC): build, unit tests, file-type refusal tests,
+#   hash and entropy parity with the Python reference, service smoke test.
+# - sanitize: Ubuntu, AddressSanitizer + UndefinedBehaviorSanitizer, same tests.
+# - fuzz: Ubuntu, Clang libFuzzer on the channel frame decoder. 60 s on every push;
+#   a manual run takes the number of seconds as input (3600 = the reviewer's one-hour line).
+# - parity-tools: the parity harness's own tests, the scoring data file against the Python
+#   reference source, and the record of the YARA library version.
+# - vuln-check: the pinned third-party libraries against the OSV database.
+# No release, no tag, no installer, no artefact is published by this workflow.
+# No EICAR file and no malware is used here.
+name: engine
+
+on:
+  push:
+    branches: [cpp/stage1]
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine.yml"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds of fuzzing per target (3600 = one hour)"
+        type: string
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # vcpkg release tag 2026.10.16. Every third-party version follows from this one commit.
+  VCPKG_COMMIT: 5d4a3dc90c0b3773f3bac81bf41297b54328f471
+  VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+  VCPKG_DISABLE_METRICS: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # same pins as .github/workflows/tests.yml
+  ENGINE_DEPS: yara-python==4.5.1 pefile==2024.8.26 watchdog==6.0.0 colorama==0.4.6 pytest==9.2.0
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Fetch vcpkg at the pinned commit
+        shell: pwsh
+        run: |
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin $env:VCPKG_COMMIT
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $head = git -C .vcpkg rev-parse HEAD
+          if ($head -ne $env:VCPKG_COMMIT) { Write-Host "vcpkg is at $head, expected $env:VCPKG_COMMIT"; exit 1 }
+          Write-Host "vcpkg at $head"
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      - name: Bootstrap vcpkg (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+      - name: Configure
+        shell: pwsh
+        run: |
+          $py = (python -c "import sys; print(sys.executable)")
+          cmake -S engine -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake" "-DMIE_REPO_ROOT=$env:GITHUB_WORKSPACE" "-DPython3_EXECUTABLE=$py"
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 4
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 180
+
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Fetch and bootstrap vcpkg at the pinned commit
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+      - name: Configure (AddressSanitizer + UndefinedBehaviorSanitizer)
+        run: >
+          cmake -S engine -B build -DCMAKE_BUILD_TYPE=Debug -DMIE_SANITIZE=ON
+          "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake"
+          "-DMIE_REPO_ROOT=$GITHUB_WORKSPACE" "-DPython3_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CC: clang
+      CXX: clang++
+      FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch and bootstrap vcpkg at the pinned commit
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+      - name: Configure (fuzz targets only)
+        run: >
+          cmake -S engine -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMIE_FUZZ_ONLY=ON
+          "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Fuzz the channel frame decoder
+        run: |
+          set -eu
+          case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "fuzz_seconds must be a whole number"; exit 2;; esac
+          mkdir -p fuzz-corpus
+          echo "fuzzing for $FUZZ_SECONDS seconds"
+          ./build/fuzz_frame -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus
+
+  parity-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the reference's engine deps (pinned)
+        run: python -m pip install $ENGINE_DEPS
+      - name: Scoring data file equals the Python reference source
+        run: python engine/tools/check_scoring_data.py
+      - name: Record of the reference's versions (YARA library version, rule hashes)
+        run: python engine/tools/parity/run_reference.py --describe
+      - name: Tests of the parity harness
+        run: python -m pytest -q -rs engine/tools/parity
+
+  vuln-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Fetch vcpkg at the pinned commit (port files only, nothing is built)
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+      - name: Pinned libraries against the OSV database
+        run: python engine/tools/vuln_check.py .vcpkg
