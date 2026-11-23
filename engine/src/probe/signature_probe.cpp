@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <span>
@@ -33,7 +34,7 @@ std::string read_text(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc != 5 && argc != 6) {
-        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped|strict-d13|strict-d17|strict-d19|strict-d20]\n", stderr);
+        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped|shipped-pause|strict-d13|strict-d17|strict-d19|strict-d20]\n", stderr);
         return 2;
     }
     mie::signature::Options options;
@@ -42,7 +43,12 @@ int main(int argc, char** argv) {
     // "strict-d13", "strict-d17", "strict-d19", "strict-d20": parity with that ONE numbered
     // difference switched to its shipped value, so a test can say which one changed an answer.
     const std::string mode = argc == 6 ? argv[5] : "parity";
-    const bool shipped = mode == "shipped";
+    // "shipped-pause" (test only): the shipped setting; after a file is opened and read, the
+    // probe prints an "opened" record, waits for one line on standard input, and only then
+    // checks; the second check is called whatever the walker says. A test changes the file
+    // behind the path during the wait, to see whether the answer follows the open handle.
+    const bool pause = mode == "shipped-pause";
+    const bool shipped = mode == "shipped" || pause;
     options.verify_every_entry = shipped || mode == "strict-d13";
     options.accept_unread_fields = !(shipped || mode == "strict-d17");
     options.signer_by_second_lookup = !(shipped || mode == "strict-d19");
@@ -103,11 +109,20 @@ int main(int argc, char** argv) {
             handle = file->native_handle();
         }
         const std::span<const std::uint8_t> data(bytes.data(), bytes.size());
+        if (pause) {
+            const json opened = {{"record", "opened"}, {"file", path.filename().string()}, {"bytes", bytes.size()}};
+            std::fputs(opened.dump(-1, ' ', true, json::error_handler_t::replace).c_str(), stdout);
+            std::fputc('\n', stdout);
+            std::fflush(stdout);
+            std::string ignored;
+            std::getline(std::cin, ignored);
+        }
         const mie::signature::Precheck checked = mie::signature::precheck(data);
         const mie::signature::Result result = mie::signature::verify(data, options);
         const bool valid = result.status == "valid";
         mie::signature::SecondCheck second;
-        if (shipped && valid) second = mie::signature::second_check(data, result, options, handle);
+        const bool second_asked = (shipped && valid) || pause;
+        if (second_asked) second = mie::signature::second_check(data, result, options, handle);
         json line = {
             {"file", path.filename().string()},
             {"precheck_status", checked.status},
@@ -122,7 +137,7 @@ int main(int argc, char** argv) {
             {"timestamp", valid && !result.timestamp.empty() ? json(result.timestamp) : json(nullptr)},
             {"error_class", result.error_class},
             {"certificate_table_verified", result.certificate_table_verified},
-            {"second_check", shipped && valid ? json(second.agree) : json(nullptr)},
+            {"second_check", second_asked ? json(second.agree) : json(nullptr)},
             {"second_check_reason", second.reason},
             {"opened", file != nullptr},
         };

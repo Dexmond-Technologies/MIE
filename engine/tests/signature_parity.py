@@ -697,6 +697,98 @@ def engine_part(ref, inputs, tmp, roots_path, pinned, policy):
     return failures
 
 
+def handle_test(inputs, tmp, roots_path, pinned, policy_path):
+    """Term (4) of r-01's ruling on the Windows second check: ONE open, the same handle for the
+    worker, the hash and the Windows check. The probe ('shipped-pause') opens the file through
+    mie::io::open_regular, reads it, and waits; meanwhile this test tries to change what the PATH
+    holds (overwrite in place, then rename another file over it). Either the system refuses both
+    (stated), or the probe's answer must be the one for the ORIGINAL bytes.
+    The Windows part of the answer can only be told with a file Windows itself trusts: set
+    MIE_REAL_SIGNED_FILE to a program with an embedded Microsoft signature. With the generated
+    file (signed under the throwaway root, which Windows does not trust) that part is NOT DETERMINED.
+    Windows only. Returns the lines that must fail the test."""
+    if os.name != 'nt':
+        print('NOT RUN  handle test (term 4 of the Windows second check): Windows only')
+        return []
+    real = os.environ.get('MIE_REAL_SIGNED_FILE')
+    use_real = bool(real) and os.path.isfile(real)
+    work = os.path.join(tmp, 'handle')
+    os.mkdir(work)
+    path = os.path.join(work, 'subject.bin')
+    if use_real:
+        shutil.copyfile(real, path)
+    else:
+        with open(path, 'wb') as f:
+            f.write(inputs['valid_sha256'])
+    with open(path, 'rb') as f:
+        original = hashlib.sha256(f.read()).hexdigest()
+    replacement = inputs['unsigned']
+    other = os.path.join(tmp, 'handle-replacement.bin')
+    with open(other, 'wb') as f:
+        f.write(replacement)
+
+    proc = subprocess.Popen([PROBE, roots_path, pinned, policy_path, work, 'shipped-pause'],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    answer, changed = None, []
+    try:
+        while True:
+            raw = proc.stdout.readline()
+            if not raw:
+                break
+            line = json.loads(raw.decode('ascii'))
+            if line.get('record') == 'settings':
+                print('SETTINGS (shipped-pause):', json.dumps(line, sort_keys=True))
+            elif line.get('record') == 'opened':
+                def overwrite():
+                    with open(path, 'r+b') as f:
+                        f.write(replacement)
+                        f.truncate()
+                for label, attempt in (('overwritten in place', overwrite),
+                                       ('another file renamed over it', lambda: os.replace(other, path))):
+                    try:
+                        attempt()
+                        changed.append(label)
+                    except OSError as e:
+                        print(f'HANDLE  while the probe holds the file open, "{label}" was REFUSED by the system: {e}')
+                proc.stdin.write(b'\n')
+                proc.stdin.flush()
+            elif 'file' in line:
+                answer = line
+        proc.wait(timeout=300)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    with open(path, 'rb') as f:
+        now = hashlib.sha256(f.read()).hexdigest()
+    print(f"HANDLE  file used: {'a real signed file (MIE_REAL_SIGNED_FILE)' if use_real else 'generated, throwaway root'}; "
+          f'changes that went through: {changed or "none"}; content behind the path changed: {now != original}')
+    if answer is None:
+        return ['handle test: the probe gave no answer']
+    print(f"HANDLE  probe answer: walker {answer['status']} publisher {answer.get('publisher')!r} "
+          f"({answer['detail'][:100]!r}); second check {answer.get('second_check')} ({answer.get('second_check_reason')!r})")
+    if not changed:
+        print('PASS  handle test: the system refused every change while the file was open (deny-write holds)')
+        return []
+    print('NOTE  handle test: the file COULD be changed while the probe held it open: mie::io::open_regular does not '
+          'deny writing or deleting (term 4 asks for deny-write; that is a change in mie::io)')
+    failures = []
+    # the replacement is an unsigned file; the original is signed (the generated one: valid here)
+    walker_follows = answer['status'] != 'unsigned' if use_real else answer['status'] == 'valid'
+    print(f"{'PASS' if walker_follows else 'FAIL'}  handle test: the walker's answer is the one for the ORIGINAL bytes")
+    if not walker_follows:
+        failures.append(f'handle test: the walker answered for the replaced content: {answer!r}')
+    if use_real:
+        windows_follows = 'WinVerifyTrust did not accept' not in (answer.get('second_check_reason') or '')
+        print(f"{'PASS' if windows_follows else 'FAIL'}  handle test: WinVerifyTrust judged the ORIGINAL (the open handle), "
+              f'not the unsigned file now behind the path')
+        if not windows_follows:
+            failures.append(f'handle test: WinVerifyTrust did not follow the handle: {answer!r}')
+    else:
+        print('NOT DETERMINED  handle test, Windows part: Windows does not trust the throwaway root, so WinVerifyTrust '
+              'refuses the generated file either way; set MIE_REAL_SIGNED_FILE to a file with an embedded Microsoft signature')
+    return failures
+
+
 def main():
     from dexmond_mie import signature as ref
     cases, variants, roots_pem, policy, mutations = build_cases()
@@ -872,6 +964,13 @@ def main():
                           f'(D-19, time-stamp certificate order)')
                 else:
                     hard.append(f'{name}: the shipped setting grants a cap that parity does not: {s_line!r}')
+        disagreements = [(n, shipped[n].get('second_check_reason')) for n in sorted(named)
+                         if n in shipped and shipped[n]['status'] == 'valid' and shipped[n].get('second_check') is False]
+        print(f'--- second check DISAGREES with a walker that said valid: {len(disagreements)} case(s) ---')
+        for n, reason in disagreements:
+            print(f"DISAGREE {n}: walker valid, publisher {shipped[n].get('publisher')!r}, allowed "
+                  f"{shipped[n].get('publisher_allowed')}; second check: {reason}")
+        hard.extend(handle_test(dict(inputs), tmp, roots_path, pinned, policy_path))
         print(f'shipped setting: of the named cases valid with cap in parity, {kept} keep the cap, '
               f'{sum(lost.values())} lose it: {json.dumps(lost, sort_keys=True)}')
         for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first'):
