@@ -120,8 +120,12 @@ def main():
         capped_total = 0
         for family, total in raw.items():
             cap = table['family_caps'].get(family)
+            # r-01 (B-3579): each cap once exactly AT the cap and once ABOVE it, so that a scorer
+            # that uses "greater or equal" where the reference uses "greater" is caught
             if cap is not None and total > cap:
-                mark('family_cap:' + family, path)
+                mark('family_cap_above:' + family, path)
+            if cap is not None and total == cap:
+                mark('family_cap_exactly:' + family, path)
             capped_total += min(total, cap) if cap is not None else total
         if record['score'] == table['score_max'] and capped_total > table['score_max']:
             mark('clamp_at_100', path)
@@ -149,19 +153,16 @@ def main():
     medium, malicious = table['verdicts']['medium_from'], table['verdicts']['malicious_from']
     below_medium = [s for s in present if 0 < s < medium]
     below_malicious = [s for s in present if medium <= s < malicious]
-    boundary = {
-        'score 0 (CLEAN)': 0 in present,
-        'lowest non-zero score': bool(below_medium),
-        f'on the MEDIUM line ({medium})': medium in present,
-        f'below the MEDIUM line (highest present: {max(below_medium) if below_medium else None})': bool(below_medium),
-        f'on the MALICIOUS line ({malicious})': malicious in present,
-        f'below the MALICIOUS line (highest present: {max(below_malicious) if below_malicious else None})':
-            bool(below_malicious),
-    }
+    # r-01 (B-3579): every weight is a multiple of 5 (only the signature cap is 29), so "just below"
+    # a line means 25 and 65. The set must hold files whose REFERENCE score is exactly each of these.
+    step = 5
+    wanted_scores = [0, step, medium - step, medium, malicious - step, malicious, table['score_max']]
+    boundary = {f'a file with reference score exactly {s}': s in present for s in wanted_scores}
 
     required = (['weight:' + c for c in table['weights']]
                 + ['yara_severity:' + s for s in table['yara_severity_weights']]
-                + ['family_cap:' + f for f in table['family_caps']]
+                + ['family_cap_above:' + f for f in table['family_caps']]
+                + ['family_cap_exactly:' + f for f in table['family_caps']]
                 + ['reduced_entropy_weight', 'floor:archive_member', 'floor:reputation', 'clamp_at_100',
                    'partial_scan_verdict', 'trusted_hash_early_return', 'archive_depth_limit',
                    'default_weight', 'signed_cap']
@@ -218,6 +219,7 @@ def main():
         'unreachable_in_reference': unreachable,
         'missing': missing,
         'scores_present': present,
+        'scores_required': wanted_scores,
     }
     text = json.dumps(manifest, indent=1, sort_keys=True)
     if args.manifest:

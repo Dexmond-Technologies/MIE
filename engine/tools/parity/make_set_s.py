@@ -309,6 +309,9 @@ def build_files(rng, large):
                       'CreateObject MSXML2.XMLHTTP ADODB.Stream',
                       'meterpreter metsrv.dll stdapi_')
     add('t08_rule_cap.txt', three_high, 'yara family above its cap of 40 (three high rules = 60)')
+    add('t16_rule_exactly_at_cap.txt', text('eval( unescape( fromCharCode ActiveXObject',
+                                            'CreateObject MSXML2.XMLHTTP ADODB.Stream'),
+        'yara family exactly at its cap of 40 (two high rules = 40)')
     add('t09_just_below_malicious.txt', three_high + text('x = FromBase64String(y)'),
         'yara cap 40 + obfuscated_script 25 = 65: highest reachable score below the MALICIOUS line')
     add('t10_clamp.txt', critical_words + three_high + text('x = FromBase64String(y)',
@@ -409,6 +412,16 @@ def build_files(rng, large):
     upx_layout = [('UPX0', b'', SEC_WX, 0x4000), ('UPX1', b'UPX!' + rng.randbytes(0x3FFC), SEC_WX)]
     add('p15_packer_confirmed.exe', build_pe(upx_layout, BENIGN_IMPORTS, entry=('section', 1)),
         'confirmed packer layout: packing family above its cap of 25')
+    upx_plain = [('UPX0', b'', SEC_WX, 0x4000), ('UPX1', b'UPX!' + filler_code(0x1000), SEC_WX)]
+    add('p23_packer_exactly_at_cap.exe', build_pe(upx_plain, BENIGN_IMPORTS, entry=('section', 1)),
+        'confirmed packer layout without high entropy: packing family exactly at its cap of 25 '
+        '(packer_detected 15 + wx_section 10)')
+    rule_words = b'VirtualAllocEx\x00NtCreateThreadEx\x00QueueUserAPC\x00'
+    add('p24_imports_exactly_at_cap.exe', build_pe(
+        [('.text', code, SEC_CODE), ('.data', rule_words + bytes(0x200 - len(rule_words)), SEC_DATA)],
+        with_benign({'KERNEL32.dll': ['LoadLibraryA', 'GetProcAddress', 'VirtualProtect']})),
+        'imports family exactly at its cap of 35: dynamic_resolution_chain 15 + an imports-category rule 20 '
+        '(the rule\'s words are plain text in the data section, not imports)')
     add('p16_packer_section_name.exe', build_pe(plain + [('.aspack', bytes(0x200), SEC_RDATA)], BENIGN_IMPORTS),
         'packer_detected (15) by section name')
     add('p17_download_exec_chain.exe', build_pe(plain, with_benign(

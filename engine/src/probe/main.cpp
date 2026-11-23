@@ -30,12 +30,16 @@ constexpr std::uint64_t kMaxProbeBytes = 64ull * 1024 * 1024;
 
 int main(int argc, char** argv) {
     using nlohmann::json;
-    if (argc != 3 || std::string(argv[1]) != "file") {
-        std::fputs("usage: mie-probe file PATH\n", stderr);
+    const bool usage_ok = (argc == 3 || (argc == 4 && std::string(argv[3]) == "--allow-cloud-only")) &&
+                          std::string(argv[1]) == "file";
+    if (!usage_ok) {
+        std::fputs("usage: mie-probe file PATH [--allow-cloud-only]\n", stderr);
         return 2;
     }
+    mie::io::OpenOptions options;
+    options.allow_cloud_only = (argc == 4);
     mie::io::IoError error;
-    const auto file = mie::io::open_regular(std::filesystem::path(argv[2]), error);
+    const auto file = mie::io::open_regular(std::filesystem::path(argv[2]), error, options);
     if (!file) {
         const json refused = {{"state", "refused"},
                               {"code", mie::io::to_string(error.code)},

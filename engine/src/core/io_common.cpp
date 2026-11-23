@@ -10,6 +10,7 @@ const char* to_string(IoErrorCode code) {
         case IoErrorCode::NotRegular: return "not_regular";
         case IoErrorCode::AccessDenied: return "access_denied";
         case IoErrorCode::Changed: return "changed";
+        case IoErrorCode::CloudOnly: return "cloud_only";
         case IoErrorCode::ReadFailed: return "read_failed";
         case IoErrorCode::Other: return "other";
     }

@@ -71,7 +71,8 @@ IoErrorCode code_from_errno(int err) {
 
 }  // namespace
 
-std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error) {
+std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error,
+                                   const OpenOptions& /*options: cloud-only files are a Windows matter*/) {
     error = IoError{};
 
     // 1. Look at the name itself, without following a link.

@@ -189,6 +189,8 @@ jobs:
         run: python engine/tools/parity/run_reference.py --describe
       - name: Tests of the parity harness
         run: python -m pytest -q -rs engine/tools/parity
+      - name: Scoring vectors (lists of findings and the reference scorer's answers)
+        run: python engine/tools/parity/scoring_vectors.py --out "$RUNNER_TEMP/scoring.vectors.json"
 
   set-s:
     # Parity set S: harmless generated files that make the Python reference use its scoring

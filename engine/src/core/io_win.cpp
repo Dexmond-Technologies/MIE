@@ -104,7 +104,14 @@ HANDLE open_handle(const std::filesystem::path& path, bool stop_at_reparse_point
 
 }  // namespace
 
-std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error) {
+// Attribute bits of files whose content is not on this disk. Defined here in case the
+// SDK headers in use are older than the attributes.
+constexpr DWORD kAttributeOffline = 0x00001000;             // FILE_ATTRIBUTE_OFFLINE
+constexpr DWORD kAttributeRecallOnOpen = 0x00040000;        // FILE_ATTRIBUTE_RECALL_ON_OPEN
+constexpr DWORD kAttributeRecallOnDataAccess = 0x00400000;  // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error,
+                                   const OpenOptions& options) {
     error = IoError{};
 
     // 1. Open the name itself: a link or junction is opened as the link, not its target.
@@ -130,6 +137,18 @@ std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& e
         ::CloseHandle(handle);
         error.code = IoErrorCode::Other;
         error.detail = "GetFileInformationByHandle failed, error " + std::to_string(err);
+        return nullptr;
+    }
+
+    // 2b. Content only in cloud storage: not opened further unless the caller asked for it.
+    //     The handle above was opened with FILE_FLAG_OPEN_REPARSE_POINT and nothing has
+    //     been read, so nothing has been downloaded up to here.
+    const DWORD cloud_bits = kAttributeOffline | kAttributeRecallOnOpen | kAttributeRecallOnDataAccess;
+    if ((facts.attributes & cloud_bits) != 0 && !options.allow_cloud_only &&
+        (facts.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        ::CloseHandle(handle);
+        error.code = IoErrorCode::CloudOnly;
+        error.detail = "only in the cloud";
         return nullptr;
     }
 
