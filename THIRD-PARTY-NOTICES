@@ -1,0 +1,16 @@
+THIRD-PARTY NOTICES for Dexmond MIE (branch main, the Python line)
+
+Dexmond MIE is licensed under the Apache License 2.0 (see LICENSE).
+
+Checked on 2026-11-23 at commit cb6a97d: this branch contains no code, data or rule set copied
+from another project. The Python files in dexmond_mie/ and main.py, the detection rules in
+rules/ and data/reputation.json are Dexmond Technologies' own work.
+
+The Python packages named in requirements.txt are not contained in this repository; they are
+installed from their own sources and carry their own licences, which a package that ships them
+must include.
+
+Not covered by the Apache 2.0 licence of this repository:
+- rules/eicar.yar and data/reputation.json name the EICAR anti-virus test file (the test string
+  is published by EICAR).
+- Product and tool names in the detection rules are used only to identify what a rule detects. They are trademarks of their owners. Dexmond is not affiliated with them.

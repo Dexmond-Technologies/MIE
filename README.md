@@ -1,5 +1,11 @@
 # DEXMOND MIE — Malware Inspection Engine
 
+Licensed under the Apache License 2.0 (see `LICENSE`; attributions in `NOTICE` and `THIRD-PARTY-NOTICES`).
+
+Product and tool names in the detection rules are used only to identify what a rule detects. They are trademarks of their owners. Dexmond is not affiliated with them.
+
+Some rules match patterns associated with dual-use security tools that are also used legitimately (e.g. in authorised penetration testing). A match is not a finding of malicious intent.
+
 A lightweight malware inspection engine with a web dashboard, always-on
 real-time protection, quarantine, and a static analysis pipeline
 (hashing, entropy, YARA, PE analysis, archive inspection, and a known-hash
