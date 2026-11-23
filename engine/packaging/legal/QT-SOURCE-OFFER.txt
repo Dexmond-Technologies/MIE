@@ -1,0 +1,36 @@
+DRAFT, not legal text
+
+Written Offer for Complete Corresponding Qt Source Code
+=======================================================
+
+When Dexmond MIE is distributed with the Qt 6 libraries (version 6.11.2,
+used under the GNU Lesser General Public License version 3), the complete
+corresponding source code for that exact version of Qt (6.11.2) may be
+obtained directly at no charge from:
+
+  1. Official Qt release archives (The Qt Company):
+     https://download.qt.io/archive/qt/6.11/6.11.2/submodules/qtbase-everywhere-src-6.11.2.tar.xz
+
+  2. Official Qt Git repository:
+     https://code.qt.io/qt/qtbase.git (tag v6.11.2)
+
+  3. Exact build scripts and patches used by Dexmond MIE (vcpkg registry):
+     https://github.com/microsoft/vcpkg (commit 9eec002df1cd109f8f104cd966a763daf9751489,
+     directory ports/qtbase)
+
+Three-Year Written Offer by Dexmond Technologies:
+  In accordance with section 4 of the GNU Lesser General Public License
+  version 3 and section 6(b) of the GNU General Public License version 3,
+  Dexmond Technologies hereby offers, for a period of at least three (3)
+  years from your receipt of this software (and for as long as Dexmond
+  Technologies offers support for this product version), to provide any
+  third party, upon request, with the complete machine-readable
+  corresponding source code for the exact Qt 6.11.2 libraries distributed
+  with Dexmond MIE, either through network download at no charge or on a
+  durable physical medium for a charge no greater than the cost of
+  physically performing the source distribution.
+
+  To request the corresponding Qt source code, contact:
+    Dexmond Technologies
+    Email: support@dexmond.com
+    Subject: Qt 6.11.2 Corresponding Source Request (Dexmond MIE)

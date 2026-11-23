@@ -1,0 +1,35 @@
+{
+  "product_name": "Dexmond MIE",
+  "publisher": "Dexmond Technologies",
+  "unsigned_banner": "UNSIGNED TEST BUILD",
+  "unsigned_notice": "UNSIGNED TEST BUILD - This package is not signed and is built for testing only.",
+  "fixed_sentences": {
+    "what_it_does": "Dexmond MIE checks files and reports what it finds. It has not been tested against real malware.",
+    "account_boundary": "Other user accounts on this computer cannot control MIE. Programs that run under your own account can.",
+    "linux_scope": "This version does not judge Linux programs. It checks Windows programs, scripts, documents and archives.",
+    "no_scan_engine": "This build contains the background service and the command line only. The scan engine is not part of this build. Nothing is being scanned."
+  },
+  "windows": {
+    "autostart_task": "Start MIE's background service when I sign in",
+    "welcome_heading_unsigned": "Welcome to Dexmond MIE Setup (UNSIGNED TEST BUILD)",
+    "welcome_heading_signed": "Welcome to Dexmond MIE Setup",
+    "uninstall_userdata_prompt": "Remove MIE's user data folder at %LOCALAPPDATA%\\DexmondMIE? Select No to keep your data folder, or Yes to delete it.",
+    "start_menu_ui": "Dexmond MIE",
+    "start_menu_service": "Start Dexmond MIE Background Service",
+    "start_menu_readme": "Dexmond MIE README",
+    "start_menu_uninstall": "Uninstall Dexmond MIE",
+    "install_location_note": "Installed files are placed in %LOCALAPPDATA%\\Programs\\Dexmond MIE.",
+    "userdata_location_note": "User data is stored in %LOCALAPPDATA%\\DexmondMIE. Uninstalling asks whether to keep or remove that folder and keeps it by default."
+  },
+  "linux": {
+    "deb_synopsis_unsigned": "Dexmond MIE file checker - UNSIGNED TEST BUILD",
+    "deb_synopsis_signed": "Dexmond MIE file checker",
+    "desktop_name": "Dexmond MIE Background Service",
+    "install_location_note": "Installed files are placed under /opt/dexmond-mie, with a command-line wrapper at /usr/bin/mie and a per-user sign-in entry at /etc/xdg/autostart/dexmond-mie-service.desktop.",
+    "userdata_location_note": "User data in your home folder is stored in ~/.local/share/dexmond-mie (or $XDG_DATA_HOME/dexmond-mie), and the per-user service socket is placed in $XDG_RUNTIME_DIR/dexmond-mie (or ~/.cache/dexmond-mie when XDG_RUNTIME_DIR is unset). Removing or purging the package does not touch files in your home folder."
+  },
+  "common": {
+    "licenses_note": "Third-party licence texts and notices are in the licenses folder alongside this file.",
+    "qt_replaceable_note": "When the graphical window is included, the Qt 6 libraries are separate files in the install folder and may be replaced by your own build of the same Qt version."
+  }
+}

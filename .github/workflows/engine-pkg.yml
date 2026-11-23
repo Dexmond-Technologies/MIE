@@ -1,0 +1,212 @@
+# MIE stage 1 packaging and installer acceptance tests (Windows and Linux).
+# Builds unsigned test installers from the read-only engine/ sources and runs
+# acceptance tests P-1..P-9 (Windows) and L-1..L-8 (Ubuntu + Debian 13 container).
+# Nothing is published; artifacts are kept 7 days with UNSIGNED-TEST in their name.
+name: engine-pkg
+
+on:
+  push:
+    branches:
+      - cpp/stage1-pkg
+      - cpp/stage1
+    paths:
+      - "engine/**"
+      - ".github/workflows/engine-pkg.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same pinned vcpkg commit as .github/workflows/engine.yml (tag 2026.10.16)
+  VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+  VCPKG_DISABLE_METRICS: "1"
+  # Signing placeholders (empty for unsigned test builds; set by owner later)
+  MIE_WIN_CODESIGN_CERT: ""
+  MIE_WIN_CODESIGN_TIMESTAMP_URL: ""
+  MIE_LINUX_GPG_KEY_ID: ""
+
+jobs:
+  windows-pkg:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      INNO_VERSION: "6.4.3"
+      INNO_URL: "https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe"
+      INNO_SHA256: "f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Fetch and bootstrap vcpkg at the pinned commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin $env:VCPKG_COMMIT
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          $head = git -C .vcpkg rev-parse HEAD
+          if ($head -ne $env:VCPKG_COMMIT) { throw "vcpkg at $head, expected $env:VCPKG_COMMIT" }
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tool-cache
+          key: innosetup-${{ env.INNO_VERSION }}-${{ env.INNO_SHA256 }}
+      - name: Download and verify Inno Setup 6.4.3 (SHA-256 checked before use)
+        id: inno
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path .tool-cache | Out-Null
+          $exe = Join-Path (Resolve-Path .tool-cache) "innosetup-$env:INNO_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Write-Host "Downloading $env:INNO_URL"
+            Invoke-WebRequest -Uri $env:INNO_URL -OutFile $exe -UseBasicParsing
+          }
+          $actual = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "innosetup-$env:INNO_VERSION.exe sha256=$actual"
+          if ($actual -ne $env:INNO_SHA256) {
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            throw "SHA-256 mismatch for Inno Setup: got $actual, expected $env:INNO_SHA256"
+          }
+          $installDir = Join-Path $env:RUNNER_TEMP 'innosetup6'
+          $p = Start-Process -FilePath $exe -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$installDir") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Inno Setup install exited with $($p.ExitCode)" }
+          $iscc = Join-Path $installDir 'ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found at $iscc" }
+          "iscc=$iscc" >> $env:GITHUB_OUTPUT
+      - name: Stage Dexmond MIE install tree
+        shell: pwsh
+        run: python engine/packaging/stage.py
+      - name: Build Windows Inno Setup installer
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python engine/packaging/build_windows_installer.py --iscc "${{ steps.inno.outputs.iscc }}"
+          $meta = Get-Content build-pkg/out/windows-pkg-metadata.json -Raw | ConvertFrom-Json
+          "version=$($meta.version)" >> $env:GITHUB_OUTPUT
+          "short_sha=$($meta.short_sha)" >> $env:GITHUB_OUTPUT
+          "installer_name=$($meta.installer_name)" >> $env:GITHUB_OUTPUT
+      - name: Run Windows acceptance tests (P-1 to P-9)
+        shell: pwsh
+        run: python engine/packaging/test_windows_pkg.py
+      - name: Upload unsigned Windows test installer (7 days)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dexmond-mie-windows-${{ steps.pkg.outputs.version }}-${{ steps.pkg.outputs.short_sha }}-UNSIGNED-TEST
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            build-pkg/out/${{ steps.pkg.outputs.installer_name }}
+            build-pkg/out/${{ steps.pkg.outputs.installer_name }}.sha256
+
+  ubuntu-pkg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Prepare vcpkg at the pinned commit
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+          mkdir -p .vcpkg-cache
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-ubuntu2404-pkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+      - name: Build, stage, and package in Ubuntu 24.04 LTS baseline container (compatible with Ubuntu LTS and Debian 13)
+        id: pkg
+        run: |
+          set -eu
+          HOST_UID="$(id -u)"
+          HOST_GID="$(id -g)"
+          docker run --rm \
+            -e VCPKG_COMMIT="$VCPKG_COMMIT" \
+            -e VCPKG_ROOT="$GITHUB_WORKSPACE/.vcpkg" \
+            -e VCPKG_DEFAULT_BINARY_CACHE="$GITHUB_WORKSPACE/.vcpkg-cache" \
+            -e VCPKG_DISABLE_METRICS=1 \
+            -e GITHUB_SHA="$GITHUB_SHA" \
+            -e MIE_LINUX_GPG_KEY_ID="$MIE_LINUX_GPG_KEY_ID" \
+            -e HOST_UID="$HOST_UID" \
+            -e HOST_GID="$HOST_GID" \
+            -e WORKSPACE="$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -w "$GITHUB_WORKSPACE" \
+            ubuntu:24.04 \
+            bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                build-essential cmake ninja-build pkg-config curl zip unzip tar git \
+                ca-certificates python3 dpkg-dev binutils perl
+              git config --global --add safe.directory "*"
+              ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+              python3 engine/packaging/stage.py
+              python3 engine/packaging/build_linux_packages.py
+              chown -R "$HOST_UID:$HOST_GID" "$WORKSPACE/build-pkg" "$WORKSPACE/.vcpkg" "$WORKSPACE/.vcpkg-cache"
+            '
+          python -c '
+          import json, os
+          m = json.load(open("build-pkg/out/linux-pkg-metadata.json"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={m[\"version\"]}\n")
+              out.write(f"short_sha={m[\"short_sha\"]}\n")
+              out.write(f"deb_name={m[\"deb_name\"]}\n")
+              out.write(f"tar_name={m[\"tar_name\"]}\n")
+          '
+      - name: Install lintian on Ubuntu runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends lintian
+      - name: Run Linux acceptance tests on ubuntu-latest (L-1 to L-8)
+        run: python engine/packaging/test_linux_pkg.py
+      - name: Run .deb acceptance tests inside debian:13 container (L-3 to L-6)
+        run: |
+          set -eu
+          DEB_ABS="$GITHUB_WORKSPACE/build-pkg/out/${{ steps.pkg.outputs.deb_name }}"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
+            -w "$GITHUB_WORKSPACE" \
+            debian:13 \
+            bash -euxc "
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends python3 passwd
+              useradd -m -s /bin/sh mieuser
+              python3 '$GITHUB_WORKSPACE/engine/packaging/test_linux_pkg.py' --debian-container '$DEB_ABS'
+            "
+      - name: Upload unsigned Linux test packages (7 days)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dexmond-mie-linux-${{ steps.pkg.outputs.version }}-${{ steps.pkg.outputs.short_sha }}-UNSIGNED-TEST
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            build-pkg/out/${{ steps.pkg.outputs.deb_name }}
+            build-pkg/out/${{ steps.pkg.outputs.tar_name }}
+            build-pkg/out/SHA256SUMS

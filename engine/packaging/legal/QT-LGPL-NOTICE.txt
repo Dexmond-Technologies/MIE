@@ -1,0 +1,32 @@
+DRAFT, not legal text
+
+Qt LGPL-3.0 Notice for Dexmond MIE
+==================================
+
+When the graphical interface program (mie-ui) is included in Dexmond MIE,
+mie-ui dynamically links against the Qt 6 libraries (Qt Core, Qt Gui,
+Qt Widgets, and the Qt platform plugin) version 6.11.2, built from the
+pinned vcpkg commit 9eec002df1cd109f8f104cd966a763daf9751489.
+
+Dexmond MIE uses these Qt libraries under the terms of the GNU Lesser
+General Public License version 3 (LGPL-3.0). Copies of the GNU Lesser
+General Public License version 3 (licenses/LGPL-3.0.txt) and the GNU
+General Public License version 3 (licenses/GPL-3.0.txt) accompany this
+distribution inside the licenses folder.
+
+Qt Copyright:
+  Copyright (C) The Qt Company Ltd. and other contributors.
+
+Replaceable Shared Libraries:
+  The Qt libraries and Qt platform plugins used by Dexmond MIE are
+  shipped as separate shared library files inside the installation
+  folder (on Windows alongside mie-ui.exe and under plugins/platforms/;
+  on Linux under /opt/dexmond-mie/lib/ and /opt/dexmond-mie/plugins/platforms/).
+  Qt is never linked statically into Dexmond MIE and is never merged into
+  another binary.
+
+  You may replace those Qt shared library files in the installation
+  folder with your own interface-compatible build of the same Qt version
+  (6.11.2), and you may modify the Qt libraries and debug such
+  modifications as permitted by section 4 of the GNU Lesser General
+  Public License version 3.
