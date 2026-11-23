@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 import zlib
 
@@ -65,6 +66,20 @@ LINUX = sys.platform.startswith('linux')
 REFERENCE_OUT = os.environ.get('MIE_ARCHIVE_REFERENCE_OUT', '')
 REFERENCE_IN = '' if LINUX else os.environ.get('MIE_ARCHIVE_REFERENCE_IN', '')
 REFERENCE_ONLY = PROBE == '--reference-only'
+
+
+# Nightly wall-time cap (MIE_PARITY_DEADLINE_UNIX, seconds since 1970, UTC): when it has passed, no
+# new batch is started; what was compared is reported, with the count, and the test ends with
+# exit code 3 ("stopped at the deadline") unless something differed or failed (then 1).
+DEADLINE = float(os.environ.get('MIE_PARITY_DEADLINE_UNIX', '0') or 0)
+
+
+def deadline_passed():
+    return DEADLINE > 0 and time.time() >= DEADLINE
+
+
+def deadline_text():
+    return time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(DEADLINE))
 FIELDS = ('is_archive', 'members', 'reasons_hex', 'complete')
 TEXT = b'The garden needs water on Tuesday.\r\n' * 8
 MIB = 1024 * 1024
@@ -592,7 +607,8 @@ def main():
     rng = random.Random(SEED)
     counts = {field: [0, 0] for field in FIELDS}
     tally = {'inputs': 0, 'archive for the reference': 0, 'archive for C++': 0, 'inputs with a difference': 0,
-             'no line from the probe': 0, 'unreadable lines': 0, 'probe failures': 0}
+             'no line from the probe': 0, 'unreadable lines': 0, 'probe failures': 0, 'damaged variants': 0}
+    stopped = False
     shown = 0
     linux_table, out_file = None, None
     if REFERENCE_IN:
@@ -650,6 +666,7 @@ def main():
                     out_file.write(json.dumps({'file': name, 'input_sha256': digest, 'view': want}) + '\n')
                 have = want if REFERENCE_ONLY else got.get(name)
                 tally['inputs'] += 1
+                tally['damaged variants'] += 0 if note == 'base' else 1
                 tally['archive for the reference'] += 1 if want['is_archive'] else 0
                 tally['archive for C++'] += 1 if have and have.get('is_archive') else 0
                 if have is None:
@@ -678,7 +695,10 @@ def main():
             if len(batch) >= BATCH_FILES:
                 compare(batch)
                 batch = []
-        if batch:
+                if deadline_passed():
+                    stopped = True
+                    break
+        if batch and not stopped:
             compare(batch)
 
     if out_file is not None:
@@ -691,9 +711,16 @@ def main():
     for key, value in tally.items():
         print(f'{key}: {value}')
     failed = (tally['inputs with a difference'] or tally['unreadable lines'] or tally['probe failures'] or
-              tally['inputs'] == 0)
+              (tally['inputs'] == 0 and not stopped))
+    if stopped:
+        print(f"archive_parity: STOPPED AT THE DEADLINE ({deadline_text()}) after {tally['damaged variants']} "
+              f"damaged variants")
+    print(f"archive_parity: compared {tally['damaged variants']} damaged variants")
+    print(f"archive_parity: {tally['inputs with a difference']} differences")
     print('archive_parity: FAIL' if failed else 'archive_parity: ok')
-    return 1 if failed else 0
+    if failed:
+        return 1
+    return 3 if stopped else 0
 
 
 if __name__ == '__main__':

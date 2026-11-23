@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 PROBE, REPO = sys.argv[1], os.path.abspath(sys.argv[2])
 sys.path.insert(0, REPO)
@@ -47,6 +48,20 @@ BATCH_FILES = 400
 BATCH_BYTES = 64 * 1024 * 1024
 PE32_DIRS = 0x80 + 24 + 96        # file offset of the data directories in the files build_pe makes
 PE32_SECTIONS = 0x80 + 24 + 0xE0  # file offset of their section table
+
+
+# Nightly wall-time cap (MIE_PARITY_DEADLINE_UNIX, seconds since 1970, UTC): when it has passed, no
+# new batch is started; what was compared is reported, with the count, and the test ends with
+# exit code 3 ("stopped at the deadline") unless something differed or failed (then 1).
+DEADLINE = float(os.environ.get('MIE_PARITY_DEADLINE_UNIX', '0') or 0)
+
+
+def deadline_passed():
+    return DEADLINE > 0 and time.time() >= DEADLINE
+
+
+def deadline_text():
+    return time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(DEADLINE))
 
 
 def variants_per_base(base_count):
@@ -608,6 +623,7 @@ def main():
     rng = random.Random(SEED)
     counts, shown = {}, [0]
     tally = {'bases': 0, 'variants': 0, 'both': 0, 'lines': 0, 'unreadable': 0, 'ordinal_named': 0}
+    stopped = False
     with tempfile.TemporaryDirectory(prefix='mie-pe-') as tmp:
         bases = base_files(tmp)
         per_base = variants_per_base(len(bases))
@@ -615,6 +631,9 @@ def main():
         case_dir = os.path.join(tmp, 'cases')
         os.mkdir(case_dir)
         for batch in case_batches(bases, rng, case_dir, per_base):
+            if deadline_passed():
+                stopped = True
+                break
             got, unreadable, code = run_probe([PROBE, case_dir])
             tally['lines'] += len(got)
             tally['unreadable'] += unreadable
@@ -643,12 +662,18 @@ def main():
     problems = []
     if tally['unreadable']:
         problems.append(f"{tally['unreadable']} probe lines could not be read")
-    if tally['ordinal_named'] == 0:
+    if stopped:
+        print(f"pe_parity: STOPPED AT THE DEADLINE ({deadline_text()}) after {tally['variants']} damaged variants "
+              f"of {per_base * len(bases)} planned; coverage checks NOT DONE")
+    elif tally['ordinal_named'] == 0:
         problems.append('no file with an import by ordinal named from pefile\'s tables: the tables were not exercised')
     for problem in problems:
         print('FAIL  ' + problem)
+    print(f"pe_parity: compared {tally['variants']} damaged variants")
     print(f'pe_parity: {total_different} differences')
-    return 1 if (total_different or problems) else 0
+    if total_different or problems:
+        return 1
+    return 3 if stopped else 0
 
 
 if __name__ == '__main__':

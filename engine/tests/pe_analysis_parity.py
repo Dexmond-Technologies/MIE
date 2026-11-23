@@ -154,10 +154,13 @@ def main():
     confirmed_files = 0
     variants_built = 0
     lines_read = unreadable_lines = probe_failures = 0
+    stopped = False
+    planned = 0
 
     with tempfile.TemporaryDirectory(prefix='mie-pea-') as tmp:
         bases = pe_parity.base_files(tmp)
         per_base = pe_parity.variants_per_base(len(bases))
+        planned = per_base * len(bases)
         print(f'seed {pe_parity.SEED}; {per_base} damaged variants per base file; {len(bases)} base files; '
               f'packer rules given to both sides: {PACKER_RULES}')
         case_dir = os.path.join(tmp, 'cases')
@@ -167,6 +170,9 @@ def main():
             args += ['--packer-rule', rule]
 
         for batch in pe_parity.case_batches(bases, rng, case_dir, per_base):
+            if pe_parity.deadline_passed():
+                stopped = True
+                break
             got, unreadable, code = pe_parity.run_probe(args, timeout=800)   # line feeds only, never str.splitlines()
             lines_read += len(got)
             unreadable_lines += unreadable
@@ -228,16 +234,23 @@ def main():
     problems = []
     if probe_failures or unreadable_lines:
         problems.append(f'the probe failed on {probe_failures} batches; {unreadable_lines} lines could not be read')
-    if variants_built < 2000:
-        problems.append(f'only {variants_built} variants were built (at least 2,000 are required)')
-    if tally['both'] == 0:
-        problems.append('no file parsed on both sides: nothing was compared')
-    if confirmed_files == 0:
-        problems.append('no file with a confirmed packer layout: confirmed_upx_sections was never exercised')
+    if stopped:
+        print(f'pe_analysis_parity: STOPPED AT THE DEADLINE ({pe_parity.deadline_text()}) after {variants_built} '
+              f'damaged variants of {planned} planned; coverage checks NOT DONE')
+    else:
+        if variants_built < 2000:
+            problems.append(f'only {variants_built} variants were built (at least 2,000 are required)')
+        if tally['both'] == 0:
+            problems.append('no file parsed on both sides: nothing was compared')
+        if confirmed_files == 0:
+            problems.append('no file with a confirmed packer layout: confirmed_upx_sections was never exercised')
     for problem in problems:
         print('FAIL  ' + problem)
+    print(f'pe_analysis_parity: compared {variants_built} damaged variants')
     print(f'pe_analysis_parity: {total_different} differences')
-    return 1 if (total_different or problems) else 0
+    if total_different or problems:
+        return 1
+    return 3 if stopped else 0
 
 
 if __name__ == '__main__':

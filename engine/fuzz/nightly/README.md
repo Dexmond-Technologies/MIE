@@ -16,7 +16,15 @@ hour, each on its own core, all at the same time.
 Targets today: `fuzz_frame` (the channel frame decoder) and `fuzz_pe` (the reader for Windows
 executables). Planned with the engine: the archive reader.
 
-## Second part of the night: parity on 200,000 damaged executables
+## Second part of the night: parity on 200,000 damaged executables and archives
+
+Since 2026-11-23 the archive readers are part of it too (`engine/tests/archive_parity.py`,
+at least 200,000 damaged archives, `MIE_ARCHIVE_VARIANTS`; reviewer's conditions before gate 3,
+board B-3628); it needs `yara-python==4.5.1` because it builds the reference's own engine.
+Part 2 stops cleanly at a wall-clock deadline, `MIE_PARITY_DEADLINE_UTC` (default `02:45`, the
+next such time after the start; empty for none): no new batch is started after it, and a test
+stopped there is recorded `INCOMPLETE` with the number of damaged variants it compared
+(COMMANDER_SEAT's choice for node4: timer at 21:30 UTC, deadline 02:45 UTC).
 
 After the fuzzing the same script builds the engine's two executable probes (normal build,
 system compiler, same pinned vcpkg) and runs `engine/tests/pe_parity.py` and

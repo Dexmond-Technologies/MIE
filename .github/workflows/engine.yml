@@ -121,6 +121,23 @@ jobs:
           MIE_SET_S_REFERENCE: ${{ runner.temp }}/set-s-reference
           MIE_ARCHIVE_REFERENCE_IN: ${{ runner.temp }}/set-s-reference/archive.reference.jsonl
         run: ctest --test-dir build -C Release --verbose --timeout 3600
+      # The nightly's wall-clock deadline: with a deadline already passed, each parity test must stop
+      # before its first batch, say so, and end with exit code 3 (what the nightly records INCOMPLETE).
+      - name: Parity tests stop cleanly at a deadline
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -u
+          now=$(date -u +%s); bad=0
+          for t in pe_parity:mie-pe-probe pe_analysis_parity:mie-pe-analysis-probe archive_parity:mie-archive-probe; do
+            test=${t%%:*}; probe=${t##*:}
+            MIE_PARITY_DEADLINE_UNIX=$now python3 engine/tests/$test.py build/$probe "$GITHUB_WORKSPACE" > deadline-$test.log 2>&1
+            code=$?
+            grep -E "^$test: (STOPPED AT THE DEADLINE|compared [0-9]+ damaged variants)" deadline-$test.log
+            echo "$test: exit code $code (3 expected)"
+            [ "$code" = 3 ] || { bad=1; tail -20 deadline-$test.log; }
+          done
+          exit $bad
       # The system calls the confined test child really makes, against the shipped allow list.
       # (The reviewer's ruling asks for this on the REAL worker with OpenSSL and YARA; that
       # program does not exist yet, so this step does not yet satisfy the ruling.)

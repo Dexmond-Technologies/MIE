@@ -12,14 +12,17 @@
 # What it does: fetches branch cpp/stage1 into its own clone, builds the fuzz targets with clang
 # from the pinned vcpkg commit, runs each target for FUZZ_SECONDS on its own core, saves the log,
 # the corpus and any crash input, and appends one JSON line per target to records.jsonl.
-# Then (part 2) it builds the engine's two executable probes and runs the parity tests of the
-# executable reader and its analysis against the Python reference on at least 200,000 damaged
-# variants with a new seed each night, and appends one JSON line per test.
+# Then (part 2) it builds the engine's probes and runs the parity tests of the executable
+# reader, its analysis and the zip/tar readers against the Python reference on at least 200,000
+# damaged variants each, with a new seed each night, and appends one JSON line per test. Part 2
+# stops cleanly at a wall-clock deadline (default 02:45 UTC): a test stopped there is recorded
+# INCOMPLETE with the number of variants it compared.
 #
 # It needs: git, cmake, ninja or make, clang with libFuzzer (compiler-rt), a C++ compiler for the
 # normal build, curl, zip, unzip, tar, pkg-config, python3 with the venv module. It needs no root
 # and opens no network listener. The only things it installs are Python packages into its own
-# virtual environment under the work folder (pefile 2024.8.26, and yara-python 4.5.1 if it can).
+# virtual environment under the work folder (pefile 2024.8.26 and yara-python 4.5.1; the archive
+# test needs yara-python because it builds the reference's own engine).
 # Network use: git fetch from GitHub (the repository and vcpkg), vcpkg's source downloads, and,
 # the first time, the Python package index for that virtual environment.
 #
@@ -36,9 +39,22 @@ TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe fuzz_zip fuzz_tar fuzz_signature
 # Second part of the night: the parity tests of the executable reader and of its analysis
 # against the Python reference, on far more damaged variants than a push runs (reviewer, board
 # B-3620: at least 200,000 per night). Set MIE_PARITY_TESTS to an empty value to leave it out.
-PARITY_TESTS="${MIE_PARITY_TESTS-pe_parity pe_analysis_parity}"
+# The archive readers were added by the reviewer's conditions before gate 3 (board B-3628).
+PARITY_TESTS="${MIE_PARITY_TESTS-pe_parity pe_analysis_parity archive_parity}"
 PARITY_TOTAL="${MIE_PE_TOTAL_VARIANTS:-200000}"
 PARITY_SEED="${MIE_PE_SEED:-$(date -u +%Y%m%d)}"     # a new seed every night, written in the log
+# Wall-clock deadline of part 2, HH:MM in UTC: the next such time after the start of the run.
+# Empty: no deadline. (COMMANDER_SEAT's choice for node4: start 21:30 UTC, deadline 02:45 UTC.)
+PARITY_DEADLINE_UTC="${MIE_PARITY_DEADLINE_UTC-02:45}"
+START_UNIX="$(date -u +%s)"
+PARITY_DEADLINE_UNIX=0
+if [ -n "$PARITY_DEADLINE_UTC" ]; then
+    PARITY_DEADLINE_UNIX="$(date -u -d "$(date -u +%F) $PARITY_DEADLINE_UTC" +%s)" || {
+        echo "MIE_PARITY_DEADLINE_UTC must be HH:MM" >&2; exit 2; }
+    if [ "$PARITY_DEADLINE_UNIX" -le "$START_UNIX" ]; then
+        PARITY_DEADLINE_UNIX=$((PARITY_DEADLINE_UNIX + 86400))
+    fi
+fi
 
 case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "MIE_FUZZ_SECONDS must be a whole number" >&2; exit 2;; esac
 
@@ -184,8 +200,10 @@ if [ -n "$PARITY_TESTS" ]; then
             python3 -m venv "$VENV" || exit 1
         fi
         "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check "pefile==2024.8.26" || exit 1
-        "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check "yara-python==4.5.1" ||
-            echo "yara-python 4.5.1 could not be installed for this Python; not needed by the two parity tests"
+        rm -f "$RUN_DIR/no-yara"
+        "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check "yara-python==4.5.1" || {
+            echo "yara-python 4.5.1 could not be installed for this Python: the archive test cannot run"
+            : >"$RUN_DIR/no-yara"; }
         "$VENV/bin/python" --version
         "$VENV/bin/python" -m pip list --disable-pip-version-check 2>/dev/null | grep -i -E '^(pefile|yara-python) '
         # The fuzz targets above are built with clang; this build uses the system's default
@@ -195,7 +213,7 @@ if [ -n "$PARITY_TESTS" ]; then
         rm -rf "$BUILD_ENGINE" &&
         cmake -S "$SRC/engine" -B "$BUILD_ENGINE" -DCMAKE_BUILD_TYPE=Release -DMIE_BUILD_TESTS=OFF \
               "-DCMAKE_TOOLCHAIN_FILE=$VCPKG/scripts/buildsystems/vcpkg.cmake" &&
-        cmake --build "$BUILD_ENGINE" --parallel "$(nproc)" --target mie-pe-probe mie-pe-analysis-probe
+        cmake --build "$BUILD_ENGINE" --parallel "$(nproc)" --target mie-pe-probe mie-pe-analysis-probe mie-archive-probe
     ) >"$RUN_DIR/parity-build.log" 2>&1 || parity_ready=0
 
     if [ "$parity_ready" = "0" ]; then
@@ -209,15 +227,23 @@ if [ -n "$PARITY_TESTS" ]; then
             case "$test" in
                 pe_parity) probe="mie-pe-probe" ;;
                 pe_analysis_parity) probe="mie-pe-analysis-probe" ;;
+                archive_parity) probe="mie-archive-probe" ;;
                 *) probe="" ;;
             esac
+            if [ "$test" = "archive_parity" ] && [ -e "$RUN_DIR/no-yara" ]; then
+                echo "yara-python 4.5.1 is not installed: the archive test needs it" >"$RUN_DIR/$test.log"
+                echo 2 >"$RUN_DIR/$test.exit"
+                continue
+            fi
             if [ -z "$probe" ] || [ ! -x "$BUILD_ENGINE/$probe" ]; then
                 echo "no probe for $test" >"$RUN_DIR/$test.log"
                 echo 2 >"$RUN_DIR/$test.exit"
                 continue
             fi
             (
-                MIE_PE_TOTAL_VARIANTS="$PARITY_TOTAL" MIE_PE_SEED="$PARITY_SEED" nice -n 10 \
+                MIE_PE_TOTAL_VARIANTS="$PARITY_TOTAL" MIE_PE_SEED="$PARITY_SEED" \
+                MIE_ARCHIVE_VARIANTS="$PARITY_TOTAL" MIE_ARCHIVE_SEED="$PARITY_SEED" \
+                MIE_PARITY_DEADLINE_UNIX="$PARITY_DEADLINE_UNIX" nice -n 10 \
                     "$VENV/bin/python" "$SRC/engine/tests/$test.py" "$BUILD_ENGINE/$probe" "$SRC" \
                     >"$RUN_DIR/$test.log" 2>&1
                 echo $? >"$RUN_DIR/$test.exit"
@@ -228,10 +254,14 @@ if [ -n "$PARITY_TESTS" ]; then
         for test in $PARITY_TESTS; do
             code="$(cat "$RUN_DIR/$test.exit" 2>/dev/null || echo missing)"
             log="$RUN_DIR/$test.log"
-            variants="$(sed -n 's/.* base files, \([0-9][0-9]*\) damaged variants.*/\1/p' "$log" | tail -1)"
+            # The count of damaged variants actually compared (every test prints this line).
+            variants="$(sed -n "s/^$test: compared \([0-9][0-9]*\) damaged variants.*/\1/p" "$log" | tail -1)"
             last="$(grep -E "^$test: [0-9]+ differences" "$log" | tail -1)"
             if [ "$code" = "0" ] && [ -n "$variants" ] && [ "$variants" -ge "$PARITY_TOTAL" ]; then
                 record "$test" "PASS" "$variants" "$log" "seed $PARITY_SEED; $last" parity
+            elif [ "$code" = "3" ]; then
+                overall=1
+                record "$test" "INCOMPLETE" "${variants:-0}" "$log" "seed $PARITY_SEED; $last; stopped at the deadline $PARITY_DEADLINE_UTC UTC after ${variants:-0} damaged variants; at least $PARITY_TOTAL are required" parity
             else
                 overall=1
                 record "$test" "FAILED" "${variants:-}" "$log" "seed $PARITY_SEED; exit code $code; ${last:-no result line}; at least $PARITY_TOTAL variants are required" parity
