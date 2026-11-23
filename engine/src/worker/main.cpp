@@ -105,7 +105,11 @@ bool write_answer(const json& body) {
         return false;
     }
     const bool written = std::fwrite(frame.data(), 1, frame.size(), stdout) == frame.size();
-    return std::fflush(stdout) == 0 && written;
+    const bool flushed = std::fflush(stdout) == 0;
+    // For the parent's log when an answer does not arrive whole: what this side handed to the system.
+    say("answer frame of " + std::to_string(frame.size()) + " bytes: written " + (written ? "yes" : "NO") +
+        ", flushed " + (flushed ? "yes" : "NO"));
+    return flushed && written;
 }
 
 #if defined(MIE_WORKER_TEST_HOOKS)
@@ -143,6 +147,7 @@ void test_fault(const std::string& kind) {
 #endif
 
 int run(int argc, char** argv) {
+    const Clock::time_point main_start = Clock::now();
     say("main reached");
 
     bool allow_unconfined = false;
@@ -245,6 +250,7 @@ int run(int argc, char** argv) {
         body["rules_library"] = mie::rules::RuleSet::library_version();
         body["usable"] = usable;
         body["why_unusable"] = why_unusable;
+        body["alive_ms"] = milliseconds_since(main_start);
         if (!write_answer(body)) {
             say("the answer could not be written");
             return mie::worker::kExitInternal;
@@ -275,6 +281,9 @@ int run(int argc, char** argv) {
         return mie::worker::kExitInternal;
     }
     body["result"] = json::parse(mie::to_json(result));
+    // From the first line of main to here: what the parent's time for this worker exceeds this
+    // by is the cost of starting, confining and ending the process.
+    body["alive_ms"] = milliseconds_since(main_start);
     if (write_answer(body)) {
         return mie::worker::kExitOk;
     }

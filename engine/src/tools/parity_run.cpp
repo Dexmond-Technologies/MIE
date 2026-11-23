@@ -18,6 +18,7 @@
 //
 // Until the confined worker exists this tool is for TEST FILES ONLY (generated sets).
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -87,14 +88,14 @@ std::string line_of(const json& record) {
 
 void usage() {
     std::fputs("usage: mie-parity-run --corpus DIR --out FILE.jsonl --rules DIR --reputation FILE --scoring FILE\n"
-               "                      [--no-reputation] [--details FILE.jsonl]\n",
+               "                      [--no-reputation] [--details FILE.jsonl] [--times FILE.jsonl]\n",
                stderr);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string corpus, out_path, rules_dir, reputation_path, scoring_path, details_path;
+    std::string corpus, out_path, rules_dir, reputation_path, scoring_path, details_path, times_path;
     bool use_reputation = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -118,6 +119,8 @@ int main(int argc, char** argv) {
             ok = value(scoring_path);
         } else if (arg == "--details") {
             ok = value(details_path);
+        } else if (arg == "--times") {
+            ok = value(times_path);
         } else if (arg == "--no-reputation") {
             use_reputation = false;
         } else {
@@ -180,7 +183,11 @@ int main(int argc, char** argv) {
     if (!details_path.empty()) {
         details.open(details_path, std::ios::binary | std::ios::trunc);
     }
-    if (!out || (!details_path.empty() && !details)) {
+    std::ofstream times;
+    if (!times_path.empty()) {
+        times.open(times_path, std::ios::binary | std::ios::trunc);
+    }
+    if (!out || (!details_path.empty() && !details) || (!times_path.empty() && !times)) {
         std::fputs("mie-parity-run: cannot open an output file\n", stderr);
         return 2;
     }
@@ -223,7 +230,14 @@ int main(int argc, char** argv) {
         if (!size_error) {
             record["size"] = size;
         }
+        const std::chrono::steady_clock::time_point scan_start = std::chrono::steady_clock::now();
         const mie::ScanResult result = engine.scan_file(path);
+        if (times.is_open()) {
+            times << line_of(json{{"path", relative},
+                                  {"total_ms", std::chrono::duration<double, std::milli>(
+                                                   std::chrono::steady_clock::now() - scan_start)
+                                                   .count()}});
+        }
         if (!result.hashes.sha256.empty()) {
             record["sha256"] = result.hashes.sha256;
         }

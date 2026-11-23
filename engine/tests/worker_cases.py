@@ -111,7 +111,13 @@ def main():
         confined, confined_details = os.path.join(tmp, 'confined.jsonl'), os.path.join(tmp, 'confined.details.jsonl')
         log = os.path.join(tmp, 'confined.log.jsonl')
 
-        code, out, err = run([PARITY_RUNNER, '--corpus', files, '--out', direct, '--details', direct_details] + common)
+        # --times: the unconfined runner's time per file, to put beside the confined worker's.
+        direct_times = os.path.join(tmp, 'direct.times.jsonl')
+        code, out, err = run([PARITY_RUNNER, '--corpus', files, '--out', direct, '--details', direct_details,
+                              '--times', direct_times] + common)
+        if code == 2:  # a runner without --times
+            direct_times = ''
+            code, out, err = run([PARITY_RUNNER, '--corpus', files, '--out', direct, '--details', direct_details] + common)
         print(out.strip(), flush=True)
         if code != 0:
             print('NOT RUN mie-parity-run failed (exit %d): %s' % (code, err.strip()[-800:]))
@@ -175,13 +181,39 @@ def main():
               (len(set(pids)) >= max(2, len(pids) // 2) and all(pids)),
               'A: one worker process per file: %d jobs, %d different worker process ids (the system may reuse a number)' % (
                   len(pids), len(set(pids))))
-        setup = sorted(j.get('setup_ms', 0.0) for j in scanned)
-        seconds = sorted(j.get('seconds', 0.0) for j in scanned)
         memory = max([j.get('peak_memory_bytes', 0) for j in scanned] or [0])
-        if setup:
-            print('MEASURED per job: set-up in the worker (table, rules compiled, engine built) median %.1f ms, '
-                  'max %.1f ms; whole worker run median %.3f s, max %.3f s; highest peak memory %d bytes' % (
-                      setup[len(setup) // 2], setup[-1], seconds[len(seconds) // 2], seconds[-1], memory), flush=True)
+
+        def spread(values):
+            values = sorted(values)
+            if not values:
+                return 'no values'
+            p95 = values[min(len(values) - 1, int(round(0.95 * (len(values) - 1))))]
+            return 'median %.1f, 95th percentile %.1f, max %.1f' % (values[len(values) // 2], p95, values[-1])
+
+        print('MEASURED per file, %d files, milliseconds (parent = the program that starts the workers):' % len(scanned))
+        for label, key in (('total in the parent (hash, start, worker, answer checked)', 'total_ms'),
+                           ('  parent: its own hash of the file', 'hash_ms'),
+                           ('  parent: from the start call to the worker\'s end', 'worker_run_ms'),
+                           ('    process start, confinement and end (worker run minus worker alive)', 'start_overhead_ms'),
+                           ('    worker alive: first line of main to its answer', 'worker_alive_ms'),
+                           ('      worker: table, RULES COMPILED, engine built', 'setup_ms'),
+                           ('      worker: the scan', 'scan_ms')):
+            print('  %-72s %s' % (label, spread([j.get(key, 0.0) for j in scanned])), flush=True)
+        print('  highest peak memory of a worker: %d bytes' % memory, flush=True)
+        if direct_times:
+            unconfined = [r.get('total_ms', 0.0) for r in records(direct_times)]
+            print('  %-72s %s' % ('UNCONFINED test runner, Engine::scan_file per file (%d files)' % len(unconfined),
+                                  spread(unconfined)), flush=True)
+            both = by_path(records(direct_times))
+            ratios = sorted((j.get('total_ms', 0.0) / max(both[j['path']]['total_ms'], 0.001), j['path'])
+                            for j in scanned if j.get('path') in both)
+            if ratios:
+                print('  confined total / unconfined total per file: median %.1f, max %.1f (%s)' % (
+                    ratios[len(ratios) // 2][0], ratios[-1][0], ratios[-1][1]), flush=True)
+        else:
+            print('  UNCONFINED test runner per file: NOT MEASURED (this mie-parity-run has no --times)', flush=True)
+        print('  (the unconfined runner compiles the rules once for all files; a worker compiles them for its one file)',
+              flush=True)
 
         # ---------------------------------------------------------------- part B
         small = os.path.join(tmp, 'small')

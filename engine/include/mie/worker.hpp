@@ -141,6 +141,12 @@ struct JobOutcome {
     std::int64_t worker_pid = 0;       // as the worker reports it (0 = unknown)
     double setup_ms = 0.0;             // worker: table, rules compiled, engine built
     double scan_ms = 0.0;              // worker: the scan itself
+    double worker_alive_ms = 0.0;      // worker: from the first line of main to its answer
+    // Measured by the PARENT (steady clock):
+    double hash_ms = 0.0;              // the parent's own hashing of the file (identity check)
+    double worker_run_ms = 0.0;        // from the start call to the worker's end, all collected
+    double start_overhead_ms = 0.0;    // worker_run_ms - worker_alive_ms: starting, confining, ending the process
+    double total_ms = 0.0;             // everything the parent did for this file
 };
 
 class Host {

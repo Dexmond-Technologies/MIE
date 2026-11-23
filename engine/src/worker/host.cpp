@@ -5,6 +5,7 @@
 // result, consistency rules, and the identity of the file.
 #include "mie/worker.hpp"
 
+#include <chrono>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
@@ -49,14 +50,46 @@ double number_field(const json& object, const char* key) {
     return it != object.end() && it->is_number() ? it->get<double>() : 0.0;
 }
 
+// What was received, for a log: how many bytes, the length the first four claim, the first
+// sixteen in hex. Never the content as text.
+std::string describe_output(const std::string& output) {
+    std::string text = std::to_string(output.size()) + " bytes received";
+    if (output.size() >= channel::kFrameHeaderBytes) {
+        const auto byte = [&](std::size_t i) { return static_cast<std::uint32_t>(static_cast<unsigned char>(output[i])); };
+        text += ", the frame says " + std::to_string((byte(0) << 24) | (byte(1) << 16) | (byte(2) << 8) | byte(3)) +
+                " bytes of text";
+    }
+    static const char kHex[] = "0123456789abcdef";
+    text += ", first bytes ";
+    for (std::size_t i = 0; i < output.size() && i < 16; ++i) {
+        const unsigned char value = static_cast<unsigned char>(output[i]);
+        text += kHex[value >> 4];
+        text += kHex[value & 0x0F];
+    }
+    return text;
+}
+
+// How a worker ended, for a log: end state, exit code, what the sandbox says (which holds the
+// first part of the worker's standard error), time and memory.
+std::string describe_child(const sandbox::ChildResult& child) {
+    return std::string("worker end ") + sandbox::to_string(child.end) + ", exit code " + std::to_string(child.exit_code) +
+           ", " + std::to_string(child.seconds) + " s, peak memory " + std::to_string(child.peak_memory_bytes) +
+           " bytes; " + printable(child.detail, 600);
+}
+
+double milliseconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 // The one frame a worker writes. False with `why` set if the output is not exactly one
 // usable answer frame.
 bool decode_answer(const std::string& output, json& body, std::string& why) {
     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(output.data()), output.size());
     const channel::DecodeResult decoded = channel::decode_frame(bytes);
     if (decoded.status != channel::DecodeStatus::Ok) {
-        why = decoded.status == channel::DecodeStatus::NeedMore ? "the answer is cut short"
-                                                                 : "the answer is not a frame: " + printable(decoded.error);
+        why = (decoded.status == channel::DecodeStatus::NeedMore ? std::string("the answer is cut short")
+                                                                  : "the answer is not a frame: " + printable(decoded.error)) +
+              " (" + describe_output(output) + ")";
         return false;
     }
     if (decoded.consumed != output.size()) {
@@ -156,6 +189,7 @@ bool Host::describe(Description& out, std::string& error) {
     }
     json body;
     if (!decode_answer(child.output, body, error)) {
+        error = "the worker's description is unusable: " + error + "; " + describe_child(child);
         return false;
     }
     Description description;
@@ -258,8 +292,10 @@ JobOutcome Host::scan_file(const std::filesystem::path& path) {
 }
 
 JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
+    const std::chrono::steady_clock::time_point job_start = std::chrono::steady_clock::now();
     ScanResult base = base_result(display_name);
     base.size = file.size();
+    double hash_ms = 0.0;
 
     // The parent's own hash of the file: plain hashing, no parsing. It is the identity the
     // worker's answer must name, and the identity of a result the parent writes itself.
@@ -277,6 +313,7 @@ JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
         }
         base.hashes = hashes;
         base.subject.sha256 = hashes.sha256;
+        hash_ms = milliseconds_since(job_start);
     }
 
     Job job;
@@ -290,53 +327,62 @@ JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
     job.rules = config_.rules;
 
     std::string error;
+    const std::chrono::steady_clock::time_point run_start = std::chrono::steady_clock::now();
     const sandbox::ChildResult child = run(job, &file, error);
+    const double worker_run_ms = milliseconds_since(run_start);
+    // Every abnormal end is a result for THIS file; the parent's times and the full account
+    // of how the worker ended go with it.
+    const auto failed = [&](const std::string& reason) {
+        JobOutcome outcome = abnormal(child, reason, std::move(base));
+        outcome.detail = describe_child(child);
+        outcome.hash_ms = hash_ms;
+        outcome.worker_run_ms = worker_run_ms;
+        outcome.total_ms = milliseconds_since(job_start);
+        return outcome;
+    };
     const std::string seconds = std::to_string(options_.limits.wall_seconds);
     switch (child.end) {
         case sandbox::ChildResult::End::Exited:
             break;
         case sandbox::ChildResult::End::KilledByTimeLimit:
-            return abnormal(child, "killed at the time limit of " + seconds + " seconds", std::move(base));
+            return failed("killed at the time limit of " + seconds + " seconds");
         case sandbox::ChildResult::End::KilledByMemoryLimit:
-            return abnormal(child,
-                            "ended at the memory limit of " + std::to_string(options_.limits.memory_bytes) + " bytes",
-                            std::move(base));
+            return failed("ended at the memory limit of " + std::to_string(options_.limits.memory_bytes) + " bytes");
         case sandbox::ChildResult::End::Crashed:
-            return abnormal(child, "crashed (" + printable(child.detail, 200) + ")", std::move(base));
+            return failed("crashed (" + printable(child.detail, 200) + ")");
         case sandbox::ChildResult::End::StartFailed:
-            return abnormal(child, "could not be started confined (" + printable(child.detail, 200) + ")",
-                            std::move(base));
+            return failed("could not be started confined (" + printable(child.detail, 200) + ")");
     }
     if (child.exit_code != kExitOk) {
-        return abnormal(child, "ended without an answer: " + exit_meaning(child.exit_code), std::move(base));
+        return failed("ended without an answer: " + exit_meaning(child.exit_code));
     }
 
     json body;
     std::string why;
     if (!decode_answer(child.output, body, why)) {
-        return abnormal(child, "unusable answer: " + why, std::move(base));
+        return failed("unusable answer: " + why);
     }
     const auto result_field = body.find("result");
     if (text_field(body, "kind") != "scan" || result_field == body.end() || !result_field->is_object()) {
-        return abnormal(child, "unusable answer: no result in it", std::move(base));
+        return failed("unusable answer: no result in it");
     }
     ScanResult result;
     if (!from_json(result_field->dump(-1, ' ', false, json::error_handler_t::replace), result, why)) {
-        return abnormal(child, "unusable answer: " + printable(why, 200), std::move(base));
+        return failed("unusable answer: " + printable(why, 200));
     }
     if (!consistent(result, why)) {
-        return abnormal(child, "unusable answer: " + printable(why, 200), std::move(base));
+        return failed("unusable answer: " + printable(why, 200));
     }
     if (result.engine_version != kEngineVersion) {
-        return abnormal(child, "unusable answer: another engine version", std::move(base));
+        return failed("unusable answer: another engine version");
     }
     if (options_.verify_identity && result.state != ScanState::NotScanned &&
         (result.hashes.sha256 != base.hashes.sha256 || result.size != base.size)) {
-        return abnormal(child, "unusable answer: it names another file than the one handed over", std::move(base));
+        return failed("unusable answer: it names another file than the one handed over");
     }
     const std::string worker_confinement = text_field(body, "confinement");
     if (options_.run.confine && !options_.run.allow_weaker && worker_confinement.rfind("WEAKER", 0) == 0) {
-        return abnormal(child, "it says it ran with a weaker confinement", std::move(base));
+        return failed("it says it ran with a weaker confinement");
     }
 
     JobOutcome outcome;
@@ -353,6 +399,11 @@ JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
     outcome.worker_pid = pid != body.end() && pid->is_number_integer() ? pid->get<std::int64_t>() : 0;
     outcome.setup_ms = number_field(body, "setup_ms");
     outcome.scan_ms = number_field(body, "scan_ms");
+    outcome.worker_alive_ms = number_field(body, "alive_ms");
+    outcome.hash_ms = hash_ms;
+    outcome.worker_run_ms = worker_run_ms;
+    outcome.start_overhead_ms = worker_run_ms > outcome.worker_alive_ms ? worker_run_ms - outcome.worker_alive_ms : 0.0;
+    outcome.total_ms = milliseconds_since(job_start);
     return outcome;
 }
 

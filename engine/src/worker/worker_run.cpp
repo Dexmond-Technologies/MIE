@@ -324,7 +324,12 @@ int main(int argc, char** argv) {
                                 {"seconds", outcome.seconds},
                                 {"peak_memory_bytes", outcome.peak_memory_bytes},
                                 {"setup_ms", outcome.setup_ms},
-                                {"scan_ms", outcome.scan_ms}});
+                                {"scan_ms", outcome.scan_ms},
+                                {"worker_alive_ms", outcome.worker_alive_ms},
+                                {"hash_ms", outcome.hash_ms},
+                                {"worker_run_ms", outcome.worker_run_ms},
+                                {"start_overhead_ms", outcome.start_overhead_ms},
+                                {"total_ms", outcome.total_ms}});
             log.flush();
         }
     }
