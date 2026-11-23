@@ -552,6 +552,22 @@ def build_cases():
         add(f'stamp_same_serial_real_first_{kind}', signed(
             pe, expired, [inter], timestamp=kind, tsa=real_counter, stamp_time=mid, stamp_after=[tsa]))
 
+    # the case that can tell WHICH time-stamping certificate was judged (r-01): two SUITABLE time-stamping
+    # certificates under the test root with the same issuer name and serial number and different keys.
+    # `stamper` makes the countersignature and is valid at the stamped time; `late_twin` is a proper
+    # time-stamping certificate too, but only valid from 100 days ago, i.e. NOT at the stamped time
+    # (600 days ago). The leaf is expired, so the file is valid only if the time-stamp is accepted.
+    # Judging `stamper` (the one that verified) accepts the time; judging `late_twin` does not.
+    # No asserted reference status; the shipped setting is asserted in main().
+    stamper = make_identity('Test TSA Two', issuer=root, eku=[ExtendedKeyUsageOID.TIME_STAMPING])
+    late_twin = make_identity('Test TSA Two', issuer=root, eku=[ExtendedKeyUsageOID.TIME_STAMPING],
+                              serial=stamper.cert.serial_number, not_before=NOW - 100 * DAY)
+    for kind in ('rfc3161', 'authenticode'):
+        add(f'stamp_two_suitable_other_first_{kind}', signed(
+            pe, expired, [inter], timestamp=kind, tsa=stamper, stamp_time=mid, stamp_before=[late_twin]))
+        add(f'stamp_two_suitable_real_first_{kind}', signed(
+            pe, expired, [inter], timestamp=kind, tsa=stamper, stamp_time=mid, stamp_after=[late_twin]))
+
     # not signed at all
     add('unsigned', pe, 'unsigned', False)
     add('unsigned_pe32', pe32, 'unsigned', False)
@@ -786,7 +802,10 @@ def main():
         os.mkdir(twins)
         stamp_twins = [f'stamp_same_serial_{order}_first_{kind}' for order in ('proper', 'real')
                        for kind in ('rfc3161', 'authenticode')]
-        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256', *stamp_twins):
+        stamp_pairs = [f'stamp_two_suitable_{order}_first_{kind}' for order in ('other', 'real')
+                       for kind in ('rfc3161', 'authenticode')]
+        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256', *stamp_twins,
+                     *stamp_pairs):
             with open(os.path.join(twins, name + '.bin'), 'wb') as f:
                 f.write(dict(inputs)[name])
         done = subprocess.run([PROBE, roots_path, pinned, policy_path, twins, 'shipped'], capture_output=True, timeout=600)
@@ -816,6 +835,16 @@ def main():
                   f"timestamp {r.get('timestamp')!r} ({r['detail'][:100]!r})")
             if not safe:
                 hard.append(f'{name}: the shipped setting accepts the timestamp of a certificate that did not make it: {c!r}')
+        for name in stamp_pairs:   # the certificate that verified the time-stamp is judged: the time is accepted
+            c = shipped.get(name)
+            r = reference_result(ref, dict(inputs)[name], roots_path, pinned, loaded_policy)
+            right = c is not None and c['status'] == 'valid' and c.get('timestamp') is not None
+            print(f"{'PASS' if right else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']} "
+                  f"timestamp {None if c is None else c.get('timestamp')!r} "
+                  f"({None if c is None else c['detail'][:90]!r}); the REFERENCE gives {r['status']} "
+                  f"timestamp {r.get('timestamp')!r} ({r['detail'][:90]!r})")
+            if not right:
+                hard.append(f'{name}: the shipped setting did not judge the certificate that made the time-stamp: {c!r}')
         c = shipped.get('valid_sha256') or {}
         print(f"NOTE  shipped setting, valid_sha256: status {c.get('status')} allowed {c.get('publisher_allowed')} "
               f"second check {c.get('second_check')} ({c.get('second_check_reason')!r})")
