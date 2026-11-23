@@ -21,6 +21,7 @@ ALLOWED = {
 # initialiser `.confine = ...`. (A positional brace initialiser of RunOptions would not be seen:
 # the struct's first members are not `confine`, and none exists in the sources today.)
 ASSIGNMENT = re.compile(r'(?:\.|->)\s*confine\s*=(?!=)')
+COPY = re.compile(r'(?:\.|->)\s*confine\s*=\s*[A-Za-z_][\w.]*(?:->[\w.]+)*\.confine\s*;')
 
 
 def main():
@@ -36,6 +37,11 @@ def main():
                     for number, line in enumerate(f, 1):
                         code = line.split('//', 1)[0]
                         if not ASSIGNMENT.search(code):
+                            continue
+                        # Copying the caller's choice into the library's own state
+                        # (`impl->confine = options.run.confine;`) sets nothing: what matters
+                        # is where a program chooses false, which the caller's line shows.
+                        if COPY.search(code):
                             continue
                         (allowed_hits if relative in ALLOWED else found).append(f'{relative}:{number}: {line.strip()}')
     for hit in allowed_hits:

@@ -306,8 +306,6 @@ std::vector<std::uint8_t> read_exactly(std::size_t count) {
     data.resize(have);
     return data;
 }
-    return std::strtoll(value, nullptr, 10);
-}
 
 // Tries to WRITE through the handed-over file. It was handed over read-only: must fail.
 void try_write_handle(Line& line) {
