@@ -1036,7 +1036,11 @@ def main():
                            else 'second check disagrees')
                 else:
                     alone = [names_of[d] for d in single if not cap_of(single[d].get(name))]
-                    why = ' + '.join(alone) if alone else 'other (no single switch alone)'
+                    # A further certificate-table entry is only verified with D-13 on, so a cap lost
+                    # on such an entry is lost to D-13 together with the rule that refuses it.
+                    together = ('D-13 together with D-21/D-22' if name.startswith('second_entry_')
+                                else 'two or more differences together')
+                    why = ' + '.join(alone) if alone else f'{together} (no single strict-* mode loses it)'
                 lost[why] = lost.get(why, 0) + 1
             print(f"SHIPPED {name}: parity {None if p_line is None else p_line['status']} cap={p_cap}; shipped walker "
                   f"{None if s_line is None else s_line['status']} cap={s_walker}; second check {second}; "
