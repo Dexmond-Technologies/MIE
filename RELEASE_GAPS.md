@@ -116,3 +116,17 @@ B''.
   "Malware Inspection Engine" is unchanged).
 - Whether to ship with "detection of real malware not measured" stated to users, or wait for
   the measurement (gap 4).
+
+## Release blocker: rule names (added 2026-11-23, branch cpp/stage1)
+
+OPEN, a release blocker for both engines (AGENT-LAW's view, relayed by COMMANDER_SEAT on
+2026-11-23): three rules in `rules/malware_families.yar` name real tools in their names and
+descriptions (`Mimikatz_Credential_Tool`, `Cobalt_Strike_Beacon`, `Metasploit_Payload`).
+AFTER gate 3, for the Python and the C++ engine together, and before MIE is promoted or
+released: rename them to `HackTool_Mimikatz_Credential_Access`,
+`DualUse_CobaltStrike_Beacon_Pattern` and `DualUse_Metasploit_Payload_Pattern`, move them into
+`rules/dual_use_tools.yar` with a dual-use header, re-record the rule hashes and re-run the
+reference. Not done before gate 3 because every parity comparison and the reference tables are
+pinned to today's rule hashes; the reviewer r-01 rules on the parity consequence then. Until
+then the README carries the trademark and dual-use statements.
+

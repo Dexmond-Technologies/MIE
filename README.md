@@ -2,6 +2,10 @@
 
 Licensed under the Apache License 2.0 (see `LICENSE`; attributions in `NOTICE` and `THIRD-PARTY-NOTICES`).
 
+Product and tool names in the detection rules are used only to identify what a rule detects. They are trademarks of their owners. Dexmond is not affiliated with them.
+
+Some rules match patterns associated with dual-use security tools that are also used legitimately (e.g. in authorised penetration testing). A match is not a finding of malicious intent.
+
 A second-opinion file scanner for Windows with a local web dashboard. It reads
 file bytes and checks them with its own YARA pattern rules, simple
 heuristics and a known-hash list, can watch four user folders for new files,

@@ -15,6 +15,7 @@ Not covered by the Apache 2.0 licence of this repository:
   trust/README.md).
 - rules/eicar.yar and data/reputation.json name the EICAR anti-virus test file (the test string
   is published by EICAR); no other third-party data is contained.
+- Product and tool names in the detection rules are used only to identify what a rule detects. They are trademarks of their owners. Dexmond is not affiliated with them.
 
 ==============================================================================
 1. CPython 3.12.16 (Python Software Foundation)
