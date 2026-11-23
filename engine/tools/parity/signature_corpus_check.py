@@ -76,9 +76,10 @@ def main():
             try:
                 done = subprocess.run([args.probe, roots, pinned, policy_path, one, args.profile],
                                       capture_output=True, timeout=600)
-                lines = [line for line in done.stdout.split(b'\n') if line.strip()]
+                lines = [json.loads(line.decode('ascii')) for line in done.stdout.split(b'\n') if line.strip()]
+                lines = [line for line in lines if 'file' in line]     # the first line is the probe's settings
                 if done.returncode == 0 and lines:
-                    c = json.loads(lines[0].decode('ascii'))
+                    c = lines[0]
                 else:
                     c['detail'] = f'probe exit code {done.returncode}'
             except subprocess.TimeoutExpired:

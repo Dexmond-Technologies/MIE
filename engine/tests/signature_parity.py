@@ -727,7 +727,10 @@ def main():
         for raw in done.stdout.split(b'\n'):
             if raw.strip():
                 line = json.loads(raw.decode('ascii'))
-                cpp[line['file'][:-4]] = line
+                if line.get('record') == 'settings':
+                    print('SETTINGS (parity comparison):', json.dumps(line, sort_keys=True))
+                else:
+                    cpp[line['file'][:-4]] = line
 
         counts = {}
         for name, data in inputs:
@@ -789,7 +792,8 @@ def main():
             r = ref.verify_portable('unused', store_path=store, pinned_sha256=pin, data=good_data,
                                     policy=loaded_policy, timeout=120.0)
             done = subprocess.run([PROBE, store, pin or '-', policy_path, good_only, 'parity'], capture_output=True, timeout=300)
-            c = json.loads(done.stdout.split(b'\n')[0].decode('ascii')) if done.returncode == 0 and done.stdout.strip() else {}
+            answers = [json.loads(x.decode('ascii')) for x in done.stdout.split(b'\n') if x.strip()] if done.returncode == 0 else []
+            c = next((x for x in answers if 'file' in x), {})
             same_text = r['detail'] == c.get('detail') or label == 'store missing'  # the OS error text differs
             ok = r['status'] == 'unavailable' and c.get('status') == 'unavailable' and same_text
             print(f"{'PASS' if ok else 'FAIL'}  {label}: reference {r['status']} {r['detail']!r}, "
@@ -817,7 +821,10 @@ def main():
             for raw in done.stdout.split(b'\n'):
                 if raw.strip():
                     line = json.loads(raw.decode('ascii'))
-                    out[line['file'][:-4]] = line
+                    if line.get('record') == 'settings':
+                        print(f'SETTINGS ({mode}):', json.dumps(line, sort_keys=True))
+                    else:
+                        out[line['file'][:-4]] = line
             return out
 
         def cap_of(line, with_second_check=False):
@@ -847,8 +854,9 @@ def main():
                     alone = [names_of[d] for d in single if not cap_of(single[d].get(name))]
                     why = ' + '.join(alone) if alone else 'other (no single switch alone)'
                 lost[why] = lost.get(why, 0) + 1
-            print(f"SHIPPED {name}: parity {None if p_line is None else p_line['status']} cap={p_cap}; shipped "
-                  f"{None if s_line is None else s_line['status']} cap={s_cap}; second check {second}"
+            print(f"SHIPPED {name}: parity {None if p_line is None else p_line['status']} cap={p_cap}; shipped walker "
+                  f"{None if s_line is None else s_line['status']} cap={s_walker}; second check {second}; "
+                  f"FINAL cap={s_cap}"
                   + (f'; cap lost to: {why}' if why else ''))
             if s_cap and not p_cap:
                 hard.append(f'{name}: the shipped setting grants a cap that parity does not: {s_line!r}')

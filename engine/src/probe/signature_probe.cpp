@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <span>
 #include <string>
 #include <system_error>
@@ -16,6 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mie/io.hpp"
 #include "mie/signature.hpp"
 
 namespace {
@@ -52,6 +54,29 @@ int main(int argc, char** argv) {
     const std::string policy_path = argv[3];
     if (policy_path != "-") options.policy = mie::signature::load_policy(read_text(policy_path));
 
+    // The settings this run REALLY uses, read back from the Options object (not from the mode
+    // name), as the first line of the output.
+    {
+        const json settings = {
+            {"record", "settings"},
+            {"mode", mode},
+            {"D-13 verify_every_entry", options.verify_every_entry},
+            {"D-17 accept_unread_fields", options.accept_unread_fields},
+            {"D-19 signer_by_second_lookup", options.signer_by_second_lookup},
+            {"D-20 accept_long_lengths", options.accept_long_lengths},
+            {"require_second_check", options.require_second_check},
+            {"second_check_called_by_probe_when_walker_valid", options.require_second_check},
+            {"file_handle_passed_to_second_check", true},
+            {"roots_loaded", options.roots_loaded},
+            {"pinned_sha256_given", !options.pinned_sha256.empty()},
+            {"now_unix", options.now_unix},
+            {"policy_publishers", options.policy.publishers.size()},
+            {"policy_issuing_intermediates", options.policy.issuing_intermediates.size()},
+        };
+        std::fputs(settings.dump(-1, ' ', true, json::error_handler_t::replace).c_str(), stdout);
+        std::fputc('\n', stdout);
+    }
+
     std::vector<std::filesystem::path> files;
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(argv[4], ec)) {
@@ -59,14 +84,30 @@ int main(int argc, char** argv) {
     }
     std::sort(files.begin(), files.end());
     for (const auto& path : files) {
-        std::ifstream in(path, std::ios::binary);
-        const std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        const std::span<const std::uint8_t> data(reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size());
+        // The file is opened ONCE through mie::io, as the engine does; the bytes are read from
+        // that handle and the same handle goes to the second check (WinVerifyTrust on Windows).
+        mie::io::IoError io_error;
+        const std::unique_ptr<mie::io::File> file = mie::io::open_regular(path, io_error);
+        std::vector<std::uint8_t> bytes;
+        std::intptr_t handle = -1;
+        if (file && file->size() <= mie::signature::kMaxVerifyBytes) {
+            bytes.resize(static_cast<std::size_t>(file->size()));
+            std::size_t done = 0;
+            while (done < bytes.size()) {
+                const std::int64_t got =
+                    file->read_at(done, std::span<std::uint8_t>(bytes.data() + done, bytes.size() - done), io_error);
+                if (got <= 0) break;
+                done += static_cast<std::size_t>(got);
+            }
+            bytes.resize(done);
+            handle = file->native_handle();
+        }
+        const std::span<const std::uint8_t> data(bytes.data(), bytes.size());
         const mie::signature::Precheck checked = mie::signature::precheck(data);
         const mie::signature::Result result = mie::signature::verify(data, options);
         const bool valid = result.status == "valid";
         mie::signature::SecondCheck second;
-        if (shipped && valid) second = mie::signature::second_check(data, result, options);
+        if (shipped && valid) second = mie::signature::second_check(data, result, options, handle);
         json line = {
             {"file", path.filename().string()},
             {"precheck_status", checked.status},
@@ -83,6 +124,7 @@ int main(int argc, char** argv) {
             {"certificate_table_verified", result.certificate_table_verified},
             {"second_check", shipped && valid ? json(second.agree) : json(nullptr)},
             {"second_check_reason", second.reason},
+            {"opened", file != nullptr},
         };
         // ASCII only, invalid UTF-8 replaced: the test splits the output on b'\n' alone.
         const std::string text = line.dump(-1, ' ', true, json::error_handler_t::replace);

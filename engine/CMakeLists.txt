@@ -215,7 +215,7 @@ if(WIN32)
 endif()
 
 add_executable(mie-signature-probe src/probe/signature_probe.cpp)
-target_link_libraries(mie-signature-probe PRIVATE mie_signature nlohmann_json::nlohmann_json)
+target_link_libraries(mie-signature-probe PRIVATE mie_signature mie_core nlohmann_json::nlohmann_json)
 
 add_executable(mie-archive-probe src/probe/archive_probe.cpp)
 target_link_libraries(mie-archive-probe PRIVATE mie_archive mie_core nlohmann_json::nlohmann_json)

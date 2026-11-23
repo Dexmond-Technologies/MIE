@@ -91,8 +91,15 @@ SecondCheck second_check(std::span<const std::uint8_t> data, const Result& walke
 
     WINTRUST_FILE_INFO file_info{};
     file_info.cbStruct = sizeof(file_info);
-    file_info.pcwszFilePath = L"";  // UNSURE, see above
     file_info.hFile = reinterpret_cast<HANDLE>(native_handle);
+    // The path string is taken FROM THE HANDLE (never from the caller): WinVerifyTrust's
+    // documentation wants a path besides the handle, and uses it to find the file type. If the
+    // system will not give one (UNSURE inside an AppContainer), an empty string is passed.
+    wchar_t path_of_handle[1024] = L"";
+    const DWORD path_length =
+        ::GetFinalPathNameByHandleW(file_info.hFile, path_of_handle, 1024, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (path_length == 0 || path_length >= 1024) path_of_handle[0] = L'\0';
+    file_info.pcwszFilePath = path_of_handle;
     GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     WINTRUST_DATA trust{};
     trust.cbStruct = sizeof(trust);
