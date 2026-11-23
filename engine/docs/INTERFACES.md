@@ -46,9 +46,15 @@ Transport:
 - Windows: named pipe `\\.\pipe\DexmondMIE.<user SID>.service`, byte mode, created with the
   current user as owner and as the only entry of the access list, remote clients rejected,
   first instance exclusive (this is also the single-instance rule). A client checks that the
-  pipe it opened is owned by the current user before it sends anything.
-- Linux, macOS: Unix-domain socket `service.sock` in `$XDG_RUNTIME_DIR/dexmond-mie/`, or in
-  `/tmp/dexmond-mie-<uid>/` when that variable is not set. The directory must be a real
+  pipe it opened is owned by the current user before it sends anything; the service checks that
+  the client process runs as the current user. A pipe of this name made by another account is
+  reported as an error, not as "already running". Known limit of version 1: the name is
+  predictable, so another account on the same computer can take it first and keep this user's
+  service from starting (it cannot read or answer anything); an unpredictable per-session name
+  part is planned.
+- Linux, macOS: Unix-domain socket `service.sock` in `$XDG_RUNTIME_DIR/dexmond-mie/`; when that
+  variable is not set, in `$XDG_CACHE_HOME/dexmond-mie/` or `$HOME/.cache/dexmond-mie/`. Never
+  under a shared directory such as `/tmp`, where another account could take the name first. The directory must be a real
   directory owned by the user with no access for anyone else: the service creates it 0700, the
   client checks it. The service checks the user id of every peer. Single instance: an exclusive
   lock on `service.sock.lock`.

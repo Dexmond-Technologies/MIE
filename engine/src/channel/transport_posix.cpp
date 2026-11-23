@@ -173,6 +173,17 @@ bool fill_address(const std::string& path, sockaddr_un& address, std::string& er
     return true;
 }
 
+std::string parent_of(const std::string& path) {
+    const std::size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) {
+        return ".";
+    }
+    if (slash == 0) {
+        return "/";
+    }
+    return path.substr(0, slash);
+}
+
 // The directory that holds the socket must be a real directory (not a link), owned by
 // the current user and closed to everyone else. The service creates it 0700 if it is
 // missing; a client only checks it, so another account cannot pose as the service.
@@ -198,6 +209,9 @@ bool directory_is_private(const std::string& directory, std::string& error) {
 }
 
 bool prepare_directory(const std::string& directory, std::string& error) {
+    // The level above (for example ~/.cache) may not exist yet on a fresh account.
+    // If this fails the next mkdir fails too and reports it.
+    ::mkdir(parent_of(directory).c_str(), 0700);
     if (::mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
         error = errno_text("mkdir");
         return false;
@@ -205,27 +219,26 @@ bool prepare_directory(const std::string& directory, std::string& error) {
     return directory_is_private(directory, error);
 }
 
-std::string parent_of(const std::string& path) {
-    const std::size_t slash = path.find_last_of('/');
-    if (slash == std::string::npos) {
-        return ".";
-    }
-    if (slash == 0) {
-        return "/";
-    }
-    return path.substr(0, slash);
-}
 
 }  // namespace
 
 Endpoint default_endpoint(std::string& error) {
     error.clear();
+    // Never a predictable name in a shared directory such as /tmp: another account could
+    // create it first and keep the service from starting. Only places the user owns.
     std::string directory;
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    const char* cache = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
     if (runtime != nullptr && runtime[0] == '/') {
         directory = std::string(runtime) + "/dexmond-mie";
+    } else if (cache != nullptr && cache[0] == '/') {
+        directory = std::string(cache) + "/dexmond-mie";
+    } else if (home != nullptr && home[0] == '/') {
+        directory = std::string(home) + "/.cache/dexmond-mie";
     } else {
-        directory = "/tmp/dexmond-mie-" + std::to_string(static_cast<unsigned long>(::geteuid()));
+        error = "no per-user directory: XDG_RUNTIME_DIR, XDG_CACHE_HOME and HOME are all unset";
+        return Endpoint{};
     }
     return Endpoint{directory + "/service.sock"};
 }

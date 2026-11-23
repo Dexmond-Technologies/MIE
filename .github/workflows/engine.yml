@@ -32,8 +32,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # vcpkg release tag 2026.10.16. Every third-party version follows from this one commit.
-  VCPKG_COMMIT: 5d4a3dc90c0b3773f3bac81bf41297b54328f471
+  # vcpkg release tag 2026.10.16 (the commit the tag points to). Every third-party version follows from this one commit.
+  VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
   VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
   VCPKG_DISABLE_METRICS: "1"

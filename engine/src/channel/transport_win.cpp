@@ -54,10 +54,10 @@ std::string narrow(const wchar_t* text) {
     return out;
 }
 
-// The current user's SID as binary (for comparisons) and as text (for names).
-bool current_user_sid(std::vector<BYTE>& token_user, std::string& sid_text, std::string& error) {
+// Reads the TOKEN_USER of the process `process` into `token_user`.
+bool token_user_of(HANDLE process, std::vector<BYTE>& token_user, std::string& error) {
     HANDLE token = nullptr;
-    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    if (!::OpenProcessToken(process, TOKEN_QUERY, &token)) {
         error = win_error("OpenProcessToken", ::GetLastError());
         return false;
     }
@@ -75,6 +75,14 @@ bool current_user_sid(std::vector<BYTE>& token_user, std::string& sid_text, std:
         return false;
     }
     ::CloseHandle(token);
+    return true;
+}
+
+// The current user's SID as binary (for comparisons) and as text (for names).
+bool current_user_sid(std::vector<BYTE>& token_user, std::string& sid_text, std::string& error) {
+    if (!token_user_of(::GetCurrentProcess(), token_user, error)) {
+        return false;
+    }
     const auto* user = reinterpret_cast<const TOKEN_USER*>(token_user.data());
     LPWSTR text = nullptr;
     if (!::ConvertSidToStringSidW(user->User.Sid, &text)) {
@@ -184,6 +192,29 @@ private:
     bool server_side_;
 };
 
+// True if the process at the other end of the pipe runs as the current user.
+bool client_is_current_user(HANDLE pipe) {
+    ULONG client_pid = 0;
+    if (!::GetNamedPipeClientProcessId(pipe, &client_pid)) {
+        return false;
+    }
+    const HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, client_pid);
+    if (process == nullptr) {
+        return false;
+    }
+    std::string ignored;
+    std::vector<BYTE> theirs;
+    const bool got_theirs = token_user_of(process, theirs, ignored);
+    ::CloseHandle(process);
+    std::vector<BYTE> ours;
+    if (!got_theirs || !token_user_of(::GetCurrentProcess(), ours, ignored)) {
+        return false;
+    }
+    const auto* their_user = reinterpret_cast<const TOKEN_USER*>(theirs.data());
+    const auto* our_user = reinterpret_cast<const TOKEN_USER*>(ours.data());
+    return ::EqualSid(their_user->User.Sid, our_user->User.Sid) != FALSE;
+}
+
 class WinServer final : public Server {
 public:
     WinServer(std::wstring name, std::wstring sddl, HANDLE first_instance)
@@ -259,6 +290,11 @@ public:
                     next_ = INVALID_HANDLE_VALUE;
                     return nullptr;
                 }
+            } else if (code == ERROR_NO_DATA) {
+                // A client connected and left before we looked. Make the instance
+                // listen again; this is not an error.
+                ::DisconnectNamedPipe(next_);
+                return nullptr;
             } else if (code != ERROR_PIPE_CONNECTED) {
                 error = win_error("ConnectNamedPipe", code);
                 ::CloseHandle(next_);
@@ -267,9 +303,19 @@ public:
             }
         }
         const HANDLE connected = next_;
-        // Keep one instance listening at all times so the name is never free.
+        // Keep one instance listening at all times so the name is never free. If the
+        // new instance cannot be created, next_ stays invalid and the next accept()
+        // reports the error instead of going on without a listener.
         DWORD code = 0;
         next_ = create_instance(name_, sddl_, false, code);
+        // The access list already admits the current user only. Checked again here so
+        // that the rule does not rest on the access list alone (same rule as the
+        // peer-user check of the Unix-socket transport).
+        if (!client_is_current_user(connected)) {
+            ::DisconnectNamedPipe(connected);
+            ::CloseHandle(connected);
+            return nullptr;  // not our user: dropped without a word
+        }
         return std::make_unique<WinConnection>(connected, true);
     }
 
@@ -335,7 +381,26 @@ std::unique_ptr<Server> listen(const Endpoint& endpoint, ListenStatus& status, s
     const HANDLE first = WinServer::create_instance(name, sddl, true, code);
     if (first == INVALID_HANDLE_VALUE) {
         if (code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY) {
-            status = ListenStatus::AlreadyRunning;
+            // A pipe of this name exists. It is "our service already running" only if
+            // that pipe belongs to the current user; a pipe of this name made by another
+            // account is reported as an error, never as "already running".
+            std::string probe_error;
+            const HANDLE existing = ::CreateFileW(name.c_str(), READ_CONTROL, 0, nullptr, OPEN_EXISTING,
+                                                  SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
+            if (existing != INVALID_HANDLE_VALUE) {
+                const bool ours = owned_by_current_user(existing, probe_error);
+                ::CloseHandle(existing);
+                if (ours) {
+                    status = ListenStatus::AlreadyRunning;
+                } else {
+                    error = "the endpoint name is held by a pipe of another account";
+                }
+            } else if (::GetLastError() == ERROR_PIPE_BUSY) {
+                // All instances are busy: it cannot be opened to look at its owner.
+                error = "the endpoint name is in use and its owner could not be checked";
+            } else {
+                error = "the endpoint name is held by a pipe that cannot be opened by this user";
+            }
         } else {
             error = win_error("CreateNamedPipeW", code);
         }
