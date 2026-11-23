@@ -1,11 +1,23 @@
 // mie-worker-run: the result table of mie-parity-run, but every scan goes through a
-// CONFINED WORKER (one worker process per file). A test tool, not a product program.
+// CONFINED WORKER (one worker process per file, in either shape of mie/worker.hpp). A test
+// tool, not a product program.
 //
 //   mie-worker-run --worker PROGRAM --corpus DIR --out FILE.jsonl --rules DIR
 //                  --reputation FILE --scoring FILE [--no-reputation] [--details FILE.jsonl]
 //                  [--log FILE.jsonl] [--wall SECONDS] [--memory BYTES]
+//                  [--pool N|proposed] [--max-age SECONDS] [--idle-before-first SECONDS]
+//                  [--reload-after RELATIVE/PATH]
 //                  [--test-fault RELATIVE/PATH=KIND]... [--unconfined] [--allow-weaker]
+//                  [--test-second-hand-over] [--test-die-waiting N] [--test-die-waiting-from K]
 //   mie-worker-run --sid
+//
+// --pool 0 (the default) is one worker STARTED per file (shape A, today's shipped shape);
+// --pool N > 0 keeps up to N PRE-STARTED one-shot workers (shape B, reviewer's ruling M-13);
+// "proposed" is 2, at most the number of processor cores. --max-age: a waiting worker older
+// than this is replaced (default 300). --idle-before-first: wait until the pool is full, then
+// this many seconds, before the first file (the "one file after idle" figure).
+// --reload-after: after that file, the configuration is read again and set (every waiting
+// worker is ended; reviewer's condition 5).
 //
 // --out and --details have EXACTLY the format of mie-parity-run (src/tools/parity_run.cpp),
 // header included, so `compare.py --identical` can show that the confined path gives the
@@ -19,6 +31,7 @@
 // --sid prints the AppContainer SID of the worker (Windows; empty elsewhere) so a test can
 // grant it read access to the program folder.
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +41,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -79,7 +93,9 @@ void usage() {
     std::fputs("usage: mie-worker-run --worker PROGRAM --corpus DIR --out FILE.jsonl --rules DIR --reputation FILE\n"
                "                      --scoring FILE [--no-reputation] [--details FILE.jsonl] [--log FILE.jsonl]\n"
                "                      [--wall SECONDS] [--memory BYTES] [--test-fault PATH=KIND]... [--unconfined]\n"
-               "                      [--allow-weaker]\n"
+               "                      [--allow-weaker] [--pool N|proposed] [--max-age SECONDS]\n"
+               "                      [--idle-before-first SECONDS] [--reload-after PATH] [--test-second-hand-over]\n"
+               "                      [--test-die-waiting N] [--test-die-waiting-from K]\n"
                "       mie-worker-run --sid\n",
                stderr);
 }
@@ -92,6 +108,8 @@ int main(int argc, char** argv) {
     std::map<std::string, std::string> faults;
     bool use_reputation = true;
     mie::sandbox::RunOptions run_options;
+    std::string pool_text = "0", max_age_text, idle_text, reload_after, die_waiting_text, die_from_text;
+    bool second_hand_over = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const auto value = [&](std::string& target) {
@@ -136,6 +154,20 @@ int main(int argc, char** argv) {
             } else {
                 ok = false;
             }
+        } else if (arg == "--pool") {
+            ok = value(pool_text);
+        } else if (arg == "--max-age") {
+            ok = value(max_age_text);
+        } else if (arg == "--idle-before-first") {
+            ok = value(idle_text);
+        } else if (arg == "--reload-after") {
+            ok = value(reload_after);
+        } else if (arg == "--test-die-waiting") {
+            ok = value(die_waiting_text);
+        } else if (arg == "--test-die-waiting-from") {
+            ok = value(die_from_text);
+        } else if (arg == "--test-second-hand-over") {
+            second_hand_over = true;
         } else if (arg == "--no-reputation") {
             use_reputation = false;
         } else if (arg == "--unconfined") {
@@ -175,6 +207,22 @@ int main(int argc, char** argv) {
     if (!memory_text.empty()) {
         options.limits.memory_bytes = std::strtoull(memory_text.c_str(), nullptr, 10);
     }
+    options.pool_size = pool_text == "proposed" ? mie::worker::proposed_pool_size() : std::atoi(pool_text.c_str());
+    if (!max_age_text.empty()) {
+        options.max_waiting_age_seconds = std::atof(max_age_text.c_str());
+    }
+    options.test_second_hand_over = second_hand_over;
+    options.test_die_while_waiting = die_waiting_text.empty() ? 0 : std::atoi(die_waiting_text.c_str());
+    options.test_die_while_waiting_from = die_from_text.empty() ? 0 : std::atoi(die_from_text.c_str());
+    const double idle_seconds = idle_text.empty() ? 0.0 : std::atof(idle_text.c_str());
+    if (options.pool_size < 0 || options.max_waiting_age_seconds <= 0.0 || idle_seconds < 0.0 ||
+        (options.pool_size > 0 && !run_options.confine)) {
+        std::fputs("mie-worker-run: --pool must be 0 or more, --max-age above 0; pre-started workers cannot run "
+                   "unconfined\n",
+                   stderr);
+        return 2;
+    }
+    const mie::worker::Config initial_config = config;
     if (options.limits.wall_seconds <= 0 || options.limits.memory_bytes == 0) {
         usage();
         return 2;
@@ -240,8 +288,54 @@ int main(int argc, char** argv) {
         {"rules_sha256", description.rules_sha256},
         {"options", json{{"use_reputation", use_reputation}, {"reputation_sha256", reputation_sha256}}},
         {"signature_checking", "not built: every signature is unavailable"},
+        // Reviewer's condition 6 of M-13: pool size and age in the result header. (compare.py
+        // --identical leaves header lines out; worker_cases compares the headers itself.)
+        {"worker_pool",
+         json{{"size", options.pool_size},
+              {"max_age_seconds", options.max_waiting_age_seconds},
+              {"shape", options.pool_size > 0 ? "pre-started one-shot workers (M-13)" : "one worker started per file"},
+              {"files_per_worker", mie::worker::kFilesPerWorker}}},
     };
     out << line_of(header);
+    const auto write_events = [&] {
+        for (const mie::worker::PoolEvent& happened : host.take_events()) {
+            if (log.is_open()) {
+                log << line_of(json{{"record", "pool"},
+                                    {"what", happened.what},
+                                    {"detail", happened.detail},
+                                    {"generation", happened.generation},
+                                    {"age_seconds", happened.age_seconds}});
+            }
+        }
+        if (log.is_open()) {
+            log.flush();
+        }
+    };
+    write_events();
+    if (idle_seconds > 0.0 && options.pool_size > 0) {
+        // Figure (a) of the reviewer's A-8 line: the pool full, nothing else running, then a pause.
+        const auto start = std::chrono::steady_clock::now();
+        const auto elapsed = [&] {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        };
+        while (!host.pool_full() && elapsed() < mie::worker::kReadyTimeoutSeconds) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        const double filled_after = elapsed();
+        while (elapsed() < filled_after + idle_seconds) {
+            host.maintain();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const bool full = host.pool_full();
+        write_events();
+        if (log.is_open()) {
+            log << line_of(json{{"record", "idle"},
+                                {"pool_filled_after_seconds", filled_after},
+                                {"idle_seconds", idle_seconds},
+                                {"pool_full_before_the_first_file", full}});
+            log.flush();
+        }
+    }
     if (log.is_open()) {
         log << line_of(json{{"record", "describe"},
                             {"worker", worker},
@@ -279,7 +373,10 @@ int main(int argc, char** argv) {
         }
         const auto fault = faults.find(relative);
         host.set_test_fault(fault != faults.end() ? fault->second : std::string());
+        host.maintain();
+        write_events();
         const mie::worker::JobOutcome outcome = host.scan_file(path);
+        write_events();
         const mie::ScanResult& result = outcome.result;
         answered += outcome.answered ? 1 : 0;
         if (!result.hashes.sha256.empty()) {
@@ -335,10 +432,34 @@ int main(int argc, char** argv) {
                                 {"hash_ms", outcome.hash_ms},
                                 {"worker_run_ms", outcome.worker_run_ms},
                                 {"start_overhead_ms", outcome.start_overhead_ms},
-                                {"total_ms", outcome.total_ms}});
+                                {"total_ms", outcome.total_ms},
+                                {"after_seal_ms", outcome.after_seal_ms},
+                                {"wait_ready_ms", outcome.wait_ready_ms},
+                                {"refill_ms", outcome.refill_ms},
+                                {"attempts", outcome.attempts},
+                                {"worker_generation", outcome.worker_generation},
+                                {"second_hand_over", outcome.second_hand_over},
+                                {"container_folder_note", outcome.container_folder_note}});
             log.flush();
         }
+        if (!reload_after.empty() && relative == reload_after) {
+            // Reviewer's condition 5 of M-13: the configuration changes; waiting workers end.
+            mie::worker::Config again;
+            if (!mie::worker::load_config(scoring_path, reputation_path, rules_dir, again, error)) {
+                std::fprintf(stderr, "mie-worker-run: %s\n", error.c_str());
+                return 2;
+            }
+            again.use_reputation = initial_config.use_reputation;
+            host.set_config(std::move(again));
+            write_events();
+            if (log.is_open()) {
+                log << line_of(json{{"record", "reloaded"}, {"after", relative}, {"generation", host.generation()}});
+                log.flush();
+            }
+        }
     }
+    host.shutdown();
+    write_events();
     out.flush();
     if (!out) {
         std::fputs("mie-worker-run: writing the result file failed\n", stderr);

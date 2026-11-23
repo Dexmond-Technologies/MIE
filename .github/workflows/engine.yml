@@ -167,6 +167,19 @@ jobs:
             --corpus "$RUNNER_TEMP/trace-set/files" --out "$RUNNER_TEMP/trace-table.jsonl" \
             --rules rules --reputation "$RUNNER_TEMP/trace-set/set_s.reputation.json" \
             --scoring engine/data/scoring.reference.json --wall 900
+      # The same in the pre-started shape (reviewer's ruling M-13): the trace must show what runs
+      # BEFORE THE SEAL (our own rule files and table only) and what runs after it.
+      - name: Sandbox allow list against a trace of the real worker, pre-started workers
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 engine/tools/sandbox_trace_check.py \
+            --source engine/src/sandbox/sandbox_posix.cpp \
+            --keep "$RUNNER_TEMP/worker-trace-pool.txt" -- \
+            build/mie-worker-run --worker build/mie-worker --pool 2 \
+            --corpus "$RUNNER_TEMP/trace-set/files" --out "$RUNNER_TEMP/trace-table-pool.jsonl" \
+            --rules rules --reputation "$RUNNER_TEMP/trace-set/set_s.reputation.json" \
+            --scoring engine/data/scoring.reference.json --wall 900
 
   sanitize:
     runs-on: ubuntu-latest

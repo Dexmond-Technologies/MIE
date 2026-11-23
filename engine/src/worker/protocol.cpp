@@ -72,7 +72,7 @@ std::string printable(const std::string& text, std::size_t limit) {
 
 std::string encode_job(const Job& job, std::string& error) {
     error.clear();
-    if (job.op != "scan" && job.op != "describe") {
+    if (job.op != "scan" && job.op != "describe" && job.op != "prepare") {
         error = "job: unknown operation";
         return std::string();
     }
@@ -109,7 +109,7 @@ std::string encode_job(const Job& job, std::string& error) {
         return std::string();
     }
     const std::size_t prefix = sizeof kJobMagic + 4;
-    if (total > kMaxJobBytes || prefix + header_text.size() + total > kMaxJobBytes) {
+    if (total > kMaxPreparationBytes || prefix + header_text.size() + total > kMaxPreparationBytes) {
         error = "job: scoring table, reputation list and rules together are over the limit";
         return std::string();
     }
@@ -131,19 +131,16 @@ std::string encode_job(const Job& job, std::string& error) {
 
 bool decode_job(std::span<const std::uint8_t> bytes, Job& out, std::string& error) {
     error.clear();
-    const std::size_t prefix = sizeof kJobMagic + 4;
-    if (bytes.size() > kMaxJobBytes) {
+    const std::size_t prefix = kJobPrefixBytes;
+    if (bytes.size() > kMaxPreparationBytes) {
         error = "job: larger than the limit";
         return false;
     }
-    if (bytes.size() < prefix || std::memcmp(bytes.data(), kJobMagic, sizeof kJobMagic) != 0) {
-        error = "job: not a job (wrong first bytes)";
+    std::size_t header_length = 0;
+    if (!job_header_length(bytes, header_length, error)) {
         return false;
     }
-    const std::size_t header_length = (static_cast<std::size_t>(bytes[8]) << 24) |
-                                      (static_cast<std::size_t>(bytes[9]) << 16) |
-                                      (static_cast<std::size_t>(bytes[10]) << 8) | static_cast<std::size_t>(bytes[11]);
-    if (header_length > kMaxJobHeaderBytes || header_length > bytes.size() - prefix) {
+    if (header_length > bytes.size() - prefix) {
         error = "job: the header length does not fit";
         return false;
     }
@@ -166,7 +163,7 @@ bool decode_job(std::span<const std::uint8_t> bytes, Job& out, std::string& erro
         !get_string(header, "test_fault", job.test_fault, error)) {
         return false;
     }
-    if (job.op != "scan" && job.op != "describe") {
+    if (job.op != "scan" && job.op != "describe" && job.op != "prepare") {
         error = "job: unknown operation";
         return false;
     }
@@ -249,6 +246,103 @@ bool decode_job(std::span<const std::uint8_t> bytes, Job& out, std::string& erro
     }
     if (!have_scoring || !have_reputation) {
         error = "job: the scoring table or the reputation list is missing";
+        return false;
+    }
+    out = std::move(job);
+    return true;
+}
+
+bool job_header_length(std::span<const std::uint8_t> prefix, std::size_t& header_length, std::string& error) {
+    if (prefix.size() < kJobPrefixBytes || std::memcmp(prefix.data(), kJobMagic, sizeof kJobMagic) != 0) {
+        error = "job: not a job (wrong first bytes)";
+        return false;
+    }
+    header_length = (static_cast<std::size_t>(prefix[8]) << 24) | (static_cast<std::size_t>(prefix[9]) << 16) |
+                    (static_cast<std::size_t>(prefix[10]) << 8) | static_cast<std::size_t>(prefix[11]);
+    if (header_length == 0 || header_length > kMaxJobHeaderBytes) {
+        error = "job: the header length is not allowed";
+        return false;
+    }
+    return true;
+}
+
+bool job_sections_length(std::span<const std::uint8_t> header_text, std::size_t& sections_length, std::string& error) {
+    const char* const begin = reinterpret_cast<const char*>(header_text.data());
+    const json header = json::parse(begin, begin + header_text.size(), nullptr, false);
+    if (header.is_discarded() || !header.is_object()) {
+        error = "job: the header is not a JSON object";
+        return false;
+    }
+    const auto sections = header.find("sections");
+    if (sections == header.end() || !sections->is_array() || sections->size() > kMaxRuleFiles + 2) {
+        error = "job: the list of sections is missing or too long";
+        return false;
+    }
+    std::size_t total = 0;
+    for (const json& record : *sections) {
+        const auto size = record.is_object() ? record.find("size") : record.end();
+        if (!record.is_object() || size == record.end() || !size->is_number_unsigned()) {
+            error = "job: a section has no size";
+            return false;
+        }
+        const std::uint64_t value = size->get<std::uint64_t>();
+        if (value > kMaxPreparationBytes || total + value > kMaxPreparationBytes) {
+            error = "job: the sections are over the limit";
+            return false;
+        }
+        total += static_cast<std::size_t>(value);
+    }
+    if (kJobPrefixBytes + header_text.size() + total > kMaxPreparationBytes) {
+        error = "job: larger than the limit";
+        return false;
+    }
+    sections_length = total;
+    return true;
+}
+
+std::string encode_file_job(const FileJob& job, std::string& error) {
+    error.clear();
+    // The display name is text for people only: it is cut until the ENCODED job fits (escaping
+    // can make a name several times longer); a cut character is replaced by the encoder.
+    std::string name = job.display_name;
+    if (name.size() > kMaxFileJobDisplayNameBytes) {
+        name.resize(kMaxFileJobDisplayNameBytes);
+    }
+    for (;;) {
+        const json body = {{"v", kJobVersion}, {"display_name", name}, {"test_fault", job.test_fault}};
+        std::string text = body.dump(-1, ' ', true, json::error_handler_t::replace);
+        if (text.size() <= sandbox::kMaxJobBytes) {
+            return text;
+        }
+        if (name.empty()) {
+            error = "file job: larger than the hand-over allows even without a display name";
+            return std::string();
+        }
+        name.resize(name.size() / 2);
+    }
+}
+
+bool decode_file_job(std::span<const std::uint8_t> bytes, FileJob& out, std::string& error) {
+    if (bytes.empty() || bytes.size() > sandbox::kMaxJobBytes) {
+        error = "file job: empty or too large";
+        return false;
+    }
+    const char* const begin = reinterpret_cast<const char*>(bytes.data());
+    const json body = json::parse(begin, begin + bytes.size(), nullptr, false);
+    if (body.is_discarded() || !body.is_object()) {
+        error = "file job: not a JSON object";
+        return false;
+    }
+    if (!only_keys(body, {"v", "display_name", "test_fault"}, error)) {
+        return false;
+    }
+    const auto version = body.find("v");
+    if (version == body.end() || !version->is_number_integer() || version->get<std::int64_t>() != kJobVersion) {
+        error = "file job: unknown version";
+        return false;
+    }
+    FileJob job;
+    if (!get_string(body, "display_name", job.display_name, error) || !get_string(body, "test_fault", job.test_fault, error)) {
         return false;
     }
     out = std::move(job);

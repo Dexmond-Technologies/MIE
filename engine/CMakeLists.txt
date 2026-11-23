@@ -288,7 +288,7 @@ if(MIE_BUILD_TESTS)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_cases.py
                      $<TARGET_FILE:mie-worker-run> $<TARGET_FILE:mie-worker> $<TARGET_FILE:mie-worker-testhooks>
                      $<TARGET_FILE:mie-parity-run> ${MIE_REPO_ROOT})
-    set_tests_properties(worker_cases PROPERTIES TIMEOUT 3000)
+    set_tests_properties(worker_cases PROPERTIES TIMEOUT 5400)
     add_test(NAME set_s_parity
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/set_s_parity.py
                      $<TARGET_FILE:mie-parity-run> ${MIE_REPO_ROOT})
