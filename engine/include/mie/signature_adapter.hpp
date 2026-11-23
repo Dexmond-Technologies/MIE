@@ -22,6 +22,13 @@ public:
         out.status = checked.status;
         out.publisher = checked.publisher;  // empty when the reference has None
         out.publisher_allowed = checked.status == "valid" && checked.publisher_allowed;
+        // Shipped profile (reviewer's condition 8): the walker alone never grants the cap.
+        // This interface carries no file handle, so on Windows the second check answers
+        // "disagree" (no cap) until the pipeline passes the handle.
+        if (out.publisher_allowed && options_.require_second_check &&
+            !signature::second_check(data, checked, options_).agree) {
+            out.publisher_allowed = false;
+        }
         return out;
     }
 

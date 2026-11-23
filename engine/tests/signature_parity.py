@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -48,7 +49,7 @@ sys.path.insert(0, REPO)
 
 from cryptography import x509  # noqa: E402
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa  # noqa: E402
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID  # noqa: E402
 
 NOW = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
@@ -99,7 +100,10 @@ OID_SPC_PE_IMAGE = '1.3.6.1.4.1.311.2.1.15'
 OID_MS_TIMESTAMP = '1.3.6.1.4.1.311.3.3.1'
 OID_PAGE_HASH_V2 = '1.3.6.1.4.1.311.2.3.2'
 OID_RSA = '1.2.840.113549.1.1.1'
-DIGESTS = {'sha1': ('1.3.14.3.2.26', hashes.SHA1), 'sha256': ('2.16.840.1.101.3.4.2.1', hashes.SHA256)}
+DIGESTS = {'sha1': ('1.3.14.3.2.26', hashes.SHA1), 'sha256': ('2.16.840.1.101.3.4.2.1', hashes.SHA256),
+           'md5': ('1.2.840.113549.2.5', hashes.MD5)}
+OID_NESTED_SIGNATURE = '1.3.6.1.4.1.311.2.4.1'
+OID_LIFETIME_SIGNING = '1.3.6.1.4.1.311.10.3.13'
 PAGE_HASH_CLASS_ID = bytes.fromhex('a6b586d5b4a12466ae05a217da8e60d6')
 
 
@@ -154,9 +158,15 @@ def issuer_and_serial(identity):
 def signer_info(identity, digest, attrs):
     """A SignerInfo whose signed attributes are `attrs` (each a DER attribute)."""
     body = b''.join(sorted(attrs))
-    signature = identity.key.sign(der(0x31, body), padding.PKCS1v15(), DIGESTS[digest][1]())
+    algorithm = DIGESTS[digest][1]()
+    if isinstance(identity.key, rsa.RSAPrivateKey):
+        signature, key_oid = identity.key.sign(der(0x31, body), padding.PKCS1v15(), algorithm), OID_RSA
+    elif isinstance(identity.key, dsa.DSAPrivateKey):
+        signature, key_oid = identity.key.sign(der(0x31, body), algorithm), '1.2.840.10040.4.1'
+    else:
+        signature, key_oid = identity.key.sign(der(0x31, body), ec.ECDSA(algorithm)), '1.2.840.10045.2.1'
     return signature, [der_int(1), issuer_and_serial(identity), alg_id(digest), der(0xA0, body),
-                       seq(oid(OID_RSA), der(0x05)), der(0x04, signature)]
+                       seq(oid(key_oid), der(0x05)), der(0x04, signature)]
 
 
 # ----------------------------------------------------------------------------- executables
@@ -239,7 +249,7 @@ def page_hash_entries(pe, pairs):
 
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
-                      wrong_stamp_digest=False, page_hashes=None):
+                      wrong_stamp_digest=False, page_hashes=None, nested=None):
     """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`."""
     spc = spc_indirect(pe, digest, page_hashes)
     spc_contents = spc[len(spc) - len(seq_contents(spc)):]
@@ -249,13 +259,16 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
     signature, fields = signer_info(leaf, digest, attrs)
     certs = [leaf.der] + [c.der for c in extra_certs]
     stamped = hashlib.sha256(b'wrong' if wrong_stamp_digest else signature).digest()
+    unsigned = []
+    if nested:
+        unsigned.append(attribute(OID_NESTED_SIGNATURE, *nested))
     if timestamp == 'authenticode':
         when = stamp_time.strftime('%y%m%d%H%M%SZ').encode()
         counter_attrs = [attribute(OID_CONTENT_TYPE, oid(OID_DATA)),
                          attribute(OID_SIGNING_TIME, der(0x17, when)),
                          attribute(OID_MESSAGE_DIGEST, der(0x04, stamped))]
         _, counter_fields = signer_info(tsa, 'sha256', counter_attrs)
-        fields.append(der(0xA1, attribute(OID_COUNTER_SIGNATURE, seq(*counter_fields))))
+        unsigned.append(attribute(OID_COUNTER_SIGNATURE, seq(*counter_fields)))
         certs.append(tsa.der)
     elif timestamp == 'rfc3161':
         when = stamp_time.strftime('%Y%m%d%H%M%SZ').encode()
@@ -267,7 +280,9 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
         token = seq(oid(OID_SIGNED_DATA), der(0xA0, seq(
             der_int(3), der(0x31, alg_id('sha256')), seq(oid(OID_TST_INFO), der(0xA0, der(0x04, tst))),
             der(0xA0, tsa.der), der(0x31, seq(*token_fields)))))
-        fields.append(der(0xA1, attribute(OID_MS_TIMESTAMP, token)))
+        unsigned.append(attribute(OID_MS_TIMESTAMP, token))
+    if unsigned:
+        fields.append(der(0xA1, b''.join(unsigned)))
     signed_data = seq(der_int(1), der(0x31, alg_id(digest)), seq(oid(OID_SPC_INDIRECT), der(0xA0, spc)),
                       der(0xA0, b''.join(certs)), der(0x31, seq(*fields)))
     return seq(oid(OID_SIGNED_DATA), der(0xA0, signed_data))
@@ -476,6 +491,46 @@ def build_cases():
     add('page_hashes_offset_decreasing',
         signed(pe, leaf, [inter], page_hashes=struct.pack('<I', 0x200) + bytes(32) + struct.pack('<I', 0) + bytes(32)))
 
+    # reviewer's condition 6: other key types, MD5, nested signatures, lifetime signing. No asserted
+    # status (the reference's answer is not known from reading): compared with the reference only.
+    # A case that cannot even be built here is printed as NOT RUN, with the reason.
+    def extra(name, build):
+        try:
+            add(name, build())
+        except Exception as e:  # noqa: BLE001
+            print(f'NOT RUN  {name}: cannot be built here ({type(e).__name__}: {e})')
+
+    def with_key(key):
+        return make_identity('Test Publisher', issuer=inter, org='Test Publisher', eku=code, key=key)
+
+    extra('signer_dsa_2048', lambda: signed(pe, with_key(dsa.generate_private_key(key_size=2048)), [inter]))
+    extra('signer_ecdsa_p256', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP256R1())), [inter]))
+    extra('signer_ecdsa_p384', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP384R1())), [inter]))
+    extra('digest_md5', lambda: signed(pe, leaf, [inter], digest='md5'))
+    inner = authenticode_blob(pe, leaf, [inter], digest='sha1')
+    extra('nested_one_level', lambda: signed(pe, leaf, [inter], nested=[inner]))
+    extra('nested_two_levels', lambda: signed(
+        pe, leaf, [inter], nested=[authenticode_blob(pe, leaf, [inter], digest='sha1', nested=[inner])]))
+    extra('nested_two_side_by_side', lambda: signed(pe, leaf, [inter], nested=[inner, inner]))
+    extra('nested_untrusted', lambda: signed(
+        pe, leaf, [inter], nested=[authenticode_blob(pe, untrusted_leaf, [other_inter, other_root])]))
+    extra('nested_not_signed_data', lambda: signed(pe, leaf, [inter], nested=[garbage]))
+    lifetime = code + [x509.ObjectIdentifier(OID_LIFETIME_SIGNING)]
+    extra('lifetime_no_stamp', lambda: signed(
+        pe, make_identity('Test Publisher', issuer=inter, org='Test Publisher', eku=lifetime), [inter]))
+    extra('lifetime_with_stamp', lambda: signed(
+        pe, make_identity('Test Publisher', issuer=inter, org='Test Publisher', eku=lifetime), [inter],
+        timestamp='rfc3161', tsa=tsa, stamp_time=NOW - 10 * DAY))
+
+    def lifetime_expired():
+        return make_identity('Test Publisher', issuer=inter, org='Test Publisher', eku=lifetime,
+                             not_before=NOW - 800 * DAY, not_after=NOW - 400 * DAY)
+    extra('lifetime_expired_no_stamp', lambda: signed(pe, lifetime_expired(), [inter]))
+    extra('lifetime_expired_stamp_rfc3161', lambda: signed(
+        pe, lifetime_expired(), [inter], timestamp='rfc3161', tsa=tsa, stamp_time=mid))
+    extra('lifetime_expired_stamp_authenticode', lambda: signed(
+        pe, lifetime_expired(), [inter], timestamp='authenticode', tsa=tsa, stamp_time=mid))
+
     # not signed at all
     add('unsigned', pe, 'unsigned', False)
     add('unsigned_pe32', pe32, 'unsigned', False)
@@ -525,6 +580,80 @@ def own_text(detail):
     return error_class(detail) is None and 'not valid at' not in detail
 
 
+def engine_part(ref, inputs, tmp, roots_path, pinned, policy):
+    """Reviewer's condition 5 (board B-3630): does the reference ENGINE give another score, verdict
+    or finding for a signature that is 'invalid' than for one that is 'unavailable' or 'unsigned'?
+    Part 1 scans named cases with the real check (throwaway store). Part 2 scans ONE file with
+    the signature step forced to each answer in turn, so that nothing but the answer differs.
+    Returns the lines that must fail the test."""
+    from dexmond_mie.core import Engine
+    failures = []
+    work = os.path.join(tmp, 'engine')
+    os.mkdir(work)
+    rules_copy = os.path.join(work, 'rules')
+    shutil.copytree(os.path.join(REPO, 'rules'), rules_copy)
+    rep_copy = os.path.join(work, 'reputation.json')
+    shutil.copy(os.path.join(REPO, 'data', 'reputation.json'), rep_copy)
+
+    def scan(name, verifier):
+        engine = Engine(rules_dir=rules_copy, reputation_db=rep_copy, use_reputation=False, auto_evolution=False,
+                        signature_verifier=verifier, trusted_publishers=policy['publishers'])
+        path = os.path.join(work, name + '.exe')
+        with open(path, 'wb') as f:
+            f.write(inputs[name])
+        result = engine.scan_file(path)
+        signature = (result.get('details') or {}).get('signature')
+        view = {'score': result.get('score'), 'verdict': result.get('verdict'),
+                'findings': sorted((f.get('category', ''), f.get('weight'), f.get('description', ''))
+                                   for f in result.get('findings', []))}
+        return view, signature
+
+    def real(path, data=None, scanned_stat=None):
+        return ref.verify_portable(path, store_path=roots_path, pinned_sha256=pinned, data=data,
+                                   scanned_stat=scanned_stat, policy=policy, timeout=120.0)
+
+    print('--- the reference ENGINE on named cases (real signature check, throwaway store) ---')
+    reached = False
+    for name in ('valid_sha256', 'publisher_not_listed', 'digest_mismatch', 'bytes_appended', 'untrusted_root',
+                 'second_entry_not_signed_data', 'unsigned'):
+        if name not in inputs:
+            continue
+        view, signature = scan(name, real)
+        reached = reached or signature is not None
+        status = signature.get('status') if signature else 'SIGNATURE STEP NOT REACHED (the executable did not parse)'
+        print(f"ENGINE {name}: signature {status}; score {view['score']} {view['verdict']!r}; "
+              f"findings {json.dumps(view['findings'])}")
+
+    print('--- the reference ENGINE on ONE file with the signature answer forced ---')
+    forced = {}
+    for label, answer in (
+            ('invalid', {'status': 'invalid', 'publisher': None, 'detail': 'forced A'}),
+            ('invalid, other text', {'status': 'invalid', 'publisher': None, 'detail': 'signify: X: forced B'}),
+            ('unavailable', {'status': 'unavailable', 'publisher': None, 'detail': 'verification error: forced C'}),
+            ('unsigned', {'status': 'unsigned', 'publisher': None, 'detail': 'forced D'}),
+            ('valid, publisher not allowed', {'status': 'valid', 'publisher': policy['publishers'][0],
+                                              'publisher_allowed': False, 'detail': 'forced E'}),
+            ('valid, publisher allowed', {'status': 'valid', 'publisher': policy['publishers'][0],
+                                          'publisher_allowed': True, 'detail': 'forced F'})):
+        view, signature = scan('digest_mismatch', lambda path, data=None, scanned_stat=None, a=answer: dict(a))
+        forced[label] = view
+        print(f"FORCED {label}: step reached: {signature is not None}; score {view['score']} {view['verdict']!r}; "
+              f"findings {json.dumps(view['findings'])}")
+        reached = reached and signature is not None
+    if not reached:
+        print('NOT RUN  the engine never reached its signature step on these files; the question is not answered')
+        failures.append('engine part: the reference engine did not reach its signature step')
+        return failures
+    base = forced['invalid']
+    for label in ('invalid, other text', 'unavailable', 'unsigned', 'valid, publisher not allowed'):
+        same = forced[label] == base
+        print(f"{'PASS' if same else 'FAIL'}  engine result for '{label}' equals the result for 'invalid': {same}")
+        if not same:
+            failures.append(f"engine part: '{label}' gives {forced[label]!r}, 'invalid' gives {base!r}: "
+                            f'the split between these answers changes the result and must be reproduced')
+    return failures
+
+
 def main():
     from dexmond_mie import signature as ref
     cases, variants, roots_pem, policy, mutations = build_cases()
@@ -547,7 +676,7 @@ def main():
             with open(os.path.join(files, name + '.bin'), 'wb') as f:
                 f.write(data)
 
-        done = subprocess.run([PROBE, roots_path, pinned, policy_path, files], capture_output=True, timeout=1800)
+        done = subprocess.run([PROBE, roots_path, pinned, policy_path, files, 'parity'], capture_output=True, timeout=1800)
         if done.returncode != 0:
             print('FAIL  the probe ended with code', done.returncode, done.stderr.decode('utf-8', 'replace')[-2000:])
             return 1
@@ -616,7 +745,7 @@ def main():
                                   ('store hash wrong', roots_path, '0' * 64)):
             r = ref.verify_portable('unused', store_path=store, pinned_sha256=pin, data=good_data,
                                     policy=loaded_policy, timeout=120.0)
-            done = subprocess.run([PROBE, store, pin or '-', policy_path, good_only], capture_output=True, timeout=300)
+            done = subprocess.run([PROBE, store, pin or '-', policy_path, good_only, 'parity'], capture_output=True, timeout=300)
             c = json.loads(done.stdout.split(b'\n')[0].decode('ascii')) if done.returncode == 0 and done.stdout.strip() else {}
             same_text = r['detail'] == c.get('detail') or label == 'store missing'  # the OS error text differs
             ok = r['status'] == 'unavailable' and c.get('status') == 'unavailable' and same_text
@@ -624,6 +753,8 @@ def main():
                   f"C++ {c.get('status')} {c.get('detail')!r}")
             if not ok:
                 hard.append(f'{label}: reference {r!r}, C++ {c!r}')
+
+        hard.extend(engine_part(ref, dict(inputs), tmp, roots_path, pinned, loaded_policy))
 
     print(f'seed {SEED}; named cases {len(cases)}; damaged variants {len(variants)}')
     print('reference statuses over all inputs:', json.dumps(counts, sort_keys=True))

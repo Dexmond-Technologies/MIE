@@ -67,6 +67,18 @@ struct Options {
     // D-13: the reference verifies only the FIRST certificate-table entry (the others are
     // parsed, not verified). ON: every entry must verify like the first, else "invalid".
     bool verify_every_entry = false;
+
+    // ---- parity-only leniency, OFF by default (= the shipped profile) -------------------
+    // D-17: the reference never looks at five fields of a signature (SignedData.version,
+    // SignerInfo.version, SignerInfo.signatureAlgorithm, TSTInfo.policy,
+    // TSTInfo.serialNumber) and accepts anything there. ON: the same. OFF: each must be
+    // what the format says, or the signature is refused.
+    bool accept_unread_fields = false;
+
+    // ---- shipped profile only, OFF in the parity profile ---------------------------------
+    // The walker alone never grants the cap: a second, independent check (second_check)
+    // must agree. Applied by the caller (mie/signature_adapter.hpp), not by verify().
+    bool require_second_check = false;
 };
 
 struct Result {
@@ -86,6 +98,9 @@ struct Result {
     bool certificate_table_verified = false;
     std::uint64_t cert_offset = 0;
     std::uint64_t cert_size = 0;
+    // "valid" only: the moment (seconds since 1970) at which the chain was checked: the
+    // trusted countersignature time, or now.
+    std::int64_t checked_at_unix = 0;
 };
 
 // signature.py verify_portable with data given and no file to re-stat. No timeout here:
@@ -97,5 +112,18 @@ Result verify(std::span<const std::uint8_t> data, const Options& options);
 bool load_roots_file(const std::string& path, Options& options);
 
 std::string sha256_hex(std::span<const std::uint8_t> data);
+
+// The second, independent check of a signature the walker called "valid" (second_check.cpp;
+// reviewer's condition 8). Linux and macOS: OpenSSL's own PKCS#7 verification of the first
+// certificate-table entry against the pinned roots. Windows: WinVerifyTrust on the open
+// file handle (`native_handle`, the HANDLE value; without one the answer is "disagree").
+// `agree` is true only if the walker's result is "valid" AND this check reaches the same
+// signer, issuer and file digest. On disagreement there is no cap.
+struct SecondCheck {
+    bool agree = false;
+    std::string reason;
+};
+SecondCheck second_check(std::span<const std::uint8_t> data, const Result& walker, const Options& options,
+                         std::intptr_t native_handle = -1);
 
 }  // namespace mie::signature

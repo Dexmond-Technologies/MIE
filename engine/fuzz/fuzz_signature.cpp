@@ -6,7 +6,10 @@
 // The root store is empty (its pinned hash is the SHA-256 of nothing), so no chain can
 // succeed: a result of "valid" is a bug and aborts.
 //
-// The first input byte chooses switches: bit 0 turns D-13 (verify every entry) on.
+// The first input byte chooses switches: bit 0 turns D-13 (verify every entry) on; bit 1
+// turns D-17 (five unread fields accepted) on; bit 2 also runs the second check
+// (second_check.cpp: on Linux OpenSSL's own PKCS#7 parser and verification) on the same
+// bytes, whatever the walker said. With an empty store it can never agree: "agree" aborts.
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -60,6 +63,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     options.pinned_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     options.now_unix = 1795000000;  // fixed, so that a finding reproduces
     options.verify_every_entry = (switches & 1) != 0;
+    options.accept_unread_fields = (switches & 2) != 0;
 
     const mie::signature::Precheck checked = mie::signature::precheck(file);
     const mie::signature::Result result = mie::signature::verify(file, options);
@@ -70,5 +74,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     if (result.status == "valid" || result.publisher_allowed || result.certificate_table_verified) std::abort();
     if (checked.status != "ok" && result.status != checked.status) std::abort();
     if (checked.status == "ok" && (checked.entries == 0 || checked.primary_der.empty())) std::abort();
+    if ((switches & 4) != 0) {
+        const mie::signature::SecondCheck second = mie::signature::second_check(file, result, options);
+        if (second.agree || second.reason.empty()) std::abort();
+    }
     return 0;
 }

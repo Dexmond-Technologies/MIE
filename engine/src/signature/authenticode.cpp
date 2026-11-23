@@ -15,6 +15,8 @@
 // fails closed. The list is in work/mie-cpp/SIGNATURE_INTEGRATION.md.
 #include "mie/signature.hpp"
 
+#include "internal.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -148,9 +150,23 @@ bool read_tlv(Bytes& in, Tlv& out) {
 // verify_signature), TSTInfo.policy and TSTInfo.serialNumber (properties only,
 // authenticode/tsp.py:57 and :75). None of them is covered by a signature, and none is
 // used by this code either, so accepting them unread changes no decision.
-Tlv skip_unread(Bytes& in, const char* what) {
+//
+// This is numbered difference D-17 and a DATA switch (Options::accept_unread_fields): ON
+// in the parity profile only. OFF (the default, the shipped profile) each of the five must
+// carry its proper tag, or the signature is refused. The switch is held for the length of
+// one verify() call in a thread-local, set and cleared by UnreadFieldsScope.
+thread_local bool g_accept_unread_fields = false;
+struct UnreadFieldsScope {
+    explicit UnreadFieldsScope(bool on) { g_accept_unread_fields = on; }
+    ~UnreadFieldsScope() { g_accept_unread_fields = false; }
+    UnreadFieldsScope(const UnreadFieldsScope&) = delete;
+    UnreadFieldsScope& operator=(const UnreadFieldsScope&) = delete;
+};
+Tlv skip_unread(Bytes& in, std::uint8_t strict_tag, const char* what) {
     Tlv out;
-    if (!read_tlv(in, out)) throw Fail{"ValueError", std::string("ASN.1: ") + what};
+    if (!read_tlv(in, out) || (!g_accept_unread_fields && out.tag != strict_tag)) {
+        throw Fail{"ValueError", std::string("ASN.1: ") + what};
+    }
     return out;
 }
 
@@ -416,7 +432,7 @@ void require_single(const std::vector<Attr>& attrs, const std::array<std::uint8_
 // signify.pkcs7.SignerInfo.__init__ / _validate_asn1 and its subclasses.
 Signer parse_signer(Bytes content, SignerKind kind) {
     Signer out;
-    skip_unread(content, "SignerInfo.version");
+    skip_unread(content, 0x02, "SignerInfo.version");
     Tlv sid;
     if (!read_tlv(content, sid)) throw Fail{"ValueError", "ASN.1: SignerInfo.sid"};
     if (sid.tag == 0x80 || sid.tag == 0xA0) {
@@ -438,8 +454,9 @@ Signer parse_signer(Bytes content, SignerKind kind) {
         out.auth = parse_attributes(next.content);
         if (!read_tlv(content, next)) throw Fail{"ValueError", "ASN.1: SignerInfo"};
     }
-    // `next` is SignerInfo.signatureAlgorithm: never read by the reference, any element is accepted
-    // (see skip_unread). An element with tag [0] cannot arrive here: it was taken as the signed attributes.
+    // `next` is SignerInfo.signatureAlgorithm: never read by the reference; with D-17 on any element is
+    // accepted (see skip_unread). An element with tag [0] cannot arrive here: it was taken as the signed attributes.
+    if (!g_accept_unread_fields && next.tag != 0x30) throw Fail{"ValueError", "ASN.1: SignerInfo.signatureAlgorithm"};
     out.signature = expect(content, 0x04, "SignerInfo.signature").content;
     if (!content.empty()) {
         const Tlv unsigned_attrs = expect(content, 0xA1, "SignerInfo.unsignedAttrs");
@@ -502,7 +519,7 @@ struct SignedData {
 // the content of the SignedData SEQUENCE.
 SignedData parse_signed_data(Bytes content, DataKind kind) {
     SignedData out;
-    skip_unread(content, "SignedData.version");
+    skip_unread(content, 0x02, "SignedData.version");
     Bytes algorithms = expect(content, 0x31, "SignedData.digestAlgorithms").content;
     while (!algorithms.empty()) {
         if (out.digest_algs.size() >= kMaxAttributes) throw Fail{"ValueError", "too many digest algorithms"};
@@ -862,12 +879,12 @@ Countersignature read_countersignature(const Signer& primary) {
         if (version.content.size() != 1 || version.content[0] != 1) {
             throw Fail{"AuthenticodeParseError", "TSTInfo.version must be v1"};
         }
-        skip_unread(info, "TSTInfo.policy");
+        skip_unread(info, 0x06, "TSTInfo.policy");
         Bytes imprint = expect(info, 0x30, "TSTInfo.messageImprint").content;
         const Tlv algorithm = expect(imprint, 0x30, "TSTInfo.messageImprint.hashAlgorithm");
         out.imprint_alg = digest_algorithm(algorithm, "TSTInfo.messageImprint.hashAlgorithm");
         out.imprint = expect(imprint, 0x04, "TSTInfo.messageImprint.hashedMessage").content;
-        skip_unread(info, "TSTInfo.serialNumber");
+        skip_unread(info, 0x02, "TSTInfo.serialNumber");
         const Tlv stamp = expect(info, 0x18, "TSTInfo.genTime");
         if (!der_time_epoch(stamp, out.time)) throw Fail{"ValueError", "TSTInfo.genTime cannot be read"};
         return out;
@@ -1368,6 +1385,7 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     out.issuer_spki_sha256 = spki_sha256(issuer);
     out.timestamp = signing_time ? iso_utc(*signing_time) : std::string();
     out.certificate_table_verified = true;
+    out.checked_at_unix = when;
     out.cert_offset = checked.cert_offset;
     out.cert_size = checked.cert_size;
     return out;
@@ -1552,6 +1570,7 @@ Result verify(std::span<const std::uint8_t> data, const Options& options) {
     }
     const Precheck checked = precheck(data);
     if (checked.status != "ok") return make_result(checked.status, checked.detail);
+    const UnreadFieldsScope unread_fields(options.accept_unread_fields);
 
     // signature.py load_pinned_store
     if (options.pinned_sha256.empty()) {
@@ -1582,5 +1601,33 @@ Result verify(std::span<const std::uint8_t> data, const Options& options) {
     ERR_clear_error();
     return out;
 }
+
+// ---- for the second check (second_check.cpp); declared in src/signature/internal.hpp ----
+namespace detail {
+
+bool primary_view(std::span<const std::uint8_t> data, PrimaryView& out) {
+    try {
+        const Precheck checked = precheck(data);
+        if (checked.status != "ok") return false;
+        const UnreadFieldsScope strict(false);
+        const SignedData primary =
+            parse_content_info(checked.primary_der, DataKind::Authenticode, "ParseError", "not SignedData");
+        const IndirectData indirect = parse_indirect_data(primary);
+        const DigestAlg algorithm = digest_algorithm(indirect.digest_alg, "SpcIndirectDataContent.digestAlgorithm");
+        out.entry_der = checked.primary_der;
+        out.content_whole = primary.content.whole;
+        out.content_inside = primary.content.content;
+        out.digest_name = algorithm.name;
+        out.signed_digest.assign(indirect.digest.begin(), indirect.digest.end());
+        out.image_digest = fingerprint(data, signify_layout(data), algorithm.md, 0, data.size(), 0);
+        return true;
+    } catch (const Fail&) {
+        return false;
+    } catch (const OverBudget&) {
+        return false;
+    }
+}
+
+}  // namespace detail
 
 }  // namespace mie::signature
