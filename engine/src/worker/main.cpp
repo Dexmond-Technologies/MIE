@@ -1,0 +1,320 @@
+// mie-worker: the low-rights process that parses untrusted bytes. One file, then it ends.
+//
+// What it does, in this order (WORKER_NOTES.md):
+//   1. one line on standard error ("main reached"), so a parent that gets nothing else
+//      knows the program started;
+//   2. what needs the disk to start (the hash library) is touched BEFORE the confinement;
+//      no untrusted byte has been read yet;
+//   3. the confinement: the worker REFUSES to go on if it was not started confined or if
+//      the confinement cannot be applied (exit code 43, no answer). There is no silent
+//      weaker run;
+//   4. the job is read from standard input: scoring table, reputation list and the text of
+//      every rule file. The worker opens no path. Rules are compiled from source;
+//   5. the one file handed over by the parent is scanned through the pipeline;
+//   6. the answer is written as one channel frame on standard output.
+//
+// The shipped program takes NO arguments and honours NO test switch: a job that carries a
+// test fault is refused (exit code 45). The same source is built a second time as
+// mie-worker-testhooks with MIE_WORKER_TEST_HOOKS; that program is never installed or
+// packaged, and only the tests start it.
+//
+// The Authenticode check is not wired in: every signature is "unavailable" (no cap).
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <new>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+#include <nlohmann/json.hpp>
+
+#include "mie/channel/frame.hpp"
+#include "mie/engine.hpp"
+#include "mie/hash.hpp"
+#include "mie/result.hpp"
+#include "mie/rules.hpp"
+#include "mie/sandbox.hpp"
+#include "mie/scoring.hpp"
+#include "mie/version.hpp"
+#include "mie/worker.hpp"
+
+namespace {
+
+using nlohmann::json;
+using Clock = std::chrono::steady_clock;
+
+double milliseconds_since(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+std::int64_t own_process_id() {
+#if defined(_WIN32)
+    return static_cast<std::int64_t>(_getpid());
+#else
+    return static_cast<std::int64_t>(::getpid());
+#endif
+}
+
+void say(const std::string& text) {
+    std::fputs(("mie-worker: " + text + "\n").c_str(), stderr);
+    std::fflush(stderr);
+}
+
+// Standard input to its end, but never more than the job limit plus one byte.
+bool read_job_bytes(std::vector<std::uint8_t>& out) {
+    out.clear();
+    std::vector<std::uint8_t> block(1u << 16);
+    for (;;) {
+        const std::size_t got = std::fread(block.data(), 1, block.size(), stdin);
+        if (got > 0) {
+            const std::size_t before = out.size();
+            out.resize(before + got);
+            std::memcpy(out.data() + before, block.data(), got);
+            if (out.size() > mie::worker::kMaxJobBytes) {
+                return false;
+            }
+        }
+        if (got < block.size()) {
+            return std::ferror(stdin) == 0;
+        }
+    }
+}
+
+bool write_answer(const json& body) {
+    mie::channel::Message message;
+    message.id = 1;
+    message.type = mie::channel::MessageType::Response;
+    message.op = mie::worker::kAnswerOp;
+    message.body = body;
+    const std::string frame = mie::channel::encode_frame(message);
+    if (frame.empty()) {
+        return false;
+    }
+    const bool written = std::fwrite(frame.data(), 1, frame.size(), stdout) == frame.size();
+    return std::fflush(stdout) == 0 && written;
+}
+
+#if defined(MIE_WORKER_TEST_HOOKS)
+// TEST BUILD ONLY. Makes this worker fail in a chosen way after it is confined and has
+// read its job, so the tests can show what the parent does with a worker that hangs,
+// dies or runs out of memory.
+void test_fault(const std::string& kind) {
+    if (kind == "spin") {
+        volatile bool keep_going = true;
+        volatile unsigned long long counter = 0;
+        while (keep_going) {
+            counter = counter + 1;
+        }
+    } else if (kind == "crash") {
+#if defined(_WIN32)
+        // An access violation: on Windows abort() is an ordinary exit with code 3, not a crash.
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
+#else
+        std::abort();
+#endif
+    } else if (kind == "allocate") {
+        // Until an allocation is refused: exit_on_out_of_memory() then ends the process
+        // with the out-of-memory exit code (or the parent's watch on memory kills it).
+        std::vector<std::unique_ptr<char[]>> blocks;
+        volatile bool keep_going = true;
+        while (keep_going) {
+            const std::size_t size = 16u * 1024 * 1024;
+            std::unique_ptr<char[]> block(new char[size]);
+            std::memset(block.get(), 0x5A, size);
+            blocks.push_back(std::move(block));
+        }
+    }
+}
+#endif
+
+int run(int argc, char** argv) {
+    say("main reached");
+
+    bool allow_unconfined = false;
+#if defined(MIE_WORKER_TEST_HOOKS)
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--test-allow-unconfined") == 0) {
+            allow_unconfined = true;
+        } else {
+            say("unknown argument");
+            return mie::worker::kExitUsage;
+        }
+    }
+#else
+    (void)argv;
+    if (argc > 1) {
+        say("this program takes no arguments");
+        return mie::worker::kExitUsage;
+    }
+#endif
+
+    // Before the confinement: the hash library reads what it needs to start. Trusted
+    // input only (nothing); no untrusted byte has been read.
+    (void)mie::sha256_hex(std::span<const std::uint8_t>{});
+    mie::sandbox::exit_on_out_of_memory();
+
+    std::string confinement;
+    if (std::getenv("MIE_SANDBOX") != nullptr) {
+        std::string error;
+        if (!mie::sandbox::enter_confinement(confinement, error)) {
+            say("the confinement could not be applied: " + error);
+            return mie::worker::kExitNotConfined;
+        }
+    } else if (allow_unconfined) {
+        confinement = "WEAKER: not confined (test switch --test-allow-unconfined)";
+    } else {
+        say("refusing to run: this process was not started confined");
+        return mie::worker::kExitNotConfined;
+    }
+
+    // From here on nothing is opened by path.
+    const Clock::time_point setup_start = Clock::now();
+    std::vector<std::uint8_t> job_bytes;
+    if (!read_job_bytes(job_bytes)) {
+        say("the job could not be read or is over the limit");
+        return mie::worker::kExitBadJob;
+    }
+    mie::worker::Job job;
+    std::string error;
+    if (!mie::worker::decode_job(job_bytes, job, error)) {
+        say(error);
+        return mie::worker::kExitBadJob;
+    }
+    job_bytes.clear();
+    job_bytes.shrink_to_fit();
+
+    if (!job.test_fault.empty()) {
+#if defined(MIE_WORKER_TEST_HOOKS)
+        test_fault(job.test_fault);
+#else
+        say("the job carries a test switch; this build has no test hooks");
+        return mie::worker::kExitTestSwitch;
+#endif
+    }
+
+    mie::ScoringTable table;
+    std::string table_error;
+    const bool table_ok = mie::load_scoring_table(job.scoring_json, table, table_error);
+    const std::unique_ptr<mie::rules::RuleSet> rules = mie::rules::RuleSet::load_sources(job.rules);
+    job.rules.clear();
+    job.rules.shrink_to_fit();
+
+    mie::EngineOptions options;
+    options.use_reputation = job.use_reputation;
+    const mie::UnavailableSignatureVerifier no_signatures;
+    const mie::Engine engine(table, *rules, job.reputation_json, options, &no_signatures);
+    std::string why_unusable;
+    bool usable = table_ok && engine.usable(why_unusable);
+    if (!table_ok) {
+        why_unusable = "scoring table: " + table_error;
+    }
+    const double setup_ms = milliseconds_since(setup_start);
+
+    json body = {{"confinement", confinement},
+                 {"self", mie::sandbox::describe_self()},
+                 {"pid", own_process_id()},
+                 {"setup_ms", setup_ms}};
+
+    if (job.op == "describe") {
+        json rule_errors = json::array();
+        for (const mie::rules::RuleFileError& rule_error : rules->errors()) {
+            rule_errors.push_back(mie::worker::printable(rule_error.file + ": " + rule_error.error, 400));
+        }
+        body["kind"] = "describe";
+        body["engine_version"] = mie::kEngineVersion;
+        body["profile"] = table_ok ? table.profile : std::string();
+        body["rules_state"] = mie::to_string(rules->state());
+        body["rules_sha256"] = rules->sha256();
+        body["rule_files"] = rules->file_hashes();
+        body["rule_errors"] = rule_errors;
+        body["rules_library"] = mie::rules::RuleSet::library_version();
+        body["usable"] = usable;
+        body["why_unusable"] = why_unusable;
+        if (!write_answer(body)) {
+            say("the answer could not be written");
+            return mie::worker::kExitInternal;
+        }
+        return mie::worker::kExitOk;
+    }
+
+    if (!table_ok) {
+        // Without a scoring table no result can even be labelled; the parent writes it.
+        say(why_unusable);
+        return mie::worker::kExitBadJob;
+    }
+
+    std::string file_error;
+    const std::unique_ptr<mie::io::File> file = mie::sandbox::inherited_file(file_error);
+    if (!file) {
+        say("no file was handed over: " + file_error);
+        return mie::worker::kExitNoFile;
+    }
+
+    const Clock::time_point scan_start = Clock::now();
+    mie::ScanResult result = engine.scan_open(*file, job.display_name);
+    body["kind"] = "scan";
+    body["scan_ms"] = milliseconds_since(scan_start);
+    std::string why_inconsistent;
+    if (!mie::consistent(result, why_inconsistent)) {
+        say("the engine produced an inconsistent result: " + why_inconsistent);
+        return mie::worker::kExitInternal;
+    }
+    body["result"] = json::parse(mie::to_json(result));
+    if (write_answer(body)) {
+        return mie::worker::kExitOk;
+    }
+
+    // The result does not fit one frame (very many or very long findings). The findings
+    // are left out and the result says so; it is then not a full result and never CLEAN.
+    if (result.state != mie::ScanState::NotScanned) {
+        const std::string note = "the result was larger than one message; its findings were left out";
+        result.reason = result.reason.empty() ? note : result.reason + "; " + note;
+        result.state = mie::ScanState::NotFullyScanned;
+        result.verdict = mie::kNotFullyScannedVerdict;
+        result.findings.clear();
+        body["result"] = json::parse(mie::to_json(result));
+        if (write_answer(body)) {
+            return mie::worker::kExitOk;
+        }
+    }
+    say("the answer could not be written");
+    return mie::worker::kExitInternal;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    try {
+        return run(argc, argv);
+    } catch (const std::bad_alloc&) {
+        std::fputs("mie-worker: out of memory\n", stderr);
+        return mie::sandbox::kOutOfMemoryExitCode;
+    } catch (const std::exception& problem) {
+        std::fputs("mie-worker: ", stderr);
+        std::fputs(mie::worker::printable(problem.what()).c_str(), stderr);
+        std::fputs("\n", stderr);
+        return mie::worker::kExitInternal;
+    } catch (...) {
+        std::fputs("mie-worker: an unknown error\n", stderr);
+        return mie::worker::kExitInternal;
+    }
+}

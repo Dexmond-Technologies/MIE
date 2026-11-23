@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "mie/result.hpp"
+#include "mie/rule_sources.hpp"
 
 namespace mie::rules {
 
@@ -50,6 +51,11 @@ public:
     // not a top-level "auto_generated.yar": the reference never loads those). Never fails:
     // a directory with no usable rules gives a rule set in state Off.
     static std::unique_ptr<RuleSet> load(const std::filesystem::path& directory);
+
+    // The same from rule SOURCE TEXT that is already in memory (the confined worker gets the
+    // rule files' text from its parent and opens no path). `sources` as
+    // collect_rule_sources() gives them. Never a compiled-rules file.
+    static std::unique_ptr<RuleSet> load_sources(const std::vector<RuleSource>& sources);
 
     RulesState state() const;
     std::size_t files_loaded() const;

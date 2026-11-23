@@ -135,6 +135,20 @@ jobs:
             --keep "$RUNNER_TEMP/sandbox-trace.txt" -- \
             build/mie-sandbox-testparent build/mie-sandbox-testchild \
             --file "$RUNNER_TEMP/trace-sample.bin" -- read-handle
+      # The reviewer's ruling (board B-3627): the allow list must come from a trace of the REAL
+      # worker, with the rule library and OpenSSL inside, on the test files.
+      - name: Sandbox allow list against a trace of the real worker
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/trace-set" --no-large
+          python3 engine/tools/sandbox_trace_check.py \
+            --source engine/src/sandbox/sandbox_posix.cpp \
+            --keep "$RUNNER_TEMP/worker-trace.txt" -- \
+            build/mie-worker-run --worker build/mie-worker \
+            --corpus "$RUNNER_TEMP/trace-set/files" --out "$RUNNER_TEMP/trace-table.jsonl" \
+            --rules rules --reputation "$RUNNER_TEMP/trace-set/set_s.reputation.json" \
+            --scoring engine/data/scoring.reference.json --wall 900
 
   sanitize:
     runs-on: ubuntu-latest

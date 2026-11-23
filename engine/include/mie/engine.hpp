@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "mie/archive.hpp"
+#include "mie/io.hpp"
 #include "mie/result.hpp"
 #include "mie/rules.hpp"
 #include "mie/scoring.hpp"
@@ -81,6 +82,10 @@ public:
     // Scans one file. The file is opened once through mie::io (links, directories, pipes,
     // devices and cloud-only files are refused: "not scanned").
     ScanResult scan_file(const std::filesystem::path& path) const;
+
+    // Scans a file that is ALREADY OPEN: the confined worker's entry, where the parent opened
+    // the file and handed over the one handle. `display_name` is text for people only.
+    ScanResult scan_open(io::File& file, std::string display_name) const;
 
     // Scans bytes that are already in memory (an archive member). `depth` is the nesting
     // depth (0 = a top-level file); `budget` is shared by the whole top-level scan.

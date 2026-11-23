@@ -81,6 +81,7 @@ add_library(mie_core STATIC
   src/core/hash.cpp
   src/core/io_common.cpp
   src/core/result.cpp
+  src/core/rule_sources.cpp
   src/core/scoring.cpp
   src/core/strings.cpp
 )
@@ -139,6 +140,28 @@ if(MIE_WITH_RULES)
 
   add_executable(mie-parity-run src/tools/parity_run.cpp)
   target_link_libraries(mie-parity-run PRIVATE mie_engine)
+
+  # ---- the worker: the confined process that parses untrusted bytes, and its parent side ----
+  add_library(mie_worker_protocol STATIC src/worker/protocol.cpp)
+  target_include_directories(mie_worker_protocol PUBLIC include)
+  target_link_libraries(mie_worker_protocol PUBLIC mie_core mie_sandbox)
+
+  add_library(mie_worker_host STATIC src/worker/host.cpp)
+  target_include_directories(mie_worker_host PUBLIC include)
+  target_link_libraries(mie_worker_host PUBLIC mie_worker_protocol mie_sandbox mie_channel mie_core)
+
+  # The shipped worker: no arguments, no test switch.
+  add_executable(mie-worker src/worker/main.cpp)
+  target_link_libraries(mie-worker PRIVATE mie_engine mie_worker_protocol mie_sandbox mie_channel)
+
+  # The same source with the test hooks: NEVER installed, NEVER packaged; only tests start it.
+  add_executable(mie-worker-testhooks src/worker/main.cpp)
+  target_compile_definitions(mie-worker-testhooks PRIVATE MIE_WORKER_TEST_HOOKS=1)
+  target_link_libraries(mie-worker-testhooks PRIVATE mie_engine mie_worker_protocol mie_sandbox mie_channel)
+
+  # Test runner: the table of mie-parity-run, every scan through a confined worker.
+  add_executable(mie-worker-run src/worker/worker_run.cpp)
+  target_link_libraries(mie-worker-run PRIVATE mie_worker_host)
 endif()
 
 # ---- local channel -----------------------------------------------------------------
@@ -246,6 +269,11 @@ if(MIE_BUILD_TESTS)
   set_tests_properties(archive_parity PROPERTIES TIMEOUT 3600)
   if(MIE_WITH_RULES)
     # Gate 2: parity set S through the whole C++ engine, compared with the Python reference.
+    add_test(NAME worker_cases
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/worker_cases.py
+                     $<TARGET_FILE:mie-worker-run> $<TARGET_FILE:mie-worker> $<TARGET_FILE:mie-worker-testhooks>
+                     $<TARGET_FILE:mie-parity-run> ${MIE_REPO_ROOT})
+    set_tests_properties(worker_cases PROPERTIES TIMEOUT 3000)
     add_test(NAME set_s_parity
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/set_s_parity.py
                      $<TARGET_FILE:mie-parity-run> ${MIE_REPO_ROOT})

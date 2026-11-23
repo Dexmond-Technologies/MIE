@@ -337,10 +337,25 @@ ScanResult Engine::scan_file(const std::filesystem::path& path) const {
     // One open, one handle (review finding S-10). The reference's error returns
     // (core.py:96-97, 141-143, 400-402) become "not scanned" with the reason's class.
     io::IoError error;
-    const auto file = io::open_regular(path, error);
-    if (!file) {
+    const auto opened = io::open_regular(path, error);
+    if (!opened) {
         return not_scanned(io::to_string(error.code), Hashes{}, 0);
     }
+    return scan_open(*opened, std::move(name));
+}
+
+ScanResult Engine::scan_open(io::File& opened, std::string name) const {
+    const auto not_scanned = [&](const std::string& reason, const Hashes& hashes, std::uint64_t size) {
+        ScanResult refused = base_result(hashes, size, name);
+        refused.state = ScanState::NotScanned;
+        refused.reason = reason;
+        return refused;
+    };
+    if (!unusable_.empty()) {
+        return not_scanned(unusable_, Hashes{}, 0);
+    }
+    io::IoError error;
+    io::File* const file = &opened;
     const std::uint64_t size = file->size();
     const std::uint64_t max_scan = static_cast<std::uint64_t>(limit_int("MAX_SCAN_BYTES"));
 

@@ -31,15 +31,6 @@ bool yara_ready() {
     return ok;
 }
 
-bool read_file(const std::filesystem::path& path, std::string& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    return true;
-}
-
 struct CompileErrors {
     std::string first;
 };
@@ -151,69 +142,38 @@ const std::map<std::string, std::string>& RuleSet::file_hashes() const { return 
 std::string RuleSet::library_version() { return YR_VERSION; }
 
 std::unique_ptr<RuleSet> RuleSet::load(const std::filesystem::path& directory) {
+    return load_sources(collect_rule_sources(directory));
+}
+
+std::unique_ptr<RuleSet> RuleSet::load_sources(const std::vector<RuleSource>& sources) {
     std::unique_ptr<RuleSet> set(new RuleSet());
     Impl& impl = *set->impl_;
     if (!yara_ready()) {
         impl.errors.push_back({"(yara)", "the rule library could not be initialised"});
         return set;
     }
-
-    // Name space -> path, as the reference builds it: the path below the rules directory
-    // without its extension, separators turned into '_'. std::map keeps them sorted.
-    std::map<std::string, std::filesystem::path> files;
-    std::error_code ec;
-    if (std::filesystem::is_directory(directory, ec)) {
-        std::filesystem::recursive_directory_iterator it(directory, ec);
-        const std::filesystem::recursive_directory_iterator end;
-        for (; !ec && it != end; it.increment(ec)) {
-            const std::filesystem::path path = it->path();
-            if (it->is_directory(ec)) {
-                if (path.filename() == "proposed") {
-                    it.disable_recursion_pending();  // unreviewed generated rules: never loaded
-                }
-                continue;
-            }
-            const std::string extension = path.extension().string();
-            if (extension != ".yar" && extension != ".yara") {
-                continue;
-            }
-            const std::filesystem::path relative = std::filesystem::relative(path, directory, ec);
-            if (ec) {
-                continue;
-            }
-            if (relative.generic_string() == "auto_generated.yar") {
-                continue;  // legacy unreviewed rules: never loaded
-            }
-            std::filesystem::path stem = relative;
-            stem.replace_extension();
-            std::string name_space = stem.generic_string();
-            std::replace(name_space.begin(), name_space.end(), '/', '_');
-            files[name_space] = path;
-        }
-    }
-    if (files.empty()) {
+    if (sources.empty()) {
         return set;  // Off: no rule files
     }
 
     // Every file alone first; a file that fails is left out and recorded.
     std::vector<std::pair<std::string, std::string>> good;
     std::map<std::string, std::string> hashes;  // file name below the directory -> SHA-256
-    for (const auto& [name_space, path] : files) {
-        std::string text;
-        if (!read_file(path, text)) {
-            impl.errors.push_back({path.generic_string(), "cannot be read"});
+    for (const RuleSource& source : sources) {
+        if (!source.readable) {
+            impl.errors.push_back({source.file, "cannot be read"});
             continue;
         }
         std::string error;
-        YR_RULES* alone = compile({{name_space, text}}, error);
+        YR_RULES* alone = compile({{source.name_space, source.text}}, error);
         if (alone == nullptr) {
-            impl.errors.push_back({path.generic_string(), error});
+            impl.errors.push_back({source.file, error});
             continue;
         }
         yr_rules_destroy(alone);
-        hashes[std::filesystem::relative(path, directory, ec).generic_string()] =
-            sha256_hex(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
-        good.emplace_back(name_space, std::move(text));
+        hashes[source.file] = sha256_hex(
+            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(source.text.data()), source.text.size()));
+        good.emplace_back(source.name_space, source.text);
     }
     if (good.empty()) {
         return set;  // Off: every rule file failed
