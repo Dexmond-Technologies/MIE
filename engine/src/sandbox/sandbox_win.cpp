@@ -473,7 +473,11 @@ std::string remove_worker_profile(const std::wstring& name, double& milliseconds
             why = state.outside > 0 ? std::to_string(state.outside) + " entries led outside the folder"
                                     : "the bound (10000 entries, 3 s, 32 levels) was reached";
         } else if (state.failed > 0) {
-            text = std::to_string(state.failed) + " entries could not be removed; ";
+            // An entry that could not be removed may be one that could not even be opened and
+            // checked (a link or junction among them): the system's own profile deletion must
+            // not be let loose on such a folder. Left behind and reported; the sweep retries.
+            may_delete = false;
+            why = std::to_string(state.failed) + " entries could not be removed";
         }
     }
     if (!may_delete) {
