@@ -70,7 +70,7 @@ private:
     Flavor flavor_;
     Meter meter_;
     Buffer input_;
-    std::optional<PyError> failed_;  // a decoder that failed keeps failing
+    std::optional<PyError> failed_;  // what a later call raises once a call has failed
 };
 
 // The output block sizes of CPython's _BlocksOutputBuffer (Include/internal/pycore_blocks_output_buffer.h).
@@ -119,6 +119,13 @@ Buffer PyDecompressor::decompress(Bytes data, std::uint64_t max_length) {
         }
     } catch (const PyError& error) {
         failed_ = error;
+        // bz2 only (CPython 3.12.16 Modules/_bz2module.c:457-461 and 632-636): an error of
+        // libbzip2 makes the object unusable: needs_input becomes False and every later
+        // decompress() raises ValueError. zlib and lzma objects are called again and fail again.
+        if (flavor_ == Flavor::Bz2 && error.type != "HardCeiling") {
+            needs_input = false;
+            failed_ = PyError{"ValueError", "Decompressor is unusable after a previous error"};
+        }
         throw;
     }
     const bool at_limit = made_total == max_length;

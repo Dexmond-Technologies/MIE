@@ -419,6 +419,12 @@ def compressed_bases(rng):
     for label, data in (('gz', gz), ('bz2', bz), ('xz', xz), ('gz_big', big_gz), ('bz2_big', big_bz), ('xz_big', big_xz)):
         for cut in (5, 12, len(data) // 3, len(data) // 2, len(data) - 9, len(data) - 4, len(data) - 1):
             bases[f'{label}_cut_at_{cut}'] = data[:cut]
+    # After-error path: a member read makes the decoder fail, then the read of the next header
+    # asks the same decoder again (bz2: ValueError from then on; gzip and xz: the error again).
+    for label, data in (('gz_big', big_gz), ('bz2_big', big_bz), ('xz_big', big_xz)):
+        for cut in (len(data) // 2, len(data) - 9):
+            bases[f'{label}_cut_at_{cut}_then_zeros'] = data[:cut] + b'\x00' * 624
+            bases[f'{label}_cut_at_{cut}_then_text'] = data[:cut] + TEXT * 3
     for cut in (128 * 1024, 128 * 1024 + 10, 2 * 128 * 1024 + 10):
         bases[f'gz_big_cut_at_{cut}'] = big_gz[:cut]
     return {'packed_' + key: value for key, value in bases.items()}
