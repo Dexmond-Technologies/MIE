@@ -39,6 +39,8 @@ int main(int argc, char** argv) {
     // there is no second check. "shipped": strict fields, and the second check must agree.
     const bool shipped = argc == 6 && std::string(argv[5]) == "shipped";
     options.accept_unread_fields = !shipped;
+    options.signer_by_second_lookup = !shipped;
+    options.accept_long_lengths = !shipped;
     options.require_second_check = shipped;
     mie::signature::load_roots_file(argv[1], options);
     const std::string pinned = argv[2];

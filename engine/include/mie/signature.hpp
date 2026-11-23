@@ -74,6 +74,13 @@ struct Options {
     // TSTInfo.serialNumber) and accepts anything there. ON: the same. OFF: each must be
     // what the format says, or the signature is refused.
     bool accept_unread_fields = false;
+    // D-19: the reference names as "the signer" the FIRST certificate with the signer's
+    // issuer name and serial number, not the one whose key verified the signature. ON: the
+    // same. OFF: the certificate that verified is the one checked and named as publisher.
+    bool signer_by_second_lookup = false;
+    // D-20 (proposed): ON accepts a DER length written longer than needed, as the
+    // reference's ASN.1 library does. OFF: shortest form only.
+    bool accept_long_lengths = false;
 
     // ---- shipped profile only, OFF in the parity profile ---------------------------------
     // The walker alone never grants the cap: a second, independent check (second_check)

@@ -73,6 +73,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     options.now_unix = 1795000000;  // fixed, so that a finding reproduces
     options.verify_every_entry = (switches & 1) != 0;
     options.accept_unread_fields = (switches & 2) != 0;
+    options.accept_long_lengths = (switches & 2) != 0;
+    options.signer_by_second_lookup = (switches & 8) != 0;
 
     const mie::signature::Precheck checked = mie::signature::precheck(file);
     const mie::signature::Result result = mie::signature::verify(file, options);

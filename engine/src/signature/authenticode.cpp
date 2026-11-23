@@ -118,6 +118,11 @@ struct Tlv {
     Bytes whole;
 };
 
+// D-20 (proposed): asn1crypto accepts a length written longer than needed (81 05 for 05,
+// 82 00 85 for 81 85). ON (parity) the same is accepted; OFF (the default, the shipped
+// profile) only the shortest form is: strict DER. Set for one verify() call, like D-17.
+thread_local bool g_accept_long_lengths = false;
+
 bool read_tlv(Bytes& in, Tlv& out) {
     if (in.size() < 2) return false;
     const std::uint8_t tag = in[0];
@@ -129,6 +134,8 @@ bool read_tlv(Bytes& in, Tlv& out) {
         if (count == 0 || count > 4 || in.size() - pos < count) return false;
         length = 0;
         for (std::size_t i = 0; i < count; ++i) length = (length << 8) | in[pos++];
+        const std::size_t least = count == 1 ? 0x80 : std::size_t{1} << (8 * (count - 1));
+        if (!g_accept_long_lengths && length < least) return false;
     }
     if (in.size() - pos < length) return false;
     out.tag = tag;
@@ -157,8 +164,11 @@ bool read_tlv(Bytes& in, Tlv& out) {
 // one verify() call in a thread-local, set and cleared by UnreadFieldsScope.
 thread_local bool g_accept_unread_fields = false;
 struct UnreadFieldsScope {
-    explicit UnreadFieldsScope(bool on) { g_accept_unread_fields = on; }
-    ~UnreadFieldsScope() { g_accept_unread_fields = false; }
+    UnreadFieldsScope(bool fields, bool long_lengths) {
+        g_accept_unread_fields = fields;
+        g_accept_long_lengths = long_lengths;
+    }
+    ~UnreadFieldsScope() { g_accept_unread_fields = g_accept_long_lengths = false; }
     UnreadFieldsScope(const UnreadFieldsScope&) = delete;
     UnreadFieldsScope& operator=(const UnreadFieldsScope&) = delete;
 };
@@ -813,24 +823,25 @@ void verify_attribute_signature(X509* certificate, const Signer& signer, const D
 // signify SignerInfo._build_chain: every certificate with the signer's issuer and serial
 // number, from the pinned store and from `pool`; one success is enough; with none, the
 // first error. `chain_time` may depend on the candidate (lifetime signing).
+// Returns the FIRST certificate that verified the signature and chained (finding SG-1).
 template <typename TimeFor>
-void verify_signer(const Signer& signer, const std::vector<X509*>& pool, const Roots& roots, TimeFor time_for,
+X509* verify_signer(const Signer& signer, const std::vector<X509*>& pool, const Roots& roots, TimeFor time_for,
                    const char* eku_oid, const char* eku_name, const char* signer_class) {
     std::vector<X509*> all = raw(roots.certs);
     all.insert(all.end(), pool.begin(), pool.end());
     const DigestAlg algorithm = digest_algorithm(signer.digest_alg, "SignerInfo.digestAlgorithm");
     std::optional<Fail> first_error;
-    bool any = false;
+    X509* verified = nullptr;
     for (X509* candidate : find_certificates(all, signer)) {
         try {
             verify_attribute_signature(candidate, signer, algorithm);
             signify_chain(candidate, pool, roots, time_for(candidate), eku_oid, eku_name);
-            any = true;
+            if (verified == nullptr) verified = candidate;
         } catch (const Fail& failure) {
             if (!first_error) first_error = failure;
         }
     }
-    if (any) return;
+    if (verified != nullptr) return verified;
     if (first_error) throw *first_error;
     throw Fail{"SignerInfoVerificationError",
                std::string("No valid certificate chain found to a trust anchor from ") + signer_class};
@@ -1155,8 +1166,9 @@ void parse_nested(const Signer& signer, int depth, std::size_t& total) {
 }
 
 // signify AuthenticodeFile.verify(multi_verify_mode='first', countersignature_mode='strict')
-// on one signature. Returns nothing; throws the failure.
-void signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots, std::int64_t now) {
+// on one signature. Throws the failure. Returns which of the signature's own certificates
+// (index into signed_data.certs) verified it, or -1 if that certificate came from the store.
+std::ptrdiff_t signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots, std::int64_t now) {
     std::size_t nested_total = 0;
     parse_nested(signed_data.signer, 0, nested_total);
 
@@ -1206,7 +1218,10 @@ void signify_verify(const SignedData& signed_data, Bytes data, const Layout& lay
         if (!signing_time || has_usage(usages, kEkuLifetimeSigning)) return now;
         return *signing_time;
     };
-    verify_signer(signed_data.signer, pool, roots, time_for, kEkuCodeSigning, "code signing", "AuthenticodeSignerInfo");
+    X509* verified =
+        verify_signer(signed_data.signer, pool, roots, time_for, kEkuCodeSigning, "code signing", "AuthenticodeSignerInfo");
+    const auto found = std::find(pool.begin(), pool.end(), verified);
+    return found == pool.end() ? -1 : found - pool.begin();
 }
 
 // ---- the reference's own checks after signify (signature.py) ----------------------------
@@ -1315,8 +1330,9 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     const SignedData& primary = signatures.front();
 
     // VERIFY: the first entry only (signify).
+    std::ptrdiff_t verified_index = -1;
     try {
-        signify_verify(primary, data, layout, roots, now);
+        verified_index = signify_verify(primary, data, layout, roots, now);
     } catch (const Fail& failure) {
         Result out = make_result("invalid", "signify: " + failure.cls + ": " + failure.text);
         out.error_class = failure.cls;
@@ -1326,9 +1342,20 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     // AFTER: the reference's own checks.
     const std::vector<X509Ptr> certificates = load_certificates(primary.certs);
     const std::vector<X509*> pool = raw(certificates);
-    const std::vector<X509*> leaves = find_certificates(pool, primary.signer);
-    if (leaves.empty()) throw Fail{"ValueError", "signer certificate not in the signature certificate set"};
-    X509* leaf = leaves.front();
+    // Which certificate is "the signer" from here on (usage, dates, chain, publisher name)?
+    // The reference looks it up AGAIN by issuer name and serial number among the signature's
+    // certificates and takes the FIRST match (signature.py:297-310), which need not be the
+    // certificate whose key verified the signature (signify tries every match and is content
+    // with any: pkcs7/signer_info.py:398-411). D-19: by default (shipped) the certificate
+    // that verified is used; the reference's second lookup only with the parity switch.
+    X509* leaf = nullptr;
+    if (options.signer_by_second_lookup) {
+        const std::vector<X509*> leaves = find_certificates(pool, primary.signer);
+        if (!leaves.empty()) leaf = leaves.front();
+    } else if (verified_index >= 0 && static_cast<std::size_t>(verified_index) < pool.size()) {
+        leaf = pool[static_cast<std::size_t>(verified_index)];
+    }
+    if (leaf == nullptr) throw Fail{"ValueError", "signer certificate not in the signature certificate set"};
     const std::optional<std::int64_t> signing_time = trusted_signing_time(primary, pool, roots);
 
     // _leaf_checks
@@ -1570,7 +1597,7 @@ Result verify(std::span<const std::uint8_t> data, const Options& options) {
     }
     const Precheck checked = precheck(data);
     if (checked.status != "ok") return make_result(checked.status, checked.detail);
-    const UnreadFieldsScope unread_fields(options.accept_unread_fields);
+    const UnreadFieldsScope unread_fields(options.accept_unread_fields, options.accept_long_lengths);
 
     // signature.py load_pinned_store
     if (options.pinned_sha256.empty()) {
@@ -1609,7 +1636,7 @@ bool primary_view(std::span<const std::uint8_t> data, PrimaryView& out) {
     try {
         const Precheck checked = precheck(data);
         if (checked.status != "ok") return false;
-        const UnreadFieldsScope strict(false);
+        const UnreadFieldsScope strict(false, false);
         const SignedData primary =
             parse_content_info(checked.primary_der, DataKind::Authenticode, "ParseError", "not SignedData");
         const IndirectData indirect = parse_indirect_data(primary);

@@ -123,7 +123,7 @@ class Identity:
 
 
 def make_identity(cn, issuer=None, org=None, ca=False, eku=None, key_usage='default',
-                  not_before=None, not_after=None, key=None):
+                  not_before=None, not_after=None, key=None, serial=None):
     key = key or rsa.generate_private_key(public_exponent=65537, key_size=2048)
     attrs = [x509.NameAttribute(NameOID.COMMON_NAME, cn)]
     if org:
@@ -133,7 +133,7 @@ def make_identity(cn, issuer=None, org=None, ca=False, eku=None, key_usage='defa
                .subject_name(name)
                .issuer_name(issuer.cert.subject if issuer else name)
                .public_key(key.public_key())
-               .serial_number(x509.random_serial_number())
+               .serial_number(serial or x509.random_serial_number())
                .not_valid_before(not_before or NOW - 3000 * DAY)
                .not_valid_after(not_after or NOW + 3000 * DAY)
                .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True))
@@ -249,7 +249,7 @@ def page_hash_entries(pe, pairs):
 
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
-                      wrong_stamp_digest=False, page_hashes=None, nested=None):
+                      wrong_stamp_digest=False, page_hashes=None, nested=None, leaf_last=False):
     """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`."""
     spc = spc_indirect(pe, digest, page_hashes)
     spc_contents = spc[len(spc) - len(seq_contents(spc)):]
@@ -257,7 +257,7 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
     attrs = [attribute(OID_CONTENT_TYPE, oid(OID_SPC_INDIRECT)),
              attribute(OID_MESSAGE_DIGEST, der(0x04, content_digest))]
     signature, fields = signer_info(leaf, digest, attrs)
-    certs = [leaf.der] + [c.der for c in extra_certs]
+    certs = [c.der for c in extra_certs] + [leaf.der] if leaf_last else [leaf.der] + [c.der for c in extra_certs]
     stamped = hashlib.sha256(b'wrong' if wrong_stamp_digest else signature).digest()
     unsigned = []
     if nested:
@@ -531,6 +531,16 @@ def build_cases():
     extra('lifetime_expired_stamp_authenticode', lambda: signed(
         pe, lifetime_expired(), [inter], timestamp='authenticode', tsa=tsa, stamp_time=mid))
 
+    # reviewer's finding SG-1 (B-3632): two certificates with the SAME issuer name and serial number.
+    # `twin` holds the allowed publisher's name; `real_signer` (another name, another key) makes the
+    # signature. The reference names as signer the FIRST of the two in the file, whichever key signed
+    # (numbered difference D-19). No asserted reference status; the shipped setting is asserted in main().
+    twin = make_identity('Test Publisher', issuer=inter, org='Test Publisher', eku=code)
+    real_signer = make_identity('Other Publisher', issuer=inter, org='Other Publisher', eku=code,
+                                serial=twin.cert.serial_number)
+    add('same_serial_allowed_name_first', signed(pe, real_signer, [twin, inter], leaf_last=True))
+    add('same_serial_real_signer_first', signed(pe, real_signer, [twin, inter]))
+
     # not signed at all
     add('unsigned', pe, 'unsigned', False)
     add('unsigned_pe32', pe32, 'unsigned', False)
@@ -755,6 +765,35 @@ def main():
                 hard.append(f'{label}: reference {r!r}, C++ {c!r}')
 
         hard.extend(engine_part(ref, dict(inputs), tmp, roots_path, pinned, loaded_policy))
+
+        # SG-1 in the SHIPPED setting (strict fields, the verified certificate is the signer, second
+        # check on): the allowed publisher's name must never get the cap from another key's signature.
+        twins = os.path.join(tmp, 'twins')
+        os.mkdir(twins)
+        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256'):
+            with open(os.path.join(twins, name + '.bin'), 'wb') as f:
+                f.write(dict(inputs)[name])
+        done = subprocess.run([PROBE, roots_path, pinned, policy_path, twins, 'shipped'], capture_output=True, timeout=600)
+        shipped = {}
+        for raw in done.stdout.split(b'\n'):
+            if raw.strip():
+                line = json.loads(raw.decode('ascii'))
+                shipped[line['file'][:-4]] = line
+        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first'):
+            c = shipped.get(name)
+            r = reference_result(ref, dict(inputs)[name], roots_path, pinned, loaded_policy)
+            r_cap = r.get('status') == 'valid' and r.get('publisher_allowed') is True
+            safe = (c is not None and not (c['status'] == 'valid' and c['publisher_allowed'] is True)
+                    and c.get('publisher') != 'Test Publisher')
+            print(f"{'PASS' if safe else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']} "
+                  f"publisher {None if c is None else c.get('publisher')!r} allowed "
+                  f"{None if c is None else c.get('publisher_allowed')}; the REFERENCE gives {r['status']} "
+                  f"publisher {r.get('publisher')!r} cap {r_cap}")
+            if not safe:
+                hard.append(f'{name}: the shipped setting names or caps the allowed publisher: {c!r}')
+        c = shipped.get('valid_sha256') or {}
+        print(f"NOTE  shipped setting, valid_sha256: status {c.get('status')} allowed {c.get('publisher_allowed')} "
+              f"second check {c.get('second_check')} ({c.get('second_check_reason')!r})")
 
     print(f'seed {SEED}; named cases {len(cases)}; damaged variants {len(variants)}')
     print('reference statuses over all inputs:', json.dumps(counts, sort_keys=True))
