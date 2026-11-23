@@ -31,7 +31,11 @@ WALL = "20"  # seconds, the limit of every case that does not set its own
 
 P1 = "r-01 point 1: a network connection from the confined child fails"
 P1B = "r-01 point 1 (not the local loop): a connection to the machine's own network address fails"
-SW1 = "SW-1: what the confined child can write in its own container folder, and that the parent empties it"
+SW1 = "SW-1: what a confined worker can write in its own folder, nothing outside it, and the folder goes with it"
+CROSS = "M-13 one profile per worker: a file left by one worker is not seen by another worker pre-started before it"
+SWEEP = "M-13 clean-up after a crash: profiles left by a hard-killed parent are removed by the next start's sweep"
+WINDOWS_MUST_RUN = []  # filled on Windows: the cases above must run there
+PROFILE_COST = {"create": [], "delete": []}  # milliseconds per start / per end (Windows)
 SHIPPED = "SB-1: a child built with the shipped library ignores the test switches in its environment"
 P2 = "r-01 point 2: reading a file in the user's profile that was not handed over fails"
 P3 = "r-01 point 3: starting another process from the confined child fails"
@@ -79,6 +83,7 @@ def run_parent(parent, child, options, action, wall=WALL):
     result = json.loads(lines[-1].decode("ascii"))
     if result.get("sanitizer_build"):
         SANITIZER["seen"] = True
+    note_profile_cost(result)
     inner = None
     for line in result.get("output", "").split("\n"):
         if line.strip().startswith("{"):
@@ -89,10 +94,22 @@ def run_parent(parent, child, options, action, wall=WALL):
     return result, inner
 
 
+def note_profile_cost(result):
+    """Windows: the time the worker's own profile took to create and to delete."""
+    if result.get("profile_create_ms", 0) > 0:
+        PROFILE_COST["create"].append(result["profile_create_ms"])
+    if result.get("profile_delete_ms", 0) > 0:
+        PROFILE_COST["delete"].append(result["profile_delete_ms"])
+
+
 def brief(result, inner):
-    return "end=%s exit=%s inner=%s detail=%r applied=%r" % (
+    cost = ""
+    if result.get("profile_create_ms", 0) > 0:
+        cost = " profile: create %.1f ms, delete %.1f ms, %s;" % (
+            result.get("profile_create_ms", 0), result.get("profile_delete_ms", 0), result.get("profile_removal", ""))
+    return "end=%s exit=%s inner=%s detail=%r applied=%r%s" % (
         result.get("end"), result.get("exit_code"), json.dumps(inner, sort_keys=True),
-        result.get("detail", "")[:700], result.get("confinement", ""))
+        result.get("detail", "")[:700], result.get("confinement", ""), cost)
 
 
 def case(name, function):
@@ -110,7 +127,13 @@ def summary():
     passed = sum(1 for status, _, _ in results if status == "PASS")
     failed = sum(1 for status, _, _ in results if status == "FAIL")
     not_run = sum(1 for status, _, _ in results if status == "NOT RUN")
-    blocking = [name for name in MUST_RUN
+    for kind in ("create", "delete"):
+        figures = sorted(PROFILE_COST[kind])
+        if figures:
+            print("profile cost (%s, ms, per worker): %d measured, median %.1f, 90th %.1f, max %.1f" % (
+                kind, len(figures), figures[len(figures) // 2], figures[min(len(figures) - 1, len(figures) * 9 // 10)],
+                figures[-1]))
+    blocking = [name for name in MUST_RUN + tuple(WINDOWS_MUST_RUN)
                 if not any(status in ("PASS", "FAIL") and case_name == name for status, case_name, _ in results)]
     print("sandbox_cases: %d passed, %d failed, %d not run%s" % (
         passed, failed, not_run,
@@ -766,65 +789,157 @@ def run_cases(parent, child, shipped_child, windows, linux, work):
         else:
             record("NOT RUN", W_SHIPPED, "the test was not given the third program (mie-sandbox-shippedchild)")
 
-    # ---- SW-1: the container's own folder (Windows) -------------------------------------------
-    def own_folder():
-        done = subprocess.run([parent, "--sid"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        folder = json.loads(done.stdout.split(b"\n")[0].decode("ascii")).get("folder", "")
-        if not folder:
-            return "FAIL", "the test parent did not name the container folder: %r" % (done.stdout[:300],)
-        result, seen = run_parent(parent, child, [], ["environment"])
-        seen = seen or {}
-        print("SW-1: container folder (computed by the parent): %s" % folder, flush=True)
-        print("SW-1: folder variables as the confined child sees them: %s" % json.dumps(
-            {name: seen.get(name) for name in ("TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE")},
-            sort_keys=True), flush=True)
-        places = []
-        for place in [folder, os.path.join(folder, "AC"), os.path.join(folder, "AC", "Temp"),
-                      seen.get("TEMP"), seen.get("TMP")]:
-            if place and os.path.normcase(place) not in [os.path.normcase(known) for known in places]:
-                places.append(place)
+    # ---- per-worker profiles (Windows): SW-1, no state across workers, clean-up after a crash ----
+    def cross_scan():
+        command = [parent, child, "--cross-scan", "--file", sample]
+        done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        lines = [line for line in done.stdout.split(b"\n") if line.strip()]
+        answer = json.loads(lines[-1].decode("ascii")) if lines else {}
+        for side in ("a", "b"):
+            if isinstance(answer.get(side), dict):
+                note_profile_cost(answer[side])
+        return answer
 
-        def inside(path):
-            return os.path.normcase(os.path.abspath(path)).startswith(
-                os.path.normcase(os.path.abspath(folder)) + os.sep)
+    def child_line(result):
+        for line in (result or {}).get("output", "").split("\n"):
+            if line.strip().startswith("{") and '"action"' in line:
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    pass
+        return {}
 
-        written_inside, written_outside, refused_at = [], [], []
-        for number, place in enumerate(places):
-            path = os.path.join(place, "mie-sw1-%d-%d.txt" % (os.getpid(), number))
-            result, inner = run_parent(parent, child, [], ["write-path", path])
-            created = bool(inner and inner.get("opened")) and os.path.exists(path)
-            if created and inside(path):
-                written_inside.append(path)
-            elif created:
-                written_outside.append(path)
-            else:
-                refused_at.append("%s (error %s)" % (path, (inner or {}).get("error")))
-            print("SW-1: create %s: %s" % (path, "WRITTEN" if created else "refused"), flush=True)
-            # Every confined start empties the folder, so a file written by this child is looked
-            # at here, before the next child is started.
-        last = written_inside[-1] if written_inside else None
-        after, after_inner = run_parent(parent, child, [], ["whoami"])
-        said = after.get("confinement", "")
-        said = said[said.find("container folder:"):] if "container folder:" in said else "(the parent said nothing)"
-        left = [path for path in written_inside if os.path.exists(path)]
-        for path in written_outside:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        text = "tried: create a file in %s. WRITTEN inside the container folder: %s. WRITTEN OUTSIDE it: %s. " \
-            "Refused: %s. Then a second confined child was started; the parent said: %s; files of the first " \
-            "children still there afterwards: %s" % (
-                places, written_inside or "none", written_outside or "none", refused_at or "none", said,
-                left or "none")
-        good = not written_outside and not left and after.get("end") == "exited" \
-            and (last is None or "emptied before the start" in said)
-        return ("PASS" if good else "FAIL"), text
     if windows:
-        case(SW1, own_folder)
+        WINDOWS_MUST_RUN.extend([SW1, CROSS, SWEEP])
+        seen_env, seen_inner = run_parent(parent, child, [], ["environment"])
+        print("SW-1: folder variables as a confined worker sees them: %s" % json.dumps(
+            {name: (seen_inner or {}).get(name) for name in ("TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE")},
+            sort_keys=True), flush=True)
+        try:
+            cross = cross_scan()
+        except Exception as error:  # reported by the cases below
+            cross = {"error": repr(error)}
+        folder_a, folder_b = cross.get("folder_a", ""), cross.get("folder_b", "")
+        print("M-13: worker A's own folder: %s" % folder_a, flush=True)
+        print("M-13: worker B's own folder (B started before A, waiting while A ran): %s" % folder_b, flush=True)
+        line_a, line_b = child_line(cross.get("a")), child_line(cross.get("b"))
+
+        def real(path):
+            # Long and short forms of the same folder (C:\Users\runneradmin and C:\Users\RUNNER~1)
+            # compare equal only after the system has resolved them: realpath on what exists,
+            # and on the nearest existing parent otherwise.
+            head, tail = path, []
+            while head and not os.path.exists(head):
+                head, part = os.path.split(head)
+                if not part:
+                    break
+                tail.insert(0, part)
+            return os.path.normcase(os.path.join(os.path.realpath(head) if head else head, *tail))
+
+        def inside(path, folder):
+            return bool(folder) and real(path).startswith(real(folder) + os.sep)
+
+        def sw1():
+            if not folder_a:
+                return "FAIL", "the cross-scan run gave no folder for worker A: %r" % (cross,)
+            written = line_a.get("written", [])
+            outside_own = [path for path in written if not inside(path, folder_a)]
+            # Paths are compared after the system resolved them (os.path.realpath), so that a
+            # long and a short form of the same folder are one folder. A's folder no longer
+            # exists at this point, so its resolution is the one taken by the parent at start.
+            text = "tried: worker A, after its seal, created a file in its folder's root, AC and AC\\Temp, in " \
+                "worker B's folder, and in the TEMP and TMP it sees. WRITTEN: %s. Refused: %s. Written outside " \
+                "its own folder: %s. A's folder still on disk after A ended: %s (%s). %s" % (
+                    written or "none", line_a.get("not_written", []) or "none", outside_own or "none",
+                    cross.get("folder_a_exists_after_a"), (cross.get("a") or {}).get("profile_removal"),
+                    brief(cross.get("a") or {}, line_a))
+            good = bool(line_a) and not outside_own and cross.get("folder_a_exists_after_a") is False
+            for path in outside_own:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return ("PASS" if good else "FAIL"), text
+        case(SW1, sw1)
+
+        def no_cross():
+            if not folder_a or not folder_b:
+                return "FAIL", "the cross-scan run gave no folders: %r" % (cross,)
+            seen_by_b = line_b.get("seen", [])
+            on_disk = [path for path, present in (cross.get("on_disk_after_a") or {}).items() if present]
+            text = "tried: worker B was started and waited; worker A (own folder %s) was handed a file and wrote " \
+                "what it could (%s), including into B's folder %s, and ended; then B was handed a file and " \
+                "looked for every one of those files. B saw: %s. On disk after A ended, as this unconfined test " \
+                "sees it: %s. Folder note given with B's hand-over: %r. %s" % (
+                    folder_a, line_a.get("written", []) or "nothing", folder_b, seen_by_b or "none",
+                    on_disk or "none", (cross.get("b") or {}).get("container_folder_note"),
+                    brief(cross.get("b") or {}, line_b))
+            own_writes = [path for path in line_a.get("written", []) if inside(path, folder_a)]
+            into_b = [path for path in line_a.get("written", []) if inside(path, folder_b)]
+            text += " Worker A's attempts into B's folder: %s." % (
+                "WRITTEN: %s" % into_b if into_b else "refused")
+            if not own_writes:
+                return "FAIL", "worker A wrote nothing into its own folder, so 'B saw nothing' shows nothing. " + text
+            good = os.path.normcase(folder_a) != os.path.normcase(folder_b) and bool(line_b) \
+                and not seen_by_b and not on_disk and (cross.get("b") or {}).get("end") == "exited" \
+                and (cross.get("b") or {}).get("container_folder_note", "") == ""
+            return ("PASS" if good else "FAIL"), text
+        case(CROSS, no_cross)
+
+        def sweep_after_crash():
+            import threading
+            packages = json.loads(subprocess.run([parent, "--sid"], stdout=subprocess.PIPE, timeout=60)
+                                  .stdout.split(b"\n")[0].decode("ascii")).get("folder", "")
+
+            def ours_on_disk():
+                try:
+                    return sorted(name.lower() for name in os.listdir(packages)
+                                  if name.lower().startswith("dexmond.mie.worker"))
+                except OSError:
+                    return []
+            before = subprocess.run([parent, "--sweep"], stdout=subprocess.PIPE, timeout=120).stdout
+            print("M-13 sweep before the crash run: %s" % before.decode("ascii", "replace").strip(), flush=True)
+            held = subprocess.Popen([parent, child, "--hold", "3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            first = {}
+
+            def read_first():
+                first["line"] = held.stdout.readline()
+            reader = threading.Thread(target=read_first, daemon=True)
+            reader.start()
+            reader.join(60)
+            held.kill()  # TerminateProcess: the parent cleans nothing up
+            held.wait(30)
+            import time
+            time.sleep(2)  # the workers die when the parent's job handles close; give that a moment
+            try:
+                folders = json.loads(first.get("line", b"{}").decode("ascii")).get("folders", [])
+            except ValueError:
+                folders = []
+            names = [os.path.basename(folder).lower() for folder in folders if folder]
+            if len(names) != 3:
+                return "FAIL", "the parent with three waiting workers did not report three folders: %r" % (
+                    first.get("line"),)
+            left_after_kill = [name for name in names if name in ours_on_disk()]
+            if len(left_after_kill) != 3:
+                return "FAIL", "the hard kill left %d of the three profiles on disk (%s; on disk: %s), so the " \
+                    "sweep has nothing to show" % (len(left_after_kill), names, ours_on_disk())
+            swept = json.loads(subprocess.run([parent, "--sweep"], stdout=subprocess.PIPE, timeout=120)
+                               .stdout.split(b"\n")[0].decode("ascii"))
+            remaining = ours_on_disk()
+            text = "tried: a parent started three waiting workers (%s) and was killed hard; left on disk after the " \
+                "kill: %s; the next start's sweep said: %s; removed: %s; failed: %s; left alone: %s; profiles " \
+                "with the prefix on disk afterwards: %s (no worker of this test is alive at this point)" % (
+                    names, left_after_kill, swept.get("text"), swept.get("names_removed"),
+                    swept.get("names_failed"), swept.get("names_left_alone"), remaining or "none")
+            removed_names = [name.lower() for name in swept.get("names_removed", [])]
+            good = all(name in removed_names for name in left_after_kill) \
+                and not any(name in remaining for name in names)
+            return ("PASS" if good else "FAIL"), text
+        case(SWEEP, sweep_after_crash)
     else:
-        record("NOT RUN", SW1, "Windows only: on Linux the confined worker has no folder of its own; it can "
-               "open no path at all (r-01 points 2 and 4)")
+        for name in (SW1, CROSS, SWEEP):
+            record("NOT RUN", name, "Windows only: on Linux a confined worker has no profile and no folder; it "
+                   "can open no path at all (r-01 points 2 and 4)")
 
     # ---- SB-1: the shipped library has no test switches -----------------------------------------
     def shipped_ignores_switches():

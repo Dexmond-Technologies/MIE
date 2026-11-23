@@ -24,6 +24,7 @@
 #include <cwchar>
 #include <iterator>
 #include <new>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -206,57 +207,112 @@ void close_handle(HANDLE& handle) {
     handle = nullptr;
 }
 
-// The AppContainer's SID. The profile is created on first use (it is kept in the user's
-// profile: a registry key and a folder under %LOCALAPPDATA%\Packages); afterwards the SID is
-// derived from the name. UNSURE: whether a process can be started under a derived SID whose
-// profile was never created; that path is taken only if creating the profile fails.
-PSID container_sid(std::string& how, std::string& error) {
-    PSID sid = nullptr;
-    const HRESULT created = ::CreateAppContainerProfile(kContainerName, L"Dexmond MIE worker",
-                                                        L"Confined process that reads files for Dexmond MIE",
-                                                        nullptr, 0, &sid);
-    if (SUCCEEDED(created) && sid != nullptr) {
-        how = "profile created";
-        return sid;
-    }
-    sid = nullptr;
-    const HRESULT derived = ::DeriveAppContainerSidFromAppContainerName(kContainerName, &sid);
-    if (SUCCEEDED(derived) && sid != nullptr) {
-        how = created == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) ? "existing profile" : "derived SID, no profile";
-        return sid;
-    }
-    error = "AppContainer profile: HRESULT " + std::to_string(static_cast<unsigned long>(created)) +
-            ", derive: HRESULT " + std::to_string(static_cast<unsigned long>(derived));
-    return nullptr;
-}
-
-// ---- the container's own folder (reviewer's item SW-1) -----------------------------------
+// ---- one AppContainer profile per worker (finding on M-13; r-01: "the right shape") --------
 //
-// An AppContainer has a profile folder, %LOCALAPPDATA%\Packages\<container name>, which the
-// confined worker CAN write. Nothing in the product reads it. So that what one worker leaves
-// there is not found by the next one, the parent EMPTIES the folder before every confined
-// start: every file is removed, and every folder below the second level (the folders Windows
-// itself made, the root's children and their children, stay as empty folders).
+// Every confined start creates its OWN AppContainer profile and deletes it when the worker
+// has ended. A profile is a registry key and a folder, %LOCALAPPDATA%\Packages\<name>, which
+// its worker CAN write (item SW-1). With one profile per worker no two workers ever share a
+// writable folder: what a worker scanning hostile file A writes there is gone with its
+// profile, and a worker pre-started for file B has a folder of its own, empty when created.
 //
-// Discipline, because the content was written by a process that may be hostile:
+// Name: "Dexmond.MIE.Worker.<creating process number, 8 hex digits>.<random, 16 hex digits>".
+// The process number lets the sweep (sweep_leftover_profiles) leave alone the profiles of a
+// service that is still running; the random part makes the name unique. A name that exists
+// already is never reused: creation then fails and is tried again with a new random part.
+//
+// Discipline for everything the parent deletes, because the content was written by a process
+// that may be hostile:
 //   - nothing is ever followed: every entry is opened WITHOUT following a link or junction
 //     (FILE_FLAG_OPEN_REPARSE_POINT); a link is removed as a link, never entered;
 //   - every opened entry is asked for its real, final path, which must lie inside the
-//     folder's own real path; an entry that leads elsewhere (a swapped parent) is left alone
-//     and counted;
+//     folder's own real path; an entry that leads elsewhere is left alone and counted, and the
+//     profile is then NOT deleted (the system's delete might follow it);
 //   - removal is done through the opened handle, not by name again;
-//   - bounded: 10,000 entries, 3 seconds, 32 levels.
-// A failure to empty is REPORTED in ChildResult::confinement and does not stop the start:
-// leftover content is data only a later confined worker could read (no network, no other
-// place to put it), while refusing to start would let one hostile file that leaves an
-// undeletable entry switch off all later scanning.
+//   - bounded: 10,000 entries, 3 seconds, 32 levels per folder.
 
-std::wstring container_folder() {
+std::wstring packages_folder() {
     const std::wstring local = environment_value(L"LOCALAPPDATA");
-    if (local.empty()) {
-        return {};
+    return local.empty() ? std::wstring() : local + L"\\Packages";
+}
+
+std::wstring profile_folder(const std::wstring& name) {
+    const std::wstring packages = packages_folder();
+    return packages.empty() || name.empty() ? std::wstring() : packages + L"\\" + name;
+}
+
+std::wstring hex_text(unsigned long long value, int digits) {
+    static const wchar_t kDigits[] = L"0123456789abcdef";
+    std::wstring out(static_cast<std::size_t>(digits), L'0');
+    for (int i = digits - 1; i >= 0; --i) {
+        out[static_cast<std::size_t>(i)] = kDigits[value & 0xF];
+        value >>= 4;
     }
-    return local + L"\\Packages\\" + kContainerName;
+    return out;
+}
+
+bool hex_digits(const std::wstring& text, std::size_t from, std::size_t count) {
+    if (text.size() < from + count) {
+        return false;
+    }
+    for (std::size_t i = from; i < from + count; ++i) {
+        const wchar_t c = text[i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A name this code made: the prefix, a dot, 8 hex digits, a dot, 16 hex digits. Also the
+// single fixed name of the versions before per-worker profiles (prefix alone). Compared
+// without regard to case, as Windows compares file names.
+bool is_worker_profile_name(const std::wstring& name, DWORD* creator) {
+    const std::wstring prefix = kContainerName;
+    if (::_wcsicmp(name.c_str(), prefix.c_str()) == 0) {
+        if (creator != nullptr) {
+            *creator = 0;
+        }
+        return true;
+    }
+    const std::size_t p = prefix.size();
+    if (name.size() != p + 1 + 8 + 1 + 16 || ::_wcsnicmp(name.c_str(), prefix.c_str(), p) != 0 || name[p] != L'.' ||
+        name[p + 9] != L'.' || !hex_digits(name, p + 1, 8) || !hex_digits(name, p + 10, 16)) {
+        return false;
+    }
+    if (creator != nullptr) {
+        *creator = static_cast<DWORD>(std::wcstoul(name.substr(p + 1, 8).c_str(), nullptr, 16));
+    }
+    return true;
+}
+
+// Creates a new profile for one worker. `name` receives its name, `milliseconds` the time the
+// creation took (part of the price of every start).
+PSID create_worker_profile(std::wstring& name, double& milliseconds, std::string& error) {
+    std::random_device random;
+    HRESULT outcome = E_FAIL;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const unsigned long long part =
+            (static_cast<unsigned long long>(random()) << 32) ^ static_cast<unsigned long long>(random());
+        name = std::wstring(kContainerName) + L"." + hex_text(::GetCurrentProcessId(), 8) + L"." + hex_text(part, 16);
+        PSID sid = nullptr;
+        const auto before = std::chrono::steady_clock::now();
+        outcome = ::CreateAppContainerProfile(name.c_str(), L"Dexmond MIE worker",
+                                              L"Confined process that reads one file for Dexmond MIE", nullptr, 0,
+                                              &sid);
+        milliseconds =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
+        if (SUCCEEDED(outcome) && sid != nullptr) {
+            return sid;
+        }
+        if (outcome != HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+            break;  // only a name that exists already is tried again
+        }
+    }
+    char text[32];
+    std::snprintf(text, sizeof text, "0x%08lX", static_cast<unsigned long>(outcome));
+    error = std::string("CreateAppContainerProfile for the worker's own profile: HRESULT ") + text;
+    name.clear();
+    return nullptr;
 }
 
 std::wstring final_path_of(HANDLE handle) {
@@ -299,6 +355,7 @@ struct EmptyState {
     bool cut = false;   // a bound was reached
 };
 
+// Removes everything below `path` (the folder itself stays).
 void empty_directory(const std::wstring& path, int depth, EmptyState& state) {
     if (depth > 32) {
         state.cut = true;
@@ -343,9 +400,7 @@ void empty_directory(const std::wstring& path, int depth, EmptyState& state) {
             delete_by_handle(entry) ? ++state.links : ++state.failed;  // the link itself; never entered
         } else if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             empty_directory(child, depth + 1, state);
-            if (depth + 1 > 2) {  // the first two levels are the folders Windows made: kept, empty
-                delete_by_handle(entry) ? ++state.removed : ++state.failed;
-            }
+            delete_by_handle(entry) ? ++state.removed : ++state.failed;
         } else {
             delete_by_handle(entry) ? ++state.removed : ++state.failed;
         }
@@ -353,49 +408,85 @@ void empty_directory(const std::wstring& path, int depth, EmptyState& state) {
     }
 }
 
-// True if the sentence of empty_container_folder() says that the folder is now empty.
-bool folder_is_empty_now(const std::string& sentence) {
-    return sentence.rfind("emptied before the start", 0) == 0 && sentence.find("COULD NOT") == std::string::npos &&
-           sentence.find("LEFT ALONE") == std::string::npos && sentence.find("STOPPED") == std::string::npos;
-}
-
-// Empties the container's folder; returns the sentence for ChildResult::confinement.
-std::string empty_container_folder() {
-    const std::wstring folder = container_folder();
+// Opens a profile's folder itself and checks that it is a real folder (not a link) whose real
+// path is exactly <Packages>\<name>. Returns that real path, or empty with `why` set.
+std::wstring checked_profile_folder(const std::wstring& name, std::string& why, bool& missing) {
+    missing = false;
+    const std::wstring folder = profile_folder(name);
     if (folder.empty()) {
-        return "NOT EMPTIED: LOCALAPPDATA is not set, the folder's place is unknown";
+        why = "LOCALAPPDATA is not set: the place of the worker's own folder is not known";
+        return {};
     }
     HANDLE root = open_entry(folder);
     if (root == INVALID_HANDLE_VALUE) {
         const DWORD code = ::GetLastError();
-        return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
-                   ? std::string("no folder at the expected place (nothing to empty)")
-                   : win_error("NOT EMPTIED: the folder could not be opened", code);
+        missing = code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
+        why = missing ? "the worker's own folder is not at the expected place " + narrow(folder)
+                      : win_error("the worker's own folder could not be opened", code);
+        return {};
     }
-    EmptyState state;
     BY_HANDLE_FILE_INFORMATION info{};
-    const bool is_link =
-        !::GetFileInformationByHandle(root, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-    state.root = final_path_of(root);
+    const bool is_link = !::GetFileInformationByHandle(root, &info) ||
+                         (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    const std::wstring real = final_path_of(root);
     ::CloseHandle(root);
-    if (is_link || state.root.empty()) {
-        return "NOT EMPTIED: the folder is a link or its real path cannot be read; refused";
+    const std::wstring tail = L"\\Packages\\" + name;
+    if (is_link || real.size() < tail.size() ||
+        ::_wcsicmp(real.c_str() + (real.size() - tail.size()), tail.c_str()) != 0) {
+        why = "the worker's own folder is a link or not where it should be; nothing in it was touched";
+        return {};
     }
-    state.deadline = ::GetTickCount64() + 3000;
-    empty_directory(folder, 0, state);
-    std::string text = "emptied before the start: " + std::to_string(state.removed) + " removed";
-    if (state.links > 0) {
-        text += ", " + std::to_string(state.links) + " links removed without following them";
+    return real;
+}
+
+// The sentence for ChildResult::container_folder_note at the moment the worker is handed its
+// file: empty when the folder is the worker's own (created with its profile, a real folder at
+// its place). Files in it at that moment were written by this worker while it prepared, from
+// our data only.
+std::string own_folder_note(const std::wstring& name) {
+    std::string why;
+    bool missing = false;
+    if (checked_profile_folder(name, why, missing).empty()) {
+        return "the worker's own folder could not be checked at the hand-over: " + why;
     }
-    if (state.failed > 0) {
-        text += ", " + std::to_string(state.failed) + " COULD NOT BE REMOVED";
+    return {};
+}
+
+// Deletes a worker's profile: first everything in its folder, without following anything,
+// then the profile itself (registry key and folder). `milliseconds`: the time it took.
+std::string remove_worker_profile(const std::wstring& name, double& milliseconds, bool& removed) {
+    const auto before = std::chrono::steady_clock::now();
+    removed = false;
+    std::string text;
+    std::string why;
+    bool missing = false;
+    const std::wstring real = checked_profile_folder(name, why, missing);
+    bool may_delete = !real.empty() || missing;
+    if (!real.empty()) {
+        EmptyState state;
+        state.root = real;
+        state.deadline = ::GetTickCount64() + 3000;
+        empty_directory(profile_folder(name), 0, state);
+        if (state.outside > 0 || state.cut) {
+            may_delete = false;
+            why = state.outside > 0 ? std::to_string(state.outside) + " entries led outside the folder"
+                                    : "the bound (10000 entries, 3 s, 32 levels) was reached";
+        } else if (state.failed > 0) {
+            text = std::to_string(state.failed) + " entries could not be removed; ";
+        }
     }
-    if (state.outside > 0) {
-        text += ", " + std::to_string(state.outside) + " entries LEFT ALONE because they led outside the folder";
+    if (!may_delete) {
+        text = "own profile NOT removed: " + why;
+    } else {
+        const HRESULT outcome = ::DeleteAppContainerProfile(name.c_str());
+        removed = SUCCEEDED(outcome);
+        char code[32];
+        std::snprintf(code, sizeof code, "0x%08lX", static_cast<unsigned long>(outcome));
+        text = removed ? "own profile removed" + (text.empty() ? std::string() : " (" + text + ")")
+                       : "own profile NOT removed: " + text + "DeleteAppContainerProfile HRESULT " + code;
     }
-    if (state.cut) {
-        text += ", STOPPED at the bound (10000 entries, 3 s, 32 levels): the folder is NOT empty";
-    }
+    milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
     return text;
 }
 
@@ -463,25 +554,86 @@ void exit_on_out_of_memory() {
     std::set_new_handler([] { std::_Exit(kOutOfMemoryExitCode); });
 }
 
-std::string appcontainer_folder_text() { return narrow(container_folder()); }
+std::string appcontainer_folder_text() { return narrow(packages_folder()); }
 
 std::string appcontainer_sid_text(std::string& error) {
+    // Every worker runs under its own container SID now; what the program folder must grant
+    // read and execute to is ALL APPLICATION PACKAGES.
     error.clear();
-    std::string how;
-    PSID sid = container_sid(how, error);
-    if (sid == nullptr) {
-        return {};
+    return "S-1-15-2-1";
+}
+
+ProfileSweep sweep_leftover_profiles() {
+    ProfileSweep sweep;
+    const std::wstring packages = packages_folder();
+    if (packages.empty()) {
+        sweep.text = "not swept: LOCALAPPDATA is not set";
+        return sweep;
     }
-    std::string out;
-    LPWSTR text = nullptr;
-    if (::ConvertSidToStringSidW(sid, &text) && text != nullptr) {
-        out = narrow(text);
-        ::LocalFree(text);
-    } else {
-        error = win_error("ConvertSidToStringSid", ::GetLastError());
+    // The names first (bounded), then one profile at a time.
+    std::vector<std::pair<std::wstring, DWORD>> names;  // name, attributes
+    WIN32_FIND_DATAW found{};
+    const HANDLE search = ::FindFirstFileExW((packages + L"\\" + kContainerName + L"*").c_str(), FindExInfoBasic,
+                                             &found, FindExSearchNameMatch, nullptr, 0);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (names.size() >= 1000) {
+                sweep.cut = true;
+                break;
+            }
+            names.emplace_back(found.cFileName, found.dwFileAttributes);
+        } while (::FindNextFileW(search, &found));
+        ::FindClose(search);
     }
-    ::FreeSid(sid);
-    return out;
+    const ULONGLONG deadline = ::GetTickCount64() + 10000;
+    for (const auto& [name, attributes] : names) {
+        DWORD creator = 0;
+        if (!is_worker_profile_name(name, &creator)) {
+            continue;  // not a name this code makes: not ours to touch
+        }
+        ++sweep.found;
+        if (::GetTickCount64() > deadline) {
+            sweep.cut = true;
+            break;
+        }
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            ++sweep.left_alone;  // a link with our name: never followed, never deleted
+            sweep.names_left_alone.push_back(narrow(name) + " (a link)");
+            continue;
+        }
+        // The profiles of a service that still runs are left alone: the creating process
+        // number is in the name. (A number the system has given to another, unrelated process
+        // since then also counts as running: the profile waits for a later sweep.)
+        if (creator != 0) {
+            const HANDLE owner = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, creator);
+            DWORD code = 0;
+            const bool running = owner == nullptr ? ::GetLastError() == ERROR_ACCESS_DENIED
+                                                  : (::GetExitCodeProcess(owner, &code) && code == STILL_ACTIVE);
+            if (owner != nullptr) {
+                ::CloseHandle(owner);
+            }
+            if (running) {
+                ++sweep.left_alone;
+                sweep.names_left_alone.push_back(narrow(name) + " (its creating process still runs)");
+                continue;
+            }
+        }
+        double milliseconds = 0.0;
+        bool removed = false;
+        const std::string text = remove_worker_profile(name, milliseconds, removed);
+        if (removed) {
+            ++sweep.removed;
+            sweep.names_removed.push_back(narrow(name));
+        } else {
+            ++sweep.failed;
+            sweep.names_failed.push_back(narrow(name) + ": " + text);
+        }
+    }
+    sweep.text = "profiles with the worker prefix: " + std::to_string(sweep.found) + " found, " +
+                 std::to_string(sweep.removed) + " removed, " + std::to_string(sweep.failed) + " failed, " +
+                 std::to_string(sweep.left_alone) + " left alone" +
+                 (sweep.cut ? "; STOPPED at the bound (1000 profiles, 10 s)" : "");
+    return sweep;
 }
 
 std::unique_ptr<io::File> inherited_file(std::string& error) {
@@ -521,6 +673,8 @@ struct StartedChild {
     HANDLE err = nullptr;   // ... of its standard error
     std::string confinement;
     std::string folder_note;
+    std::wstring profile_name;  // the worker's own AppContainer profile; deleted when it has ended
+    double profile_create_ms = 0.0;
 };
 
 static ChildResult run_or_start(const std::filesystem::path& program, const std::vector<std::string>& arguments,
@@ -552,18 +706,28 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
     HANDLE job = nullptr;
     HANDLE port = nullptr;
     PSID sid = nullptr;
+    std::wstring profile_name;  // this worker's own AppContainer profile
     PROCESS_INFORMATION process{};
     std::vector<unsigned char> attribute_store;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = nullptr;
     const auto cleanup = [&] {
+        if (job != nullptr) {
+            // Every process of the job is ended, and the worker's process is waited for, so
+            // that nothing holds a file in its folder when the profile is deleted below.
+            ::TerminateJobObject(job, 1);
+        }
+        if (process.hProcess != nullptr) {
+            ::WaitForSingleObject(process.hProcess, 5000);
+        }
         for (HANDLE* handle : {&child_in, &parent_in, &parent_out, &child_out, &parent_err, &child_err, &file_copy,
                                &port, &process.hThread, &process.hProcess}) {
             close_handle(*handle);
         }
-        if (job != nullptr) {
-            // Closing the last handle of the job kills whatever is still in it.
-            ::TerminateJobObject(job, 1);
-            close_handle(job);
+        close_handle(job);
+        if (!profile_name.empty()) {
+            bool removed = false;
+            result.profile_removal = remove_worker_profile(profile_name, result.profile_delete_ms, removed);
+            profile_name.clear();
         }
         if (attributes != nullptr) {
             ::DeleteProcThreadAttributeList(attributes);
@@ -598,16 +762,17 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
     std::string container_text = "none (confinement not requested)";
     bool in_container = false;
     if (options.confine) {
-        std::string how;
         std::string why_not;
         if (hook_break) {
             why_not = "test hook: the confinement was deliberately not applied";
         } else {
-            sid = container_sid(how, why_not);
+            sid = create_worker_profile(profile_name, result.profile_create_ms, why_not);
         }
         if (sid != nullptr) {
             in_container = true;
-            container_text = "appcontainer (no capabilities; " + how + ")";
+            container_text = "appcontainer (no capabilities; own profile " + narrow(profile_name) + ", created in " +
+                             std::to_string(static_cast<long long>(result.profile_create_ms)) + " ms)";
+            result.container_folder = narrow(profile_folder(profile_name));
         } else if (hook_allow_weaker) {
             container_text = "WEAKER: no AppContainer: " + why_not;
         } else {
@@ -615,14 +780,14 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
         }
     }
 
-    // ---- the container's own folder is emptied before the worker starts (item SW-1) --------
+    // ---- the worker's own folder (item SW-1): new with its profile, checked here -----------
+    // For a one-shot child this is also the moment of the hand-over (the file is inherited).
     std::string folder_text = "not used (no container)";
-    std::string folder_note;  // for ChildResult::container_folder_note: only when NOT emptied
+    std::string folder_note;  // for ChildResult::container_folder_note: only when NOT verified
     if (in_container) {
-        folder_text = empty_container_folder();
-        if (!folder_is_empty_now(folder_text)) {
-            folder_note = "the worker's own folder could not be emptied before this scan: " + folder_text;
-        }
+        folder_note = own_folder_note(profile_name);
+        folder_text = folder_note.empty() ? "its own, new with its profile: " + result.container_folder
+                                          : "NOT VERIFIED: " + folder_note;
     }
 
     // ---- pipes: the child's ends are inheritable, the parent's are not ---------------------
@@ -908,6 +1073,9 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
                             " file); environment (names): " +
                             variable_names + "; container folder: " + folder_text;
         keep->folder_note = folder_note;
+        keep->profile_name = profile_name;  // deleted by the waiting record when the worker has ended
+        keep->profile_create_ms = result.profile_create_ms;
+        profile_name.clear();
         process.hProcess = nullptr;
         process.hThread = nullptr;
         job = nullptr;
@@ -1078,6 +1246,8 @@ struct WaitingChild::Impl {
     bool memory_message = false; // the job said that the memory limit was reached
     std::uint64_t peak_memory = 0;
     std::string at_limit;        // what the worker looked like at the time limit
+    std::string profile_removal; // what happened when its own profile was deleted
+    double profile_delete_ms = 0.0;
 };
 
 namespace {
@@ -1169,6 +1339,12 @@ void finish_child(WaitingChild::Impl& c) {
     for (HANDLE* handle : {&c.child.in, &c.child.out, &c.child.err, &c.child.port, &c.child.thread,
                            &c.child.process, &c.child.job}) {
         close_handle(*handle);  // closing the job's last handle kills anything still in it
+    }
+    // The worker is gone: its own profile, and with it everything it wrote, goes too.
+    if (!c.child.profile_name.empty()) {
+        bool removed = false;
+        c.profile_removal = remove_worker_profile(c.child.profile_name, c.profile_delete_ms, removed);
+        c.child.profile_name.clear();
     }
     c.finished = true;
 }
@@ -1332,6 +1508,10 @@ bool hand_over_file(WaitingChild& child, const io::File& file, std::span<const s
         error = "the file was not handed over: the job is longer than " + std::to_string(kMaxJobBytes) + " bytes";
         return false;
     }
+    // The note on the worker's own folder is taken NOW, at the hand-over, not at the start.
+    if (!c.child.profile_name.empty()) {
+        c.child.folder_note = own_folder_note(c.child.profile_name);
+    }
     // A copy of the file's handle INSIDE the worker process, with read rights only
     // (FILE_GENERIC_READ: read data, attributes and extended attributes, read the access
     // list, synchronize; no write, append, delete or change right), NOT inheritable. A handle
@@ -1369,11 +1549,18 @@ ChildResult collect(WaitingChild& child, const Limits& limits) {
     ChildResult result;
     result.confinement = c.child.confinement;
     result.container_folder_note = c.child.folder_note;
+    result.container_folder = narrow(profile_folder(c.child.profile_name));
+    result.profile_create_ms = c.child.profile_create_ms;
+    const auto profile_figures = [&] {  // after finish_child: the profile is deleted by then
+        result.profile_removal = c.profile_removal;
+        result.profile_delete_ms = c.profile_delete_ms;
+    };
     if (c.state != WaitingState::HandedOver) {
         const std::string why = c.state == WaitingState::Ended
                                     ? "the worker had ended before it was given a file: " + c.failure
                                     : std::string("collect() was called on a worker that was given no file");
         end_waiting(child);
+        profile_figures();
         result.end = ChildResult::End::StartFailed;
         result.detail = why;
         return result;
@@ -1400,6 +1587,7 @@ ChildResult collect(WaitingChild& child, const Limits& limits) {
     }
     finish_child(c);
     c.state = WaitingState::Ended;
+    profile_figures();
 
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.handed_over).count();
     result.peak_memory_bytes = c.peak_memory;
@@ -1450,6 +1638,11 @@ void end_waiting(WaitingChild& child) {
 }
 
 std::string confinement_at_start(const WaitingChild& child) { return child.impl().child.confinement; }
+
+std::string worker_folder(const WaitingChild& child) {
+    const WaitingChild::Impl& c = child.impl();
+    return c.finished ? std::string() : narrow(profile_folder(c.child.profile_name));
+}
 
 std::string failure(const WaitingChild& child) { return child.impl().failure; }
 

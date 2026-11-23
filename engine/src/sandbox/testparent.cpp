@@ -19,16 +19,28 @@
 //   --end-unused (end the waiting worker without using it), --delay-hand-over SECONDS,
 //   --abandon (print the worker's first line and leave at once without ending it: the worker
 //   must end by itself).
+// Per-worker profiles (Windows):
+//   mie-sandbox-testparent --sweep             runs sweep_leftover_profiles, prints the result
+//   mie-sandbox-testparent CHILD --hold N      starts N waiting workers, prints their folders,
+//                                              then waits (up to 120 s) to be killed
+//   mie-sandbox-testparent CHILD --cross-scan --file F
+//                                              worker B is started and waits; worker A is
+//                                              started, handed F with a job to write files in
+//                                              its own folder, in B's folder and in its TEMP,
+//                                              and collected; then B is handed F with a job to
+//                                              look for all of those files.
 #include "mie/io.hpp"
 #include "mie/sandbox.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <chrono>
 #include <span>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -60,6 +72,10 @@ std::string json_result(const mie::sandbox::ChildResult& result) {
            ",\"exit_code\":" + std::to_string(result.exit_code) + ",\"output\":" + json_text(result.output) +
            ",\"detail\":" + json_text(result.detail) + ",\"confinement\":" + json_text(result.confinement) +
            ",\"container_folder_note\":" + json_text(result.container_folder_note) +
+           ",\"container_folder\":" + json_text(result.container_folder) +
+           ",\"profile_create_ms\":" + std::to_string(result.profile_create_ms) +
+           ",\"profile_delete_ms\":" + std::to_string(result.profile_delete_ms) +
+           ",\"profile_removal\":" + json_text(result.profile_removal) +
            ",\"peak_memory_bytes\":" + std::to_string(result.peak_memory_bytes) + ",\"seconds\":" + seconds + "}";
 }
 
@@ -196,7 +212,136 @@ int run_waiting(const WaitingRun& run) {
 
 }  // namespace
 
+std::string json_list(const std::vector<std::string>& items) {
+    std::string out;
+    for (const std::string& item : items) {
+        out += (out.empty() ? "" : ",") + json_text(item);
+    }
+    return "[" + out + "]";
+}
+
+// Starts a waiting worker running ACTION and waits until it has printed its ready line.
+std::unique_ptr<mie::sandbox::WaitingChild> start_ready(const std::string& child, const std::string& action,
+                                                        const mie::sandbox::RunOptions& options) {
+    namespace sandbox = mie::sandbox;
+    sandbox::WaitingOptions waiting_options;
+    waiting_options.run = options;
+    auto worker = sandbox::start_waiting(child, {"waiting", "0", action}, waiting_options);
+    const auto started = std::chrono::steady_clock::now();
+    std::string first;
+    while (std::chrono::steady_clock::now() - started < std::chrono::seconds(10)) {
+        const sandbox::WaitingState state = sandbox::poll(*worker);
+        if (state == sandbox::WaitingState::Ended) {
+            break;
+        }
+        if (state == sandbox::WaitingState::Waiting) {
+            first += sandbox::take_output(*worker);
+            if (first.find('\n') != std::string::npos) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return worker;
+}
+
+int run_sweep() {
+    const mie::sandbox::ProfileSweep sweep = mie::sandbox::sweep_leftover_profiles();
+    std::printf("{\"found\":%d,\"removed\":%d,\"failed\":%d,\"left_alone\":%d,\"cut\":%s,\"names_removed\":%s,"
+                "\"names_failed\":%s,\"names_left_alone\":%s,\"text\":%s}\n",
+                sweep.found, sweep.removed, sweep.failed, sweep.left_alone, sweep.cut ? "true" : "false",
+                json_list(sweep.names_removed).c_str(), json_list(sweep.names_failed).c_str(),
+                json_list(sweep.names_left_alone).c_str(), json_text(sweep.text).c_str());
+    return 0;
+}
+
+// Starts `count` waiting workers, prints their folders, then waits to be killed (the test
+// kills this process hard, so that nothing is cleaned up).
+int run_hold(const std::string& child, int count, const mie::sandbox::RunOptions& options) {
+    std::vector<std::unique_ptr<mie::sandbox::WaitingChild>> workers;
+    std::vector<std::string> folders;
+    for (int i = 0; i < count; ++i) {
+        workers.push_back(start_ready(child, "whoami", options));
+        folders.push_back(mie::sandbox::worker_folder(*workers.back()));
+    }
+    std::printf("{\"holding\":%d,\"folders\":%s}\n", count, json_list(folders).c_str());
+    std::fflush(stdout);
+    for (int i = 0; i < 1200; ++i) {
+        for (auto& worker : workers) {
+            mie::sandbox::poll(*worker);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return 0;
+}
+
+// The cross-scan case (finding on M-13): no state from one worker to another pre-started one.
+int run_cross(const std::string& child, const std::string& file_path, const mie::sandbox::RunOptions& options) {
+    namespace sandbox = mie::sandbox;
+    mie::io::IoError io_error;
+    const std::unique_ptr<mie::io::File> file = mie::io::open_regular(file_path, io_error);
+    if (!file) {
+        std::printf("{\"end\":\"test_setup_failed\",\"detail\":\"the cross-scan needs --file\"}\n");
+        return 2;
+    }
+    sandbox::Limits limits;
+    limits.wall_seconds = 20;
+    // B first: pre-started, waiting while A works.
+    const auto worker_b = start_ready(child, "look-job-paths", options);
+    const auto worker_a = start_ready(child, "write-job-paths", options);
+    const std::string folder_a = sandbox::worker_folder(*worker_a);
+    const std::string folder_b = sandbox::worker_folder(*worker_b);
+    const char separator = '\\';
+    std::vector<std::string> paths;
+    for (const std::string& folder : {folder_a, folder_b}) {
+        if (folder.empty()) {
+            continue;
+        }
+        paths.push_back(folder + separator + "mie-cross-root.txt");
+        paths.push_back(folder + separator + "AC" + separator + "mie-cross-ac.txt");
+        paths.push_back(folder + separator + "AC" + separator + "Temp" + separator + "mie-cross-temp.txt");
+    }
+    std::string job_a;
+    for (const std::string& path : paths) {
+        job_a += path + "\n";
+    }
+    job_a += "ENV:TEMP\nENV:TMP\n";
+    std::string error_a;
+    const bool handed_a = sandbox::hand_over_file(
+        *worker_a, *file,
+        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(job_a.data()), job_a.size()), error_a);
+    const sandbox::ChildResult result_a = sandbox::collect(*worker_a, limits);
+    // What is on disk now, seen by THIS (unconfined) process, after A has ended.
+    std::string on_disk;
+    for (const std::string& path : paths) {
+        std::error_code ignored;
+        on_disk += (on_disk.empty() ? "" : ",") + json_text(path) + ":" +
+                   (std::filesystem::exists(path, ignored) ? "true" : "false");
+    }
+    std::error_code ignored;
+    const bool folder_a_after = !folder_a.empty() && std::filesystem::exists(folder_a, ignored);
+    // B looks for everything A tried to leave (its own TEMP / TMP files are named by the same
+    // ENV lines and resolved in B's environment).
+    std::string error_b;
+    const bool handed_b = sandbox::hand_over_file(
+        *worker_b, *file,
+        std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(job_a.data()), job_a.size()), error_b);
+    const sandbox::ChildResult result_b = sandbox::collect(*worker_b, limits);
+    std::printf("{\"folder_a\":%s,\"folder_b\":%s,\"handed_a\":%s,\"error_a\":%s,\"handed_b\":%s,\"error_b\":%s,"
+                "\"on_disk_after_a\":{%s},\"folder_a_exists_after_a\":%s,\"folder_b_exists_after_b\":%s,"
+                "\"a\":%s,\"b\":%s}\n",
+                json_text(folder_a).c_str(), json_text(folder_b).c_str(), handed_a ? "true" : "false",
+                json_text(error_a).c_str(), handed_b ? "true" : "false", json_text(error_b).c_str(), on_disk.c_str(),
+                folder_a_after ? "true" : "false",
+                (!folder_b.empty() && std::filesystem::exists(folder_b, ignored)) ? "true" : "false",
+                json_result(result_a).c_str(), json_result(result_b).c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--sweep") {
+        return run_sweep();
+    }
     if (argc == 2 && std::string(argv[1]) == "--sid") {
         std::string error;
         const std::string sid = mie::sandbox::appcontainer_sid_text(error);
@@ -216,6 +361,8 @@ int main(int argc, char** argv) {
     std::size_t max_output = 64 * 1024;
     bool then_echo = false;
     bool waiting = false;
+    bool cross_scan = false;
+    int hold = 0;
     WaitingRun waiting_run;
     std::vector<std::string> child_arguments;
     int i = 2;
@@ -233,6 +380,10 @@ int main(int argc, char** argv) {
             options.test_break_confinement = true;
         } else if (argument == "--waiting") {
             waiting = true;
+        } else if (argument == "--cross-scan") {
+            cross_scan = true;
+        } else if (argument == "--hold" && has_value) {
+            hold = std::atoi(argv[++i]);
         } else if (argument == "--second-hand-over") {
             waiting_run.second_hand_over = true;
         } else if (argument == "--end-unused") {
@@ -270,6 +421,12 @@ int main(int argc, char** argv) {
         child_arguments.emplace_back(argv[i]);
     }
 
+    if (hold > 0) {
+        return run_hold(child, hold, options);
+    }
+    if (cross_scan) {
+        return run_cross(child, file_path, options);
+    }
     if (waiting) {
         waiting_run.child = child;
         waiting_run.child_arguments = child_arguments;

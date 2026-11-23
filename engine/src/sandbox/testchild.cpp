@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <memory>
 #include <span>
 #include <string>
@@ -242,6 +243,37 @@ void try_spawn(Line& line) {
 // Used by the actions that try to misuse it; the sandbox library keeps owning it.
 // The file a WAITING test child received (ruling M-13); null in the one-shot shape.
 std::unique_ptr<mie::io::File> g_waiting_file;
+// The job bytes it received with the file.
+std::string g_waiting_job;
+
+// The job of the actions write-job-paths / look-job-paths: one path per line; a line
+// "ENV:NAME" stands for "<value of NAME>\mie-job-<NAME>.txt" (for example the TEMP this
+// process sees). Returns the paths, resolved.
+std::vector<std::string> job_paths() {
+    std::vector<std::string> paths;
+    std::istringstream lines(g_waiting_job);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.rfind("ENV:", 0) == 0) {
+            const char* value = std::getenv(line.c_str() + 4);
+            if (value == nullptr || *value == '\0') {
+                continue;
+            }
+#if defined(_WIN32)
+            line = std::string(value) + "\\mie-job-" + line.substr(4) + ".txt";
+#else
+            line = std::string(value) + "/mie-job-" + line.substr(4) + ".txt";
+#endif
+        }
+        if (!line.empty()) {
+            paths.push_back(line);
+        }
+    }
+    return paths;
+}
 
 long long inherited_number() {
     if (g_waiting_file) {
@@ -640,6 +672,7 @@ int main(int argc, char** argv) {
         std::vector<std::uint8_t> job;
         std::string what;
         g_waiting_file = mie::sandbox::receive_file_and_seal(job, what);
+        g_waiting_job.assign(job.begin(), job.end());
         // What it holds AFTER the seal, before one byte of the file is read.
         Line after;
         after.text("phase", "after");
@@ -722,6 +755,25 @@ int main(int argc, char** argv) {
             const char* value = std::getenv(name);
             line.text(name, value != nullptr ? value : "");
         }
+    } else if (action == "write-job-paths" || action == "look-job-paths") {
+        // Item SW-1 and the cross-scan case: create (write-) or look for (look-) each path of
+        // the job; the answer lists which worked.
+        std::string done;
+        std::string refused;
+        for (const std::string& path : job_paths()) {
+            std::FILE* file = std::fopen(path.c_str(), action == "write-job-paths" ? "wb" : "rb");
+            if (file != nullptr) {
+                if (action == "write-job-paths") {
+                    std::fputs("left by a worker\n", file);
+                }
+                std::fclose(file);
+                done += (done.empty() ? "" : ",") + json_text(path);
+            } else {
+                refused += (refused.empty() ? "" : ",") + json_text(path);
+            }
+        }
+        line.raw(action == "write-job-paths" ? "written" : "seen", "[" + done + "]");
+        line.raw(action == "write-job-paths" ? "not_written" : "not_seen", "[" + refused + "]");
     } else if (action == "handles") {
         list_inherited(line);
     } else if (action == "write-handle") {

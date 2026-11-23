@@ -75,11 +75,19 @@ struct ChildResult {
     std::string output;       // the child's standard output, at most max_output_bytes
     std::string detail;       // why, in words; also the first part of the child's standard error
     std::string confinement;  // what was actually applied, e.g. "appcontainer+job", "seccomp+landlock"
-    // Windows: not empty when the worker container's own folder could NOT be emptied before
-    // this worker started (or its place is not known): the sentence to put in the result
-    // header of the scan (reviewer's ruling on SW-1). Empty when the folder was emptied, and
+    // Windows: not empty when the worker's own folder could not be checked AT THE HAND-OVER
+    // (not a real folder at its place, or its place unknown): the sentence to put in the
+    // result header of the scan (reviewer's ruling on SW-1). Empty when it was verified, and
     // always on Linux, where the worker has no folder.
     std::string container_folder_note;
+    // Windows: every confined worker runs under its OWN AppContainer profile, created for it
+    // and deleted when it has ended (no two workers share a writable folder). Its folder, the
+    // time the profile took to create and to delete (part of the price of a start), and what
+    // happened at the deletion. Empty / 0 on Linux.
+    std::string container_folder;
+    double profile_create_ms = 0.0;
+    double profile_delete_ms = 0.0;
+    std::string profile_removal;
     std::uint64_t peak_memory_bytes = 0;  // measured by the system, not by the child (0 = unknown)
     double seconds = 0.0;                 // wall time from start to end
 };
@@ -119,15 +127,36 @@ void exit_on_out_of_memory();
 // Linux: "no_new_privs=1 seccomp=2". Windows: "appcontainer=1 integrity=0x1000 in_job=1".
 std::string describe_self();
 
-// Windows: the text form of the AppContainer SID the worker runs under, so that an
-// installer or a test can give that SID read access to the program folder. Empty elsewhere.
+// Windows: the SID that an installer or a test must give read and execute access to the
+// program folder. Now always ALL APPLICATION PACKAGES (S-1-15-2-1): what the program folder must grant read
+// and execute to, since every worker has a SID of its own. Empty on Linux.
 std::string appcontainer_sid_text(std::string& error);
 
-// Windows: the worker container's own folder (%LOCALAPPDATA%\Packages\<container name>), the
-// one place the confined worker can write. run_confined empties it before every confined
-// start and says so in ChildResult::confinement. Nothing in the product reads it. Empty
-// elsewhere: on Linux the worker has no folder at all.
+// Windows: the folder that holds the workers' profile folders (%LOCALAPPDATA%\Packages).
+// Every confined worker gets its own profile, "Dexmond.MIE.Worker.<process>.<random>", and
+// with it its own folder, the one place it can write; the profile is deleted when the worker
+// has ended. Nothing in the product reads those folders. Empty elsewhere: on Linux a worker
+// has no folder at all.
 std::string appcontainer_folder_text();
+
+// Clean-up after a crash: deletes the worker profiles that a killed worker or a crashed
+// service left behind. The service calls it ONCE when it starts, before it starts workers.
+// Only names this library makes are touched (the prefix is fixed here, not a parameter, so a
+// caller cannot point it at other profiles). Left alone: a profile whose creating process
+// still runs, and an entry that is a link (never followed). Bounded: 1000 profiles, 10
+// seconds, and per profile the bounds of the folder clean-up. On Linux: nothing to do.
+struct ProfileSweep {
+    int found = 0;
+    int removed = 0;
+    int failed = 0;
+    int left_alone = 0;
+    bool cut = false;  // a bound was reached
+    std::vector<std::string> names_removed;
+    std::vector<std::string> names_failed;      // with the reason
+    std::vector<std::string> names_left_alone;  // with the reason
+    std::string text;
+};
+ProfileSweep sweep_leftover_profiles();
 
 // True in a build with a memory-error sanitizer. Such a build reserves terabytes of
 // address space, so the address-space limit cannot be applied to it; only the parent's
@@ -239,6 +268,8 @@ std::string confinement_at_start(const WaitingChild& child);
 std::string failure(const WaitingChild& child);
 // Age of the worker, for the caller's "replace after a fixed age" rule.
 double seconds_since_start(const WaitingChild& child);
+// Windows: the worker's own folder while it lives (empty once it has ended, and on Linux).
+std::string worker_folder(const WaitingChild& child);
 
 // ---- the worker's side ----------------------------------------------------------------------
 

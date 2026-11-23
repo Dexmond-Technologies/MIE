@@ -234,6 +234,12 @@ bool sanitizer_build() { return MIE_SANITIZER_BUILD != 0; }
 
 std::string appcontainer_folder_text() { return {}; }
 
+ProfileSweep sweep_leftover_profiles() {
+    ProfileSweep sweep;
+    sweep.text = "nothing to sweep: on Linux a worker has no profile and no folder";
+    return sweep;
+}
+
 std::string appcontainer_sid_text(std::string& error) {
     error = "AppContainer is a Windows mechanism";
     return {};
@@ -1333,6 +1339,8 @@ void end_waiting(WaitingChild& child) {
     }
     c.state = WaitingState::Ended;
 }
+
+std::string worker_folder(const WaitingChild&) { return {}; }
 
 std::string confinement_at_start(const WaitingChild& child) {
     const WaitingChild::Impl& c = child.impl();
