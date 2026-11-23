@@ -187,17 +187,21 @@ jobs:
       - name: Run .deb acceptance tests inside debian:13 container (L-3 to L-6)
         run: |
           set -eu
-          DEB_ABS="$GITHUB_WORKSPACE/build-pkg/out/${{ steps.pkg.outputs.deb_name }}"
+          DEB_NAME="${{ steps.pkg.outputs.deb_name }}"
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
-            -w "$GITHUB_WORKSPACE" \
+            -v "$GITHUB_WORKSPACE:/mie-src:ro" \
             debian:13 \
             bash -euxc "
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends python3 passwd
+              mkdir -p /tmp/mie-test/engine
+              cp -r /mie-src/engine/packaging /tmp/mie-test/engine/packaging
+              cp -r /mie-src/engine/third_party /tmp/mie-test/engine/third_party
+              cp '/mie-src/build-pkg/out/$DEB_NAME' '/tmp/mie-test/$DEB_NAME'
+              chmod -R a+rX /tmp/mie-test
               useradd -m -s /bin/sh mieuser
-              python3 '$GITHUB_WORKSPACE/engine/packaging/test_linux_pkg.py' --debian-container '$DEB_ABS'
+              python3 /tmp/mie-test/engine/packaging/test_linux_pkg.py --debian-container '/tmp/mie-test/$DEB_NAME'
             "
       - name: Upload unsigned Linux test packages (7 days)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

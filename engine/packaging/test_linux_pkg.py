@@ -80,11 +80,19 @@ def check_ldd_no_missing(binaries: list[Path]) -> tuple[bool, str]:
     return True, f"ldd clean for {[b.name for b in binaries]}"
 
 
-def run_normal_user_smoke(mie_bin: Path, svc_bin: Path) -> tuple[bool, str]:
+def run_normal_user_smoke(
+    mie_bin: Path, svc_bin: Path, elf_bins: list[Path] | None = None
+) -> tuple[bool, str]:
     if os.geteuid() == 0:
         return False, "refusing to run normal-user smoke check as root (UID 0)"
 
-    ldd_ok, ldd_detail = check_ldd_no_missing([mie_bin, svc_bin])
+    if elf_bins is None:
+        if mie_bin == Path("/usr/bin/mie") and Path("/opt/dexmond-mie/mie").is_file():
+            elf_bins = [Path("/opt/dexmond-mie/mie"), svc_bin]
+        else:
+            elf_bins = [mie_bin, svc_bin]
+
+    ldd_ok, ldd_detail = check_ldd_no_missing(elf_bins)
     if not ldd_ok:
         return False, ldd_detail
 
@@ -155,6 +163,7 @@ def snapshot_system_tree() -> set[str]:
         "/mnt",
         "/media",
         "/work",
+        "/mie-src",
         str(REPO_ROOT),
     }
     paths: set[str] = set()
@@ -423,7 +432,7 @@ def main() -> int:
     # ---- L-2 -------------------------------------------------------------------------
     # First print full raw lintian output to the CI log for complete auditability.
     raw_lintian = subprocess.run(
-        ["lintian", "--no-tag-display-limit", str(deb_path)],
+        ["lintian", "--tag-display-limit", "0", str(deb_path)],
         capture_output=True,
         text=True,
     )
@@ -434,14 +443,15 @@ def main() -> int:
         print(raw_lintian.stderr.rstrip(), flush=True)
     print("--- end lintian raw output ---", flush=True)
 
-    # Suppress ONLY the two Debian-archive-only tags directly required by the brief's
+    # Suppress ONLY the three Debian-archive-only tags directly caused by the brief's
     # layout rules (/opt/dexmond-mie/ in Req 4, and no /usr/share/doc in L-3).
     lintian_res = subprocess.run(
         [
             "lintian",
-            "--no-tag-display-limit",
+            "--tag-display-limit",
+            "0",
             "--suppress-tags",
-            "dir-or-file-in-opt,no-copyright-file",
+            "dir-or-file-in-opt,no-copyright-file,no-changelog",
             str(deb_path),
         ],
         capture_output=True,
