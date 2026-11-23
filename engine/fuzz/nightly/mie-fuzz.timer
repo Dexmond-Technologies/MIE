@@ -1,0 +1,14 @@
+# systemd USER unit: ~/.config/systemd/user/mie-fuzz.timer
+# Starts every night at 00:30 node time. One hour of fuzzing plus the build ends before 02:30,
+# clear of the 03:00 to 05:00 window. Persistent: a night missed while the node was off is
+# run at the next start, and its record carries the real date, so the gap stays visible.
+[Unit]
+Description=Nightly start of Dexmond MIE fuzzing
+
+[Timer]
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
