@@ -21,8 +21,8 @@ not_run = []
 passed = 0
 
 
-def probe(path):
-    out = subprocess.run([PROBE, 'file', path], capture_output=True, timeout=60)
+def probe(path, *extra):
+    out = subprocess.run([PROBE, 'file', path, *extra], capture_output=True, timeout=60)
     text = out.stdout.decode('utf-8', 'replace').strip()
     try:
         return json.loads(text)
@@ -31,9 +31,9 @@ def probe(path):
                 'returncode': out.returncode}
 
 
-def expect(name, path, state, code=None):
+def expect(name, path, state, code=None, extra=()):
     global passed
-    got = probe(path)
+    got = probe(path, *extra)
     ok = got.get('state') == state and (code is None or got.get('code') in code)
     print(f"{'PASS' if ok else 'FAIL'}  {name}: expected {state} {sorted(code) if code else ''} got {got}")
     if ok:
@@ -103,6 +103,23 @@ with tempfile.TemporaryDirectory(prefix='mie-io-') as tmp:
             skip('junction is refused', 'mklink /J failed: ' + made.stderr.decode('utf-8', 'replace').strip())
         else:
             expect('junction is refused', junction, 'refused', {'link'})
+        # A file marked "offline" stands for a file whose content is only in cloud storage
+        # (reviewer's finding MW-1): not opened by default, opened when asked explicitly.
+        cloud = os.path.join(tmp, 'cloud-only.bin')
+        with open(cloud, 'wb') as f:
+            f.write(b'content that would have to be downloaded\n')
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+        OFFLINE = 0x1000
+        before = kernel32.GetFileAttributesW(cloud)
+        kernel32.SetFileAttributesW(cloud, before | OFFLINE)
+        after = kernel32.GetFileAttributesW(cloud)
+        if after == 0xFFFFFFFF or not (after & OFFLINE):
+            skip('cloud-only file is not opened by default', f'could not set the offline attribute (attributes {after:#x})')
+        else:
+            expect('cloud-only file is not opened by default', cloud, 'refused', {'cloud_only'})
+            expect('cloud-only file is opened when the user asks for it', cloud, 'ok', extra=('--allow-cloud-only',))
         # device names
         expect('device name NUL is refused', 'NUL', 'refused', {'not_regular', 'not_found', 'access_denied', 'other'})
         expect('device name CON is refused', 'CON', 'refused', {'not_regular', 'not_found', 'access_denied', 'other'})

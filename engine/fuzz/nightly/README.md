@@ -13,8 +13,27 @@ builds the fuzz targets with clang, libFuzzer, AddressSanitizer and UndefinedBeh
 from the vcpkg commit that `.github/workflows/engine.yml` pins, and runs every target for one
 hour, each on its own core, all at the same time.
 
-Targets today: `fuzz_frame` (the channel frame decoder). Planned with the engine: the executable
-parser and the archive reader. A new target is added to `TARGETS` in the script and in the
+Targets today: `fuzz_frame` (the channel frame decoder) and `fuzz_pe` (the reader for Windows
+executables). Planned with the engine: the archive reader.
+
+## Second part of the night: parity on 200,000 damaged executables
+
+After the fuzzing the same script builds the engine's two executable probes (normal build,
+system compiler, same pinned vcpkg) and runs `engine/tests/pe_parity.py` and
+`engine/tests/pe_analysis_parity.py`, the tests every push runs with 100 damaged variants per
+base file, with at least 200,000 variants in all (reviewer, board B-3620) and a seed taken from
+the date, so every night tries different damage. The seed is in the log and in the record, so
+any night can be repeated: `MIE_PE_SEED=<seed> MIE_PE_TOTAL_VARIANTS=200000 python
+engine/tests/pe_parity.py <probe> <repository>`.
+
+The reference side needs Python with `pefile==2024.8.26`. The script keeps a virtual
+environment for it under the work folder (`venv/`), created the first time; that first time
+needs network access to the Python package index. `yara-python==4.5.1` is installed there too
+when the node's Python has a build of it; these two tests do not use it.
+
+A record of kind `parity` has `runs` = damaged variants compared, `seed`, and the test's last
+line in `detail`. PASS needs exit code 0 AND at least the required number of variants.
+How long 200,000 variants take on the node: NOT MEASURED. A new target is added to `TARGETS` in the script and in the
 `CPUQuota` of the unit.
 
 ## What it leaves, under `/mnt/node4-work/mie-fuzz/`
@@ -34,13 +53,14 @@ later commit that contains it.
 
 ## Missed or failed nights
 
-`check_night.sh [date]` prints one line per target for a night: PASS, FAILED or MISSED (no
-record). The board lives on the coordinator's machine, not on the node, so the posting of a
+`check_night.sh [date]` prints one line per fuzz target and per parity test for a night: PASS,
+FAILED or MISSED (no record). The board lives on the coordinator's machine, not on the node, so the posting of a
 missed or failed night is done by the coordinator from this line; the job itself cannot post.
 
 ## Resources
 
-- Cores: one per target while fuzzing (today 1; 3 when the parser and archive targets exist);
+- Cores: one per target while fuzzing (two targets today); then one per parity test (two) for the
+  second part;
   the build before it uses all cores for a few minutes (first night longer: OpenSSL and Catch2
   are built once from source and then cached under `vcpkg-cache/`).
 - Memory: at most 2 GiB per target (libFuzzer's limit, `-rss_limit_mb=2048`); the unit caps the

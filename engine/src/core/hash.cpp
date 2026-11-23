@@ -80,6 +80,17 @@ Hashes TripleHasher::finish() {
     return out;
 }
 
+std::string sha256_hex(std::span<const std::uint8_t> data) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    static const unsigned char nothing = 0;
+    const unsigned char* bytes = data.empty() ? &nothing : data.data();
+    if (EVP_Digest(bytes, data.size(), digest, &length, EVP_sha256(), nullptr) != 1) {
+        return {};
+    }
+    return to_hex(digest, length);
+}
+
 bool hash_file(io::File& file, Hashes& out, io::IoError& error) {
     TripleHasher hasher;
     if (!hasher.ok()) {

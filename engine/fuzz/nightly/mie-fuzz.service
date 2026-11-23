@@ -9,7 +9,7 @@ ExecStart=%h/mie-fuzz/run_nightly.sh
 Environment=MIE_FUZZ_WORK=/mnt/node4-work/mie-fuzz
 Environment=MIE_FUZZ_SECONDS=3600
 Nice=10
-# One core per target; today one target. Raise CPUQuota with the number of targets (100% each).
-CPUQuota=100%
+# One core per target (100% each): channel frame decoder, executable reader, zip reader, tar reader, signature check.
+CPUQuota=500%
 MemoryMax=6G
-TimeoutStartSec=3h
+TimeoutStartSec=12h

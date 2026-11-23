@@ -28,7 +28,124 @@
       "used_for": "unit tests only",
       "expected_version": "3.16.0",
       "expected_commit": "317ac1ed4c0bb6e6b91eafc817e05c488feffcb3"
+    },
+    "yara": {
+      "repository": "https://github.com/VirusTotal/yara",
+      "tag": "v{version}",
+      "port_dir": "engine/vcpkg-ports/yara",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "rule matching over file bytes; pinned to the reference's version 4.5.1 (reviewer's condition M-5)",
+      "expected_version": "4.5.1",
+      "expected_commit": "0e5b6bb9660cba500eb58dbccb027757c82cc4cf",
+      "source_archive": "https://github.com/VirusTotal/yara/archive/v4.5.1.tar.gz",
+      "source_archive_sha512": "8bf1df7089f9bc5a448dbae0999e04f4ecdec06b4478e2cb5f42a2a3201b99fce68379e3f8f7c67a9db201205366250d7befe5c38451cced807ed692d436422c"
+    },
+    "zlib": {
+      "repository": "https://github.com/madler/zlib",
+      "tag": "v{version}",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "raw deflate of zip members and of gzip-compressed tars (reviewer's ruling M-4c)",
+      "expected_version": "1.3.2",
+      "expected_commit": "da607da739fa6047df13e66a2af6b8bec7c2a498"
+    },
+    "bzip2": {
+      "repository": "https://gitlab.com/bzip2/bzip2",
+      "tag": "bzip2-{version}",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "bzip2 zip members and bzip2-compressed tars (reviewer's ruling M-4c)",
+      "expected_version": "1.0.8",
+      "expected_commit": "6a8690fc8d26c815e798c588f796eabe9d684cf0"
+    },
+    "liblzma": {
+      "repository": "https://github.com/tukaani-project/xz",
+      "tag": "v{version}",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "lzma zip members and xz/lzma-compressed tars (reviewer's ruling M-4c)",
+      "expected_version": "5.8.4",
+      "expected_commit": "d3e650e63c110e830fd5391e7f8b45df0b91d3da"
     }
   },
-  "accepted_vulnerabilities": []
+  "accepted_vulnerabilities": [
+    {
+      "id": "CVE-2026-88341",
+      "library": "yara",
+      "version": "4.5.1",
+      "accepted_by": "r-01 (reviewer), board B-3616",
+      "date": "2026-11-23",
+      "reason": "Not reachable: the flaw is in loading compiled-rules files, which the engine never does. The engine's calls into YARA are: yr_initialize, yr_compiler_create, yr_compiler_set_callback, yr_compiler_set_include_callback, yr_compiler_add_string, yr_compiler_get_rules, yr_compiler_destroy, yr_rule_metas_foreach, yr_rules_scan_mem, yr_rules_destroy.",
+      "conditions": [
+        "the guard against yr_rules_load, yr_rules_load_stream, yr_rules_save and yr_rules_save_stream stays for good",
+        "this record only: any other advisory fails the check",
+        "rules enter only as the shipped source files; a rule 'include' is not followed; the shipped rule folder is not writable by an ordinary user after install (shown in the install test)",
+        "re-check at each release candidate; a move to a fixed YARA release that still passes rules parity is a numbered difference"
+      ]
+    },
+    {
+      "id": "CVE-2026-85091",
+      "library": "zlib",
+      "version": "1.3.2",
+      "accepted_by": "r-01 (reviewer), board B-3627",
+      "date": "2026-11-23",
+      "reason": "Not reachable: the flaw is in zlib's gz file writing layer. The engine's only calls into zlib are inflateInit2, inflate, inflateEnd and crc32, all in engine/src/archive/codec.cpp; no gz function, no deflate, no compress.",
+      "conditions": [
+        "the guard against the gz functions, deflate, deflateInit, deflateInit2 and compress stays for good",
+        "this record only: any other advisory fails the check",
+        "zlib is maintained: move the pin to a fixed zlib as soon as the dependency set offers one, checked at each release candidate at the latest; an overlay port is not required now"
+      ]
+    }
+  ],
+  "vulnerability_guards": [
+    {
+      "id": "CVE-2026-88341",
+      "library": "yara",
+      "what": "An assertion can be reached when LOADING a crafted compiled-rules file (.yrc); the program then terminates. Public record: https://api.osv.dev/v1/vulns/CVE-2026-88341 (CVSS 3.1 AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:N/A:H). The record names YARA 4.5.8, the newest release, as affected; the fix it points to is in a fork, not in a YARA release.",
+      "why_guarded": "The engine never loads compiled-rules files: rules are compiled at start from the rule source files shipped with the product, and the bytes of a scanned file never reach the rule loader.",
+      "forbidden_symbols": [
+        "yr_rules_load",
+        "yr_rules_load_stream",
+        "yr_rules_save",
+        "yr_rules_save_stream"
+      ],
+      "status": "ACCEPTED AS NOT REACHABLE by r-01, board B-3616, 2026-11-23; the guard stays for good."
+    },
+    {
+      "id": "CVE-2026-85091",
+      "library": "zlib",
+      "what": "Heap buffer overflow through a stale pointer in gzwrite after a failed write (zlib 1.2.11 through 1.3.2). Public record: https://api.osv.dev/v1/vulns/CVE-2026-85091. The flaw is in zlib's gz file layer (writing compressed files).",
+      "why_guarded": "The engine never uses zlib's gz file layer and never compresses. Its only calls into zlib are inflateInit2 (raw deflate, window -15), inflate, inflateEnd and crc32, all in engine/src/archive/codec.cpp.",
+      "forbidden_symbols": [
+        "gzopen",
+        "gzdopen",
+        "gzbuffer",
+        "gzsetparams",
+        "gzwrite",
+        "gzfwrite",
+        "gzprintf",
+        "gzvprintf",
+        "gzputs",
+        "gzputc",
+        "gzflush",
+        "gzread",
+        "gzfread",
+        "gzgets",
+        "gzgetc",
+        "gzungetc",
+        "gzseek",
+        "gzclose",
+        "gzclose_r",
+        "gzclose_w",
+        "deflateInit",
+        "deflateInit2",
+        "deflate",
+        "compress",
+        "compress2",
+        "compressBound"
+      ],
+      "status": "ACCEPTED AS NOT REACHABLE by r-01, board B-3627, 2026-11-23; the guard stays for good."
+    }
+  ]
 }

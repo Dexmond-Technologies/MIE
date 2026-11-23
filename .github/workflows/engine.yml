@@ -6,6 +6,8 @@
 #   a manual run takes the number of seconds as input (3600 = the reviewer's one-hour line).
 # - parity-tools: the parity harness's own tests, the scoring data file against the Python
 #   reference source, and the record of the YARA library version.
+# - set-s: builds parity set S (generated, harmless files), runs the Python reference over it
+#   and prints which rows of the scoring table the set exercises, and the set's manifest.
 # - vuln-check: the pinned third-party libraries against the OSV database.
 # No release, no tag, no installer, no artefact is published by this workflow.
 # No EICAR file and no malware is used here.
@@ -43,6 +45,9 @@ env:
 
 jobs:
   build-test:
+    # The Windows job compares its C++ table of set S with the reference table the job set-s
+    # makes on Linux in the same run (reviewer's ruling B-3627).
+    needs: set-s
     strategy:
       fail-fast: false
       matrix:
@@ -50,12 +55,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
+      # The rule files and test data must be the same bytes on every system (the reviewer's
+      # condition on byte-identical rule files): no line-ending conversion at checkout.
+      - name: No line-ending conversion
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          # Python 3.12.16 has no Windows build (3.12.10 is the last); the Windows job's Python only
+          # drives the tests, the reference answers come from the Linux job (ruling B-3627).
+          python-version: ${{ matrix.os == 'windows-latest' && '3.12.10' || '3.12.16' }}
+      - name: Install the reference's rule and parser libraries (pinned), for the parity tests
+        run: python -m pip install yara-python==4.5.1 pefile==2024.8.26
+      # The reference's own signature libraries, from its lock file with hashes; and the package
+      # with which the signature test makes its throwaway keys and certificates (test only).
+      - name: Install the reference's signature libraries (locked) and the test's key maker
+        run: |
+          python -m pip install --require-hashes -r requirements-signify.lock
+          python -m pip install cryptography==50.0.2
       - name: Fetch vcpkg at the pinned commit
         shell: pwsh
         run: |
@@ -78,18 +97,59 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vcpkg-cache
-          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          # an older cache of the same vcpkg commit is still useful: vcpkg takes from it every
+          # package whose build inputs are unchanged and builds only the rest
+          restore-keys: |
+            vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-
       - name: Configure
         shell: pwsh
         run: |
           $py = (python -c "import sys; print(sys.executable)")
-          cmake -S engine -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake" "-DMIE_REPO_ROOT=$env:GITHUB_WORKSPACE" "-DPython3_EXECUTABLE=$py"
+          cmake -S engine -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake" "-DMIE_REPO_ROOT=$env:GITHUB_WORKSPACE" "-DPython3_EXECUTABLE=$py" -DMIE_WITH_RULES=ON -DVCPKG_MANIFEST_FEATURES=rules "-DVCPKG_OVERLAY_PORTS=$env:GITHUB_WORKSPACE/engine/vcpkg-ports"
       - name: Build
         shell: pwsh
         run: cmake --build build --config Release --parallel 4
+      - name: Fetch the reference table of set S made on Linux in this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: set-s-reference
+          path: ${{ runner.temp }}/set-s-reference
       - name: Test
         shell: pwsh
-        run: ctest --test-dir build -C Release --verbose --timeout 180
+        env:
+          MIE_SET_S_REFERENCE: ${{ runner.temp }}/set-s-reference
+          MIE_ARCHIVE_REFERENCE_IN: ${{ runner.temp }}/set-s-reference/archive.reference.jsonl
+        run: ctest --test-dir build -C Release --verbose --timeout 3600
+      # The system calls the confined test child really makes, against the shipped allow list.
+      # (The reviewer's ruling asks for this on the REAL worker with OpenSSL and YARA; that
+      # program does not exist yet, so this step does not yet satisfy the ruling.)
+      - name: Sandbox allow list against a trace (test child)
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y strace
+          head -c 65536 /dev/urandom > "$RUNNER_TEMP/trace-sample.bin"
+          python3 engine/tools/sandbox_trace_check.py \
+            --source engine/src/sandbox/sandbox_posix.cpp \
+            --keep "$RUNNER_TEMP/sandbox-trace.txt" -- \
+            build/mie-sandbox-testparent build/mie-sandbox-testchild \
+            --file "$RUNNER_TEMP/trace-sample.bin" -- read-handle
+      # The reviewer's ruling (board B-3627): the allow list must come from a trace of the REAL
+      # worker, with the rule library and OpenSSL inside, on the test files.
+      - name: Sandbox allow list against a trace of the real worker
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          # ALL of set S, the four large files included (reviewer, run 45128299260).
+          python3 engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/trace-set"
+          python3 engine/tools/sandbox_trace_check.py \
+            --source engine/src/sandbox/sandbox_posix.cpp \
+            --keep "$RUNNER_TEMP/worker-trace.txt" -- \
+            build/mie-worker-run --worker build/mie-worker \
+            --corpus "$RUNNER_TEMP/trace-set/files" --out "$RUNNER_TEMP/trace-table.jsonl" \
+            --rules rules --reputation "$RUNNER_TEMP/trace-set/set_s.reputation.json" \
+            --scoring engine/data/scoring.reference.json --wall 900
 
   sanitize:
     runs-on: ubuntu-latest
@@ -103,7 +163,15 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
+      - name: Install the reference's rule and parser libraries (pinned), for the parity tests
+        run: python -m pip install yara-python==4.5.1 pefile==2024.8.26
+      # The reference's own signature libraries, from its lock file with hashes; and the package
+      # with which the signature test makes its throwaway keys and certificates (test only).
+      - name: Install the reference's signature libraries (locked) and the test's key maker
+        run: |
+          python -m pip install --require-hashes -r requirements-signify.lock
+          python -m pip install cryptography==50.0.2
       - name: Fetch and bootstrap vcpkg at the pinned commit
         run: |
           set -eu
@@ -117,16 +185,21 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vcpkg-cache
-          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          # an older cache of the same vcpkg commit is still useful: vcpkg takes from it every
+          # package whose build inputs are unchanged and builds only the rest
+          restore-keys: |
+            vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-
       - name: Configure (AddressSanitizer + UndefinedBehaviorSanitizer)
         run: >
           cmake -S engine -B build -DCMAKE_BUILD_TYPE=Debug -DMIE_SANITIZE=ON
           "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake"
           "-DMIE_REPO_ROOT=$GITHUB_WORKSPACE" "-DPython3_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"
+          -DMIE_WITH_RULES=ON -DVCPKG_MANIFEST_FEATURES=rules "-DVCPKG_OVERLAY_PORTS=$GITHUB_WORKSPACE/engine/vcpkg-ports"
       - name: Build
         run: cmake --build build --parallel 4
       - name: Test
-        run: ctest --test-dir build --verbose --timeout 300
+        run: ctest --test-dir build --verbose --timeout 3600
 
   fuzz:
     runs-on: ubuntu-latest
@@ -152,7 +225,9 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vcpkg-cache
-          key: vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-
       - name: Configure (fuzz targets only)
         run: >
           cmake -S engine -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMIE_FUZZ_ONLY=ON
@@ -166,6 +241,73 @@ jobs:
           mkdir -p fuzz-corpus
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_frame -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus
+      # Reviewer's condition (board B-3629) after the stop in run 45117930444: test directly
+      # whether the OLD target stops on its rule "an import by ordinal has no name" when given
+      # the base file that imports by ordinal from oleaut32, ws2_32 and wsock32. Each base file
+      # is given to the old and to the corrected target, one at a time.
+      - name: Regression check of the old fuzz target on the base files
+        if: ${{ !cancelled() }}
+        run: |
+          set -u
+          python3 engine/tools/write_pe_bases.py pe-bases
+          old_stops=0; new_stops=0
+          for f in pe-bases/*; do
+            if ./build/fuzz_pe_old_ee62e76 "$f" > old.log 2>&1; then o=runs; else o=STOPS; old_stops=$((old_stops+1)); fi
+            if ./build/fuzz_pe "$f" > new.log 2>&1; then n=runs; else n=STOPS; new_stops=$((new_stops+1)); grep -E 'fuzz_pe: |ERROR|SUMMARY' new.log || true; fi
+            echo "$(basename "$f"): old target $o, corrected target $n"
+          done
+          echo "old target stops on $old_stops base files; corrected target stops on $new_stops"
+          if ./build/fuzz_pe_old_ee62e76 pe-bases/o01_imports_by_ordinal.exe > /dev/null 2>&1; then
+            echo "REGRESSION CHECK: NOT CONFIRMED. The old target does not stop on o01_imports_by_ordinal.exe; the cause of the stop in run 45117930444 is UNKNOWN."
+            exit 1
+          fi
+          echo "REGRESSION CHECK: CONFIRMED. The old target stops on o01_imports_by_ordinal.exe (imports by ordinal from oleaut32, ws2_32, wsock32)."
+          [ "$new_stops" -eq 0 ] || { echo "the corrected target stops on a base file"; exit 1; }
+      - name: Fuzz the reader for Windows executables
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          # Part 1: from an empty corpus. (The counted 60,000,000 inputs the reviewer asked for after
+          # the stop of run 45117930444 were run once, in run 45122636462: 2,321 s, no stop. Per push
+          # the time is FUZZ_SECONDS again; a manual run can pass a larger fuzz_seconds.)
+          mkdir -p fuzz-corpus-pe
+          ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe
+          # Part 2: seeded with the parity test's base files, full length.
+          mkdir -p fuzz-corpus-pe-seeded
+          [ -d pe-bases ] || python3 engine/tools/write_pe_bases.py pe-bases
+          cp pe-bases/* fuzz-corpus-pe-seeded/
+          ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe-seeded
+      - name: Fuzz the zip reader
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-zip
+          ./build/fuzz_zip -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-zip
+      - name: Fuzz the signature check
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-signature
+          ./build/fuzz_signature -max_total_time="$FUZZ_SECONDS" -timeout=20 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-signature
+      - name: Fuzz the tar reader
+        if: ${{ !cancelled() }}
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-tar
+          ./build/fuzz_tar -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-tar
+      # A crashing input is harmless bytes made by the fuzzer; it is kept so the crash can be read.
+      - name: Keep the inputs that crashed a target
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+            leak-*
+          if-no-files-found: warn
+          retention-days: 14
 
   parity-tools:
     runs-on: ubuntu-latest
@@ -176,17 +318,64 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
       - name: Install the reference's engine deps (pinned)
         run: python -m pip install $ENGINE_DEPS
       - name: Scoring data file equals the Python reference source
         run: python engine/tools/check_scoring_data.py
+      - name: No shipped program starts a child without confinement
+        run: python engine/tools/check_no_unconfined.py
       - name: The same check fails on deliberately wrong values (proof that it can fail)
         run: python engine/tools/check_scoring_data.py --self-test
       - name: Record of the reference's versions (YARA library version, rule hashes)
         run: python engine/tools/parity/run_reference.py --describe
       - name: Tests of the parity harness
         run: python -m pytest -q -rs engine/tools/parity
+      - name: Scoring vectors (lists of findings and the reference scorer's answers)
+        run: python engine/tools/parity/scoring_vectors.py --out "$RUNNER_TEMP/scoring.vectors.json"
+
+  set-s:
+    # Parity set S: harmless generated files that make the Python reference use its scoring
+    # table. Builds the set, runs the reference over it, prints what every file triggers and
+    # the coverage of the table, and prints the manifest. No malware, no EICAR file.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12.16"
+      - name: Install the reference's engine deps (pinned)
+        run: python -m pip install $ENGINE_DEPS
+      - name: Generate set S
+        run: python engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/set_s"
+      - name: Run the Python reference over set S (with the set's own reputation list)
+        run: >
+          python engine/tools/parity/run_reference.py --corpus "$RUNNER_TEMP/set_s/files"
+          --out "$RUNNER_TEMP/set_s/reference.jsonl" --details "$RUNNER_TEMP/set_s/reference.details.jsonl"
+          --reputation "$RUNNER_TEMP/set_s/set_s.reputation.json"
+      - name: Coverage of the scoring table, and the manifest
+        run: >
+          python engine/tools/parity/set_s_coverage.py --results "$RUNNER_TEMP/set_s/reference.jsonl"
+          --details "$RUNNER_TEMP/set_s/reference.details.jsonl" --intent "$RUNNER_TEMP/set_s/set_s.intent.json"
+          --expect engine/tools/parity/set_s.manifest.json
+      - name: The reference's answers on the archive test inputs (for the Windows comparison)
+        env:
+          MIE_ARCHIVE_REFERENCE_OUT: ${{ runner.temp }}/set_s/archive.reference.jsonl
+        run: python engine/tests/archive_parity.py --reference-only "$GITHUB_WORKSPACE"
+      - name: Keep the reference table for the Windows comparison
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: set-s-reference
+          path: |
+            ${{ runner.temp }}/set_s/reference.jsonl
+            ${{ runner.temp }}/set_s/reference.details.jsonl
+            ${{ runner.temp }}/set_s/archive.reference.jsonl
+            ${{ runner.temp }}/set_s/files/a*.zip
+          if-no-files-found: error
+          retention-days: 7
 
   vuln-check:
     runs-on: ubuntu-latest
@@ -197,7 +386,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.12.16"
       - name: Fetch vcpkg at the pinned commit (port files only, nothing is built)
         run: |
           set -eu

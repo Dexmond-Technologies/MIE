@@ -26,6 +26,8 @@ std::uint64_t File::size() const { return impl_->size; }
 
 const FileIdentity& File::identity() const { return impl_->identity; }
 
+std::intptr_t File::native_handle() const { return reinterpret_cast<std::intptr_t>(impl_->handle); }
+
 std::int64_t File::read_at(std::uint64_t offset, std::span<std::uint8_t> buffer, IoError& error) {
     std::size_t done = 0;
     while (done < buffer.size()) {
@@ -104,7 +106,14 @@ HANDLE open_handle(const std::filesystem::path& path, bool stop_at_reparse_point
 
 }  // namespace
 
-std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error) {
+// Attribute bits of files whose content is not on this disk. Defined here in case the
+// SDK headers in use are older than the attributes.
+constexpr DWORD kAttributeOffline = 0x00001000;             // FILE_ATTRIBUTE_OFFLINE
+constexpr DWORD kAttributeRecallOnOpen = 0x00040000;        // FILE_ATTRIBUTE_RECALL_ON_OPEN
+constexpr DWORD kAttributeRecallOnDataAccess = 0x00400000;  // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error,
+                                   const OpenOptions& options) {
     error = IoError{};
 
     // 1. Open the name itself: a link or junction is opened as the link, not its target.
@@ -130,6 +139,18 @@ std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& e
         ::CloseHandle(handle);
         error.code = IoErrorCode::Other;
         error.detail = "GetFileInformationByHandle failed, error " + std::to_string(err);
+        return nullptr;
+    }
+
+    // 2b. Content only in cloud storage: not opened further unless the caller asked for it.
+    //     The handle above was opened with FILE_FLAG_OPEN_REPARSE_POINT and nothing has
+    //     been read, so nothing has been downloaded up to here.
+    const DWORD cloud_bits = kAttributeOffline | kAttributeRecallOnOpen | kAttributeRecallOnDataAccess;
+    if ((facts.attributes & cloud_bits) != 0 && !options.allow_cloud_only &&
+        (facts.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        ::CloseHandle(handle);
+        error.code = IoErrorCode::CloudOnly;
+        error.detail = "only in the cloud";
         return nullptr;
     }
 
@@ -181,6 +202,29 @@ std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& e
         return nullptr;
     }
 
+    auto impl = std::make_unique<File::Impl>();
+    impl->handle = handle;
+    impl->size = facts.size;
+    impl->identity = facts.identity;
+    return std::make_unique<File>(std::move(impl));
+}
+
+std::unique_ptr<File> adopt_native_handle(std::intptr_t handle_value, IoError& error) {
+    error = IoError{};
+    const HANDLE handle = reinterpret_cast<HANDLE>(handle_value);
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        error.code = IoErrorCode::Other;
+        error.detail = "handed-over handle is not usable";
+        return nullptr;
+    }
+    Facts facts;
+    if (::GetFileType(handle) != FILE_TYPE_DISK || !read_facts(handle, facts) ||
+        (facts.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        ::CloseHandle(handle);
+        error.code = IoErrorCode::NotRegular;
+        error.detail = "handed-over handle is not a regular file";
+        return nullptr;
+    }
     auto impl = std::make_unique<File::Impl>();
     impl->handle = handle;
     impl->size = facts.size;
