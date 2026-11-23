@@ -327,6 +327,23 @@ def main():
         fault_case('answer-extra', ['bytes follow the answer'], 60, 600)
         fault_case('answer-wrong-file', ['names another file than the one handed over'], 60, 600)
 
+        # Reviewer's question SB-2: the worker's handle shares its read position with the parent's.
+        # A worker that MOVES that position (a plain read / SetFilePointerEx on the handed-over
+        # handle) and then answers normally must change nothing: the parent's hash and size
+        # check passes and all three results are those without the switch. Both sides read by
+        # position only; this case fails if either stops doing so.
+        table = os.path.join(tmp, 'move-position.jsonl')
+        move_log = os.path.join(tmp, 'move-position.log.jsonl')
+        code, out, err = worker_run(WORKER_HOOKS, small, table, common,
+                                    ['--log', move_log, '--wall', '120', '--test-fault', 'b.txt=move-position'])
+        got = by_path(records(table))
+        job = by_path([r for r in records(move_log) if r.get('record') == 'job']).get('b.txt', {})
+        said = job.get('detail', '')
+        check(code == 0 and got == base and job.get('answered') is True and 'moved the shared read position' in said,
+              'B (SB-2): a worker that moves the shared read position of the handed-over file changes nothing: all three '
+              'results as without it: %s; b.txt answered: %s; the worker says: %r' % (
+                  got == base, job.get('answered'), said[-200:]))
+
         # ---------------------------------------------------------------- part C
         table = os.path.join(tmp, 'shipped-fault.jsonl')
         details = os.path.join(tmp, 'shipped-fault.details.jsonl')

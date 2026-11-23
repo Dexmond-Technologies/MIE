@@ -38,6 +38,9 @@
 #include <fcntl.h>
 #include <io.h>
 #include <process.h>
+#if defined(MIE_WORKER_TEST_HOOKS)
+#include <windows.h>  // the test switch "move-position" only
+#endif
 #else
 #include <unistd.h>
 #endif
@@ -123,8 +126,8 @@ std::size_t write_all_to_standard_output(const char* data, std::size_t size) {
 }
 
 #if defined(MIE_WORKER_TEST_HOOKS)
-// TEST BUILD ONLY: how the answer is to be spoiled ("answer-none", "answer-half",
-// "answer-extra"); empty = not at all. Set from the job's test_fault.
+// TEST BUILD ONLY: a switch that takes effect late ("answer-none", "answer-half",
+// "answer-extra", "answer-wrong-file", "move-position"); empty = none. Set from the job's test_fault.
 std::string g_answer_fault;
 #endif
 
@@ -250,7 +253,7 @@ int run(int argc, char** argv) {
 
     if (!job.test_fault.empty()) {
 #if defined(MIE_WORKER_TEST_HOOKS)
-        if (job.test_fault.rfind("answer-", 0) == 0) {
+        if (job.test_fault.rfind("answer-", 0) == 0 || job.test_fault == "move-position") {
             g_answer_fault = job.test_fault;  // takes effect when the answer is written
         } else {
             test_fault(job.test_fault);
@@ -320,6 +323,29 @@ int run(int argc, char** argv) {
         return mie::worker::kExitNoFile;
     }
 
+#if defined(MIE_WORKER_TEST_HOOKS)
+    if (g_answer_fault == "move-position") {
+        // TEST BUILD ONLY (reviewer's question SB-2): the handed-over handle shares its read
+        // position with the parent's. Move that position with a plain, non-positional read,
+        // then answer normally: nothing on either side may depend on the position.
+        char scratch[4096];
+#if defined(_WIN32)
+        const HANDLE handle = reinterpret_cast<HANDLE>(file->native_handle());
+        LARGE_INTEGER to;
+        to.QuadPart = 7;
+        const BOOL moved = ::SetFilePointerEx(handle, to, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        const BOOL read_ok = ::ReadFile(handle, scratch, static_cast<DWORD>(sizeof scratch), &got, nullptr);
+        say("test: moved the shared read position: SetFilePointerEx " + std::string(moved ? "ok" : "refused") +
+            ", plain ReadFile " + (read_ok ? "read " + std::to_string(got) + " bytes" : "refused"));
+#else
+        errno = 0;
+        const ssize_t got = ::read(static_cast<int>(file->native_handle()), scratch, sizeof scratch);
+        say("test: moved the shared read position: plain read " +
+            (got >= 0 ? "read " + std::to_string(got) + " bytes" : "refused, errno " + std::to_string(errno)));
+#endif
+    }
+#endif
     const Clock::time_point scan_start = Clock::now();
     mie::ScanResult result = engine.scan_open(*file, job.display_name);
 #if defined(MIE_WORKER_TEST_HOOKS)

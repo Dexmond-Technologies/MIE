@@ -390,7 +390,7 @@ JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
     outcome.answered = true;
     outcome.end = child.end;
     outcome.exit_code = child.exit_code;
-    outcome.detail = printable(child.detail);
+    outcome.detail = printable(child.detail, 600);
     outcome.confinement = printable(child.confinement, 600);
     outcome.worker_confinement = printable(worker_confinement, 600);
     outcome.peak_memory_bytes = child.peak_memory_bytes;
