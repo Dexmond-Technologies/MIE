@@ -142,13 +142,31 @@ def variants(name, data, rng):
     return out[:VARIANTS_PER_BASE]
 
 
+_OPENED = []
+
+
 def reference_view(path):
-    """What the reference side sees, in the shape of the probe's JSON line."""
+    """What the reference side sees, in the shape of the probe's JSON line. The reference's
+    analyser never closes pefile's handle on the file (review finding W-2); on Windows that keeps
+    the file locked, so it is closed here once the view has been built."""
+    try:
+        return _reference_view(path)
+    finally:
+        for opened in _OPENED:
+            try:
+                opened.close()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                pass
+        _OPENED.clear()
+
+
+def _reference_view(path):
     from dexmond_mie.pe_analyzer import PEAnalyzer
     analyzer = PEAnalyzer(path)
     if not analyzer.is_valid():
         return {'parsed': False}
     pe = analyzer.pe
+    _OPENED.append(pe)
     with open(path, 'rb') as f:
         data = f.read()
 
@@ -254,12 +272,18 @@ def main():
                 f.write(data)
         out = subprocess.run([PROBE, case_dir], capture_output=True, timeout=540)
         got = {}
-        for line in out.stdout.decode('utf-8', 'replace').splitlines():
+        # Split on line feeds only: str.splitlines() also splits at characters such as U+0085
+        # or U+2028, which can occur inside a damaged section name and would cut a JSON line in two.
+        unreadable = 0
+        for raw in out.stdout.split(b'\n'):
+            if not raw.strip():
+                continue
             try:
-                record = json.loads(line)
+                record = json.loads(raw.decode('utf-8', 'replace'))
                 got[record['file']] = record
             except (ValueError, KeyError):
-                pass
+                unreadable += 1
+        print(f'probe: {len(got)} lines read, {unreadable} unreadable, exit code {out.returncode}')
         parsed_both = 0
         for kind, name, _ in names:
             want = reference_view(os.path.join(case_dir, name))

@@ -65,6 +65,10 @@ YR_RULES* compile(const std::vector<std::pair<std::string, std::string>>& source
     }
     CompileErrors errors;
     yr_compiler_set_callback(compiler, on_compile_message, &errors);
+    // Rules enter only as the rule files that were handed in. A rule's "include" directive
+    // is not followed: with no include callback YARA refuses the directive, and the file
+    // that uses it does not compile (reviewer's condition, board B-3616).
+    yr_compiler_set_include_callback(compiler, nullptr, nullptr, nullptr);
     for (const auto& [name_space, text] : sources) {
         if (yr_compiler_add_string(compiler, text.c_str(), name_space.c_str()) != 0) {
             error = errors.first.empty() ? "does not compile" : errors.first;

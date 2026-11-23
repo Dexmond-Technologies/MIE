@@ -79,6 +79,12 @@ void serve(mie::channel::Connection& connection) {
             return;
         }
         if (g_stop.load()) {
+            // Give the client time to read the answer before the connection is closed: on
+            // Windows, disconnecting a pipe throws away what the client has not read yet.
+            // Bounded: at most two seconds, then the service stops whatever the client does.
+            Message ignored;
+            std::string ignored_error;
+            connection.receive(ignored, 2000, ignored_error);
             return;
         }
     }

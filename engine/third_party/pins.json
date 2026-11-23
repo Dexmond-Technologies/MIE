@@ -42,7 +42,22 @@
       "source_archive_sha512": "8bf1df7089f9bc5a448dbae0999e04f4ecdec06b4478e2cb5f42a2a3201b99fce68379e3f8f7c67a9db201205366250d7befe5c38451cced807ed692d436422c"
     }
   },
-  "accepted_vulnerabilities": [],
+  "accepted_vulnerabilities": [
+    {
+      "id": "CVE-2026-88341",
+      "library": "yara",
+      "version": "4.5.1",
+      "accepted_by": "r-01 (reviewer), board B-3616",
+      "date": "2026-11-23",
+      "reason": "Not reachable: the flaw is in loading compiled-rules files, which the engine never does. The engine's calls into YARA are: yr_initialize, yr_compiler_create, yr_compiler_set_callback, yr_compiler_set_include_callback, yr_compiler_add_string, yr_compiler_get_rules, yr_compiler_destroy, yr_rule_metas_foreach, yr_rules_scan_mem, yr_rules_destroy.",
+      "conditions": [
+        "the guard against yr_rules_load, yr_rules_load_stream, yr_rules_save and yr_rules_save_stream stays for good",
+        "this record only: any other advisory fails the check",
+        "rules enter only as the shipped source files; a rule 'include' is not followed; the shipped rule folder is not writable by an ordinary user after install (shown in the install test)",
+        "re-check at each release candidate; a move to a fixed YARA release that still passes rules parity is a numbered difference"
+      ]
+    }
+  ],
   "vulnerability_guards": [
     {
       "id": "CVE-2026-88341",
@@ -55,7 +70,7 @@
         "yr_rules_save",
         "yr_rules_save_stream"
       ],
-      "status": "NOT ACCEPTED. Acceptance is the reviewer's (r-01), not the builder's. Until it is in accepted_vulnerabilities the vulnerability check fails."
+      "status": "ACCEPTED AS NOT REACHABLE by r-01, board B-3616, 2026-11-23; the guard stays for good."
     }
   ]
 }

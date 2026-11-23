@@ -52,6 +52,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
+      # The rule files and test data must be the same bytes on every system (the reviewer's
+      # condition on byte-identical rule files): no line-ending conversion at checkout.
+      - name: No line-ending conversion
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

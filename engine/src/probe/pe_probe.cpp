@@ -116,7 +116,9 @@ int main(int argc, char** argv) {
                                       {"problems", image.certificates.problems}}},
             });
         }
-        std::printf("%s\n", line.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+        // ASCII only: every other character is written as an escape, so a line can never be cut
+        // by a line-separator character inside a damaged name.
+        std::printf("%s\n", line.dump(-1, ' ', true, json::error_handler_t::replace).c_str());
     }
     return 0;
 }

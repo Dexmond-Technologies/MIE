@@ -164,6 +164,22 @@ def main():
         check('proposed/ and auto_generated.yar are not loaded: their rule does not match',
               got.get('matches') == [], f"({got.get('matches')})")
 
+        # A rule file that tries to include another file is refused on the C++ side: rules enter
+        # only as the files that were handed in (reviewer's condition, board B-3616). The
+        # reference would follow the include; the shipped rules use none.
+        include_dir = os.path.join(tmp, 'with_include')
+        shutil.copytree(rules_dir, include_dir)
+        outside = os.path.join(tmp, 'outside_rules.yar')
+        with open(outside, 'w', encoding='utf-8') as f:
+            f.write('rule from_outside { strings: $a = "Meeting notes" condition: $a }\n')
+        with open(os.path.join(include_dir, 'zz_includer.yar'), 'w', encoding='utf-8') as f:
+            f.write('include "' + outside.replace('\\', '/') + '"\n')
+        got = probe(include_dir, os.path.join(files_dir, 't01_clean.txt'))
+        check('a rule file with an include directive is refused (state DEGRADED, the file named)',
+              got.get('rules_state') == 'DEGRADED' and len(got.get('errors', [])) == 1
+              and 'zz_includer.yar' in got['errors'][0]['file'], f"({got.get('rules_state')}, {got.get('errors')})")
+        check('the rule from the included file does not match', got.get('matches') == [], f"({got.get('matches')})")
+
     print(f'rules_parity: {compared} checks, {len(failures)} failed')
     return 1 if failures else 0
 
