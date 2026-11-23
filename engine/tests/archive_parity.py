@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Compares MIE's zip and tar readers, which are ported to C++ from CPython 3.12.16 (PSF License;
+# notice in THIRD-PARTY-NOTICES), with the Python reference. This test contains no CPython code.
+# Apache License 2.0, Copyright 2026 Dexmond Technologies.
+#
 """CI test: the C++ zip and tar readers give what the Python reference gives (reviewer's
 ruling M-4c, board B-3619).
 

@@ -1,3 +1,7 @@
+# Copied from vcpkg (https://github.com/microsoft/vcpkg) at commit
+# 9eec002df1cd109f8f104cd966a763daf9751489, Copyright (c) Microsoft Corporation, MIT License.
+# Changes made: version 4.5.1 and its archive's SHA-512. Full notice in THIRD-PARTY-NOTICES.
+
 cmake_minimum_required(VERSION 3.10)
 project(yara C)
 

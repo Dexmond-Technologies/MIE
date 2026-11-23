@@ -1,0 +1,8 @@
+Dexmond MIE
+Copyright 2026 Dexmond Technologies
+
+This product includes software and data from other projects, under their own licences:
+CPython 3.12.16 (Python Software Foundation License), signify 0.9.3 (MIT; parts based on
+Google's verify-sigs, Apache License 2.0), certvalidator 0.11.1 (MIT), asn1crypto 1.5.1 (MIT),
+pefile 2024.8.26 (MIT) and vcpkg's YARA recipe (MIT). Their notices, and which MIE files follow
+each, are in THIRD-PARTY-NOTICES.

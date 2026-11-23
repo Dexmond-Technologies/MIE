@@ -1,3 +1,8 @@
+// Derived work: follows pefile 2024.8.26 (https://github.com/erocarrera/pefile), Copyright (c)
+// 2004-2024 Ero Carrera, MIT License. Changes made: its parsing rules re-implemented in C++; the
+// ordinal name tables copied unchanged. Full notice in THIRD-PARTY-NOTICES. This file: Apache
+// License 2.0, Copyright 2026 Dexmond Technologies.
+//
 // Reader for Windows executables (PE), written to give what pefile 2024.8.26 gives for the
 // fields the Python reference uses (dexmond_mie/pe_analyzer.py). Reviewer's conditions M-4b
 // (board B-3608): worker process only; every read goes through one bounds-checked view;

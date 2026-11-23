@@ -1,5 +1,7 @@
 # DEXMOND MIE — Malware Inspection Engine
 
+Licensed under the Apache License 2.0 (see `LICENSE`; attributions in `NOTICE` and `THIRD-PARTY-NOTICES`).
+
 A second-opinion file scanner for Windows with a local web dashboard. It reads
 file bytes and checks them with its own YARA pattern rules, simple
 heuristics and a known-hash list, can watch four user folders for new files,

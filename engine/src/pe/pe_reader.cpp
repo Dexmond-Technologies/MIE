@@ -1,3 +1,8 @@
+// Derived work: follows pefile 2024.8.26 (https://github.com/erocarrera/pefile), Copyright (c)
+// 2004-2024 Ero Carrera, MIT License. Changes made: its parsing rules re-implemented in C++; the
+// ordinal name tables copied unchanged. Full notice in THIRD-PARTY-NOTICES. This file: Apache
+// License 2.0, Copyright 2026 Dexmond Technologies.
+//
 // See include/mie/pe.hpp and PE_READER_SPEC.md. Line numbers in comments ("pefile:NNNN")
 // refer to pefile.py of pefile 2024.8.26; "ref:NNN" to dexmond_mie/pe_analyzer.py at ff313e2.
 #include "mie/pe.hpp"

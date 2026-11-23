@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Compares MIE's Authenticode check, which follows signify 0.9.3, certvalidator 0.11.1 and
+# asn1crypto 1.5.1 (MIT; notices in THIRD-PARTY-NOTICES), with the Python reference. This test
+# contains no code of those projects. Apache License 2.0, Copyright 2026 Dexmond Technologies.
+#
 """Authenticode check: the C++ engine against the Python reference (CI only).
 
     signature_parity.py PROBE REPO

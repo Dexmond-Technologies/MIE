@@ -1,3 +1,11 @@
+// Derived work: ported to C++ from CPython 3.12.16 (Lib/zipfile/__init__.py, Lib/tarfile.py,
+// Lib/_compression.py, Lib/gzip.py, Lib/bz2.py, Lib/lzma.py, Modules/_bz2module.c,
+// Modules/_lzmamodule.c, Modules/zlibmodule.c, Modules/_io/bufferedio.c), Copyright (c) 2001-2023
+// Python Software Foundation, licensed under the PSF License Agreement. Changes made: the reading
+// rules, limits, error classes and error texts were re-implemented in C++ over in-memory buffers,
+// with hard ceilings of our own added (ARCHIVE_SPEC.md sections 9-10). Full notice in THIRD-PARTY-
+// NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond Technologies.
+//
 // detect() and extract(), and the in-memory copy of the reference's temp folder.
 // Reference: dexmond_mie/core.py at ff313e2, lines 504-511 (_is_archive) and 608-655
 // (_extract_safely). File-system behaviour: Linux, CPython 3.12.16 posixpath.realpath,

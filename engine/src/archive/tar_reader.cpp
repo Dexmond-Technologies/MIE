@@ -1,3 +1,11 @@
+// Derived work: ported to C++ from CPython 3.12.16 (Lib/zipfile/__init__.py, Lib/tarfile.py,
+// Lib/_compression.py, Lib/gzip.py, Lib/bz2.py, Lib/lzma.py, Modules/_bz2module.c,
+// Modules/_lzmamodule.c, Modules/zlibmodule.c, Modules/_io/bufferedio.c), Copyright (c) 2001-2023
+// Python Software Foundation, licensed under the PSF License Agreement. Changes made: the reading
+// rules, limits, error classes and error texts were re-implemented in C++ over in-memory buffers,
+// with hard ceilings of our own added (ARCHIVE_SPEC.md sections 9-10). Full notice in THIRD-PARTY-
+// NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond Technologies.
+//
 // Tar reader: what CPython 3.12.16 tarfile gives (Lib/tarfile.py) to the reference's
 // _extract_tar (dexmond_mie/core.py at ff313e2, lines 686-748). Member names are kept as the
 // raw bytes of the archive (Python holds them as text with surrogateescape, which gives the

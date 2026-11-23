@@ -1,3 +1,11 @@
+// Derived work: ported to C++ from CPython 3.12.16 (Lib/zipfile/__init__.py, Lib/tarfile.py,
+// Lib/_compression.py, Lib/gzip.py, Lib/bz2.py, Lib/lzma.py, Modules/_bz2module.c,
+// Modules/_lzmamodule.c, Modules/zlibmodule.c, Modules/_io/bufferedio.c), Copyright (c) 2001-2023
+// Python Software Foundation, licensed under the PSF License Agreement. Changes made: the reading
+// rules, limits, error classes and error texts were re-implemented in C++ over in-memory buffers,
+// with hard ceilings of our own added (ARCHIVE_SPEC.md sections 9-10). Full notice in THIRD-PARTY-
+// NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond Technologies.
+//
 // Zip and tar container readers, written to give what the Python reference gives
 // (dexmond_mie/core.py at ff313e2: _is_archive, _extract_safely, _extract_zip, _extract_tar,
 // _zip_covers_file), which in turn is what CPython 3.12.16's zipfile and tarfile give.

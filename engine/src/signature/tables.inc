@@ -1,3 +1,10 @@
+// Derived work: follows the Python library signify 0.9.3 (https://github.com/ralphje/signify),
+// Copyright (c) 2018 Ralph Broenink, MIT License (parts based on Google's verify-sigs, Copyright
+// 2011 Google Inc., Apache License 2.0), and the rules of certvalidator 0.11.1 and asn1crypto
+// 1.5.1, Copyright (c) Will Bond, MIT License. Changes made: re-implemented in C++ on OpenSSL.
+// Full notices in THIRD-PARTY-NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond
+// Technologies.
+//
 // Constants of the Authenticode check: limits and object identifiers. No code.
 // Included by authenticode.cpp INSIDE its anonymous namespace (it is not a header of its own).
 // Moved out of authenticode.cpp unchanged (reviewer's ruling: the line limit is on the code
