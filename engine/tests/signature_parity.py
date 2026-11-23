@@ -635,7 +635,10 @@ def engine_part(ref, inputs, tmp, roots_path, pinned, policy):
     def scan(name, verifier):
         engine = Engine(rules_dir=rules_copy, reputation_db=rep_copy, use_reputation=False, auto_evolution=False,
                         signature_verifier=verifier, trusted_publishers=policy['publishers'])
-        path = os.path.join(work, name + '.exe')
+        # A new folder for every scan, the same file name: on Windows the reference keeps a
+        # scanned executable open, so the same path cannot be written a second time.
+        folder = tempfile.mkdtemp(prefix='scan-', dir=work)
+        path = os.path.join(folder, name + '.exe')
         with open(path, 'wb') as f:
             f.write(inputs[name])
         result = engine.scan_file(path)
