@@ -57,6 +57,9 @@ DAY = datetime.timedelta(days=1)
 
 
 # ----------------------------------------------------------------------------- DER
+# Named cases where the strict setting is known to grant what the reference refuses (see the use).
+GRANTS_BY_D19_STAMP_ORDER = ('stamp_two_suitable_other_first_rfc3161', 'stamp_two_suitable_other_first_authenticode')
+
 def der(tag, content=b''):
     n = len(content)
     if n < 0x80:
@@ -859,7 +862,16 @@ def main():
                   f"FINAL cap={s_cap}"
                   + (f'; cap lost to: {why}' if why else ''))
             if s_cap and not p_cap:
-                hard.append(f'{name}: the shipped setting grants a cap that parity does not: {s_line!r}')
+                # One known kind (reviewer's ruling on run 45132119984, numbered under D-19): two
+                # suitable time-stamping certificates with one issuer name and serial, the one that
+                # did NOT make the time-stamp placed first. The reference judges that first one and
+                # refuses; the strict setting judges the one that verified and accepts. It is
+                # counted on the corpus (expected 0). Any other case is a failure of this test.
+                if name in GRANTS_BY_D19_STAMP_ORDER:
+                    print(f'KNOWN  {name}: the shipped setting grants a cap that parity does not '
+                          f'(D-19, time-stamp certificate order)')
+                else:
+                    hard.append(f'{name}: the shipped setting grants a cap that parity does not: {s_line!r}')
         print(f'shipped setting: of the named cases valid with cap in parity, {kept} keep the cap, '
               f'{sum(lost.values())} lose it: {json.dumps(lost, sort_keys=True)}')
         for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first'):

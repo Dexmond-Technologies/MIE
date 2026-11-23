@@ -995,6 +995,9 @@ bool apply_seccomp(std::string& what, std::string& why_not) {
     // first check of a memory range ("CHECK failed: sanitizer_posix_libcdep.cpp:324
     // ((0)) == ((pipe(fds)))"), before the worker can answer.
     filter.allow(SYS_pipe2, SANITIZER("runtime: tests whether memory is readable by writing it to a pipe of its own"));
+    // Second stop, run 45134340352: "CHECK failed: sanitizer_posix_libcdep.cpp:312
+    // ((!internal_iserror(res, nullptr))) != (0)": the runtime then sets that pipe non-blocking.
+    filter.allow(SYS_fcntl, SANITIZER("runtime: sets its own pipe non-blocking (F_GETFL, F_SETFL)"));
 #ifdef SYS_pipe
     filter.allow(SYS_pipe, SANITIZER("runtime: the same, older call"));
 #endif
