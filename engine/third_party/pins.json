@@ -83,6 +83,19 @@
         "rules enter only as the shipped source files; a rule 'include' is not followed; the shipped rule folder is not writable by an ordinary user after install (shown in the install test)",
         "re-check at each release candidate; a move to a fixed YARA release that still passes rules parity is a numbered difference"
       ]
+    },
+    {
+      "id": "CVE-2026-85091",
+      "library": "zlib",
+      "version": "1.3.2",
+      "accepted_by": "r-01 (reviewer), board B-3627",
+      "date": "2026-11-23",
+      "reason": "Not reachable: the flaw is in zlib's gz file writing layer. The engine's only calls into zlib are inflateInit2, inflate, inflateEnd and crc32, all in engine/src/archive/codec.cpp; no gz function, no deflate, no compress.",
+      "conditions": [
+        "the guard against the gz functions, deflate, deflateInit, deflateInit2 and compress stays for good",
+        "this record only: any other advisory fails the check",
+        "zlib is maintained: move the pin to a fixed zlib as soon as the dependency set offers one, checked at each release candidate at the latest; an overlay port is not required now"
+      ]
     }
   ],
   "vulnerability_guards": [
@@ -127,9 +140,12 @@
         "gzclose_w",
         "deflateInit",
         "deflateInit2",
-        "deflate"
+        "deflate",
+        "compress",
+        "compress2",
+        "compressBound"
       ],
-      "status": "PROPOSED by the builder, NOT ACCEPTED: awaits the reviewer's ruling. Until then the vulnerability check fails on this record."
+      "status": "ACCEPTED AS NOT REACHABLE by r-01, board B-3627, 2026-11-23; the guard stays for good."
     }
   ]
 }

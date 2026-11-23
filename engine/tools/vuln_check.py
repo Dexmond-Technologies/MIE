@@ -15,6 +15,7 @@ A null expected value is reported as NOT YET RECORDED and does not fail; the pri
 values are then copied into pins.json.
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -139,7 +140,7 @@ def main():
                     with open(os.path.join(root, name), encoding='utf-8', errors='replace') as f:
                         text = f.read()
                     for symbol in guard['forbidden_symbols']:
-                        if symbol + '(' in text:
+                        if re.search(r'(?<![A-Za-z0-9_])' + re.escape(symbol) + r'\(', text):
                             used.append(f'{os.path.relpath(os.path.join(root, name), engine_dir)}: {symbol}')
         state = 'accepted' if guard['id'] in accepted else 'NOT ACCEPTED'
         if used:

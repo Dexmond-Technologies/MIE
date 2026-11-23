@@ -45,6 +45,9 @@ env:
 
 jobs:
   build-test:
+    # The Windows job compares its C++ table of set S with the reference table the job set-s
+    # makes on Linux in the same run (reviewer's ruling B-3627).
+    needs: set-s
     strategy:
       fail-fast: false
       matrix:
@@ -99,8 +102,15 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build build --config Release --parallel 4
+      - name: Fetch the reference table of set S made on Linux in this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: set-s-reference
+          path: ${{ runner.temp }}/set-s-reference
       - name: Test
         shell: pwsh
+        env:
+          MIE_SET_S_REFERENCE: ${{ runner.temp }}/set-s-reference
         run: ctest --test-dir build -C Release --verbose --timeout 3600
 
   sanitize:
@@ -254,6 +264,15 @@ jobs:
           python engine/tools/parity/set_s_coverage.py --results "$RUNNER_TEMP/set_s/reference.jsonl"
           --details "$RUNNER_TEMP/set_s/reference.details.jsonl" --intent "$RUNNER_TEMP/set_s/set_s.intent.json"
           --expect engine/tools/parity/set_s.manifest.json
+      - name: Keep the reference table for the Windows comparison
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: set-s-reference
+          path: |
+            ${{ runner.temp }}/set_s/reference.jsonl
+            ${{ runner.temp }}/set_s/reference.details.jsonl
+          if-no-files-found: error
+          retention-days: 7
 
   vuln-check:
     runs-on: ubuntu-latest

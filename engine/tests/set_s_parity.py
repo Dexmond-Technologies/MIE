@@ -23,6 +23,7 @@ construction, so the folder must not be watched by any real scanner while this r
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,7 +82,7 @@ def manifest_check(cpp, cpp2):
     code, out, _ = run([PY, os.path.join(PARITY, 'compare.py'), '--identical', cpp, cpp2])
     print('--- two C++ runs ---')
     print(out.strip())
-    print(f'set_s_parity (WEAKER CHECK, manifest only, reference failed here): {len(expected)} files in the '
+    print(f'extra check against the committed manifest (not the gate): {len(expected)} files in the '
           f'manifest, {len(got)} in the C++ table, {different} differences, two C++ runs identical: {code == 0}')
     return 1 if (different or code != 0) else 0
 
@@ -110,14 +111,22 @@ def main():
             if os.name != 'nt':
                 print('FAIL  no reference table')
                 return 1
-            # On Windows the reference itself stops on set S (it cannot remove its temporary
-            # folder while its own parser still holds an unpacked executable open). That is a
-            # defect of the reference, recorded as such. There is then no reference table made
-            # on this system; the C++ table is compared below with the committed manifest of
-            # the set, which the reference produced on Linux. That is a WEAKER check than
-            # compare.py (hash, size, score, verdict, categories, error class only) and is
-            # printed as such; it is not the gate-2 comparison.
-            print('REFERENCE FAILED ON WINDOWS: comparing the C++ table with the committed manifest instead')
+            # On Windows the reference itself stops on set S: WinError 32 when it removes its own
+            # temporary folder while an unpacked executable is still open (a defect of the
+            # reference; that its own parser holds the handle is the builder's inference).
+            # Reviewer's ruling B-3627: the Windows C++ table is compared, with the full comparer
+            # and the same pass lines, against the reference table made on Linux in the same CI
+            # run (job set-s, passed as an artifact; MIE_SET_S_REFERENCE names the folder). The
+            # comparison with the committed manifest is an extra, not the gate.
+            linux_dir = os.environ.get('MIE_SET_S_REFERENCE', '')
+            linux_ref = os.path.join(linux_dir, 'reference.jsonl')
+            if not linux_dir or not os.path.exists(linux_ref):
+                print('FAIL  the reference failed here and no reference table from Linux was given')
+                return 1
+            shutil.copyfile(linux_ref, ref)
+            if os.path.exists(os.path.join(linux_dir, 'reference.details.jsonl')):
+                shutil.copyfile(os.path.join(linux_dir, 'reference.details.jsonl'), ref_details)
+            print('REFERENCE FAILED ON WINDOWS: using the reference table made on Linux in this run')
 
         engine_args = [RUNNER, '--corpus', files, '--rules', os.path.join(REPO, 'rules'), '--reputation', reputation,
                        '--scoring', os.path.join(REPO, 'engine', 'data', 'scoring.reference.json')]
@@ -128,8 +137,8 @@ def main():
                 print(f'FAIL  the C++ engine run failed (exit {code}):', err.strip()[-2000:])
                 return 1
 
-        if reference_failed:
-            return manifest_check(cpp, cpp2)
+        if reference_failed and manifest_check(cpp, cpp2) != 0:
+            failed = True
 
         print('reference header:', json.dumps(header_of(ref), sort_keys=True))
         print('C++ header:      ', json.dumps(header_of(cpp), sort_keys=True))
