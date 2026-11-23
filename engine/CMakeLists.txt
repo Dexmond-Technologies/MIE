@@ -26,6 +26,7 @@ if(MIE_SANITIZE AND NOT MSVC)
 endif()
 
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # Decompression for the zip and tar readers (also needed by their fuzz targets).
 find_package(ZLIB REQUIRED)
@@ -45,6 +46,12 @@ if(MIE_FUZZ_ONLY)
   target_compile_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
   target_link_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined)
 
+  add_executable(fuzz_signature fuzz/fuzz_signature.cpp src/signature/authenticode.cpp)
+  target_include_directories(fuzz_signature PRIVATE include)
+  target_link_libraries(fuzz_signature PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+  target_compile_options(fuzz_signature PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
+  target_link_options(fuzz_signature PRIVATE -fsanitize=fuzzer,address,undefined)
+
   foreach(target fuzz_zip fuzz_tar)
     add_executable(${target} fuzz/${target}.cpp ${MIE_ARCHIVE_SOURCES})
     target_include_directories(${target} PRIVATE include)
@@ -60,7 +67,6 @@ if(MIE_FUZZ_ONLY)
   return()
 endif()
 
-find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 # ---- engine library: no interface code, no network code ---------------------------
@@ -158,6 +164,14 @@ endif()
 add_executable(mie-pe-probe src/probe/pe_probe.cpp)
 target_link_libraries(mie-pe-probe PRIVATE mie_pe nlohmann_json::nlohmann_json)
 
+# ---- Authenticode signature check (own code on OpenSSL; copies the reference's portable path) ----
+add_library(mie_signature STATIC src/signature/authenticode.cpp)
+target_include_directories(mie_signature PUBLIC include)
+target_link_libraries(mie_signature PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+
+add_executable(mie-signature-probe src/probe/signature_probe.cpp)
+target_link_libraries(mie-signature-probe PRIVATE mie_signature nlohmann_json::nlohmann_json)
+
 add_executable(mie-archive-probe src/probe/archive_probe.cpp)
 target_link_libraries(mie-archive-probe PRIVATE mie_archive mie_core nlohmann_json::nlohmann_json)
 
@@ -212,6 +226,10 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_analysis_parity.py
                    $<TARGET_FILE:mie-pe-analysis-probe> ${MIE_REPO_ROOT})
   set_tests_properties(pe_analysis_parity PROPERTIES TIMEOUT 1200)
+  add_test(NAME signature_parity
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/signature_parity.py
+                   $<TARGET_FILE:mie-signature-probe> ${MIE_REPO_ROOT})
+  set_tests_properties(signature_parity PROPERTIES TIMEOUT 1800)
   add_test(NAME archive_parity
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/archive_parity.py
                    $<TARGET_FILE:mie-archive-probe> ${MIE_REPO_ROOT})

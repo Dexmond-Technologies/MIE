@@ -6,7 +6,7 @@
 # Exit code: 0 every target PASS, 1 any FAILED, 3 any MISSED.
 set -u
 WORK="${MIE_FUZZ_WORK:-/mnt/node4-work/mie-fuzz}"
-TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe fuzz_zip fuzz_tar} ${MIE_PARITY_TESTS-pe_parity pe_analysis_parity}"
+TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe fuzz_zip fuzz_tar fuzz_signature} ${MIE_PARITY_TESTS-pe_parity pe_analysis_parity}"
 NIGHT="${1:-$(date -u +%Y-%m-%d)}"
 python3 - "$WORK/records.jsonl" "$NIGHT" $TARGETS <<'PY'
 import json, os, sys
