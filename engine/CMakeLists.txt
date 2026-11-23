@@ -45,6 +45,7 @@ add_library(mie_core STATIC
   src/core/hash.cpp
   src/core/io_common.cpp
   src/core/result.cpp
+  src/core/scoring.cpp
 )
 if(WIN32)
   target_sources(mie_core PRIVATE src/core/io_win.cpp)
@@ -75,6 +76,9 @@ target_link_libraries(mie PRIVATE mie_channel)
 add_executable(mie-probe src/probe/main.cpp)
 target_link_libraries(mie-probe PRIVATE mie_core)
 
+add_executable(mie-scoring-check src/probe/scoring_check.cpp)
+target_link_libraries(mie-scoring-check PRIVATE mie_core)
+
 # ---- tests -------------------------------------------------------------------------
 if(MIE_BUILD_TESTS)
   enable_testing()
@@ -84,9 +88,11 @@ if(MIE_BUILD_TESTS)
     tests/test_frame.cpp
     tests/test_hash.cpp
     tests/test_result.cpp
+    tests/test_scoring.cpp
     tests/test_transport.cpp
   )
   target_link_libraries(mie_tests PRIVATE mie_core mie_channel Catch2::Catch2WithMain Threads::Threads)
+  target_compile_definitions(mie_tests PRIVATE "MIE_SCORING_TABLE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/data/scoring.reference.json\"")
   add_test(NAME unit COMMAND mie_tests)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -98,5 +104,8 @@ if(MIE_BUILD_TESTS)
   add_test(NAME service_smoke
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/service_smoke.py
                    $<TARGET_FILE:mie-service> $<TARGET_FILE:mie>)
-  set_tests_properties(unit io_cases parity_primitives service_smoke PROPERTIES TIMEOUT 180)
+  add_test(NAME scoring_vectors
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scoring_vectors_test.py
+                   $<TARGET_FILE:mie-scoring-check> ${MIE_REPO_ROOT})
+  set_tests_properties(unit io_cases parity_primitives service_smoke scoring_vectors PROPERTIES TIMEOUT 300)
 endif()
