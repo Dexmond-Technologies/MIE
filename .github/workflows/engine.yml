@@ -394,6 +394,57 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  signature-recipe:
+    # The recipe for the run on real signed files on the corpus machine (Ubuntu 24.04, gcc 13,
+    # Python 3.12.3 by COMMANDER_SEAT's report), run here first on the same system with its own
+    # compiler and Python: engine/tools/parity/build_signature_probe.sh, then the selection and
+    # the comparison on set S's executables (generated, harmless). The built probe is kept as an
+    # artifact with its SHA-256, so the corpus machine may take it instead of building.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-ubuntu-24.04-system-gcc-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-ubuntu-24.04-system-gcc-${{ env.VCPKG_COMMIT }}-
+      - name: The recipe, exactly as the corpus machine runs it
+        run: |
+          set -eu
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          python3 --version; c++ --version | head -1; cmake --version | head -1
+          engine/tools/parity/build_signature_probe.sh "$RUNNER_TEMP/sig" | tee "$RUNNER_TEMP/recipe.txt"
+      - name: Selection and comparison on set S (both profiles)
+        run: |
+          set -u
+          python3 engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/set_s" --no-large
+          python3 engine/tools/parity/select_signed_pe.py --from "$RUNNER_TEMP/set_s/files" --to "$RUNNER_TEMP/chosen"
+          cat "$RUNNER_TEMP/chosen.selection.tsv"
+          code=0
+          for profile in parity shipped; do
+            "$RUNNER_TEMP/sig/venv/bin/python" engine/tools/parity/signature_corpus_check.py \
+              --folder "$RUNNER_TEMP/chosen" --probe "$RUNNER_TEMP/sig/build/mie-signature-probe" \
+              --repo "$GITHUB_WORKSPACE" --profile $profile | tee "$RUNNER_TEMP/corpus-check-$profile.txt" || code=1
+            sha256sum "$RUNNER_TEMP/corpus-check-$profile.txt"
+          done
+          exit $code
+      - name: Keep the probe built by the recipe
+        run: |
+          cp "$RUNNER_TEMP/sig/build/mie-signature-probe" "$RUNNER_TEMP/mie-signature-probe"
+          (cd "$RUNNER_TEMP" && sha256sum mie-signature-probe > mie-signature-probe.sha256 && cat mie-signature-probe.sha256)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mie-signature-probe-ubuntu-24.04
+          path: |
+            ${{ runner.temp }}/mie-signature-probe
+            ${{ runner.temp }}/mie-signature-probe.sha256
+            ${{ runner.temp }}/recipe.txt
+          retention-days: 30
+
   vuln-check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
