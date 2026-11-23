@@ -991,6 +991,13 @@ bool apply_seccomp(std::string& what, std::string& why_not) {
     filter.allow(SYS_mlock, SANITIZER("runtime"));
     filter.allow(SYS_munlock, SANITIZER("runtime"));
     filter.allow(SYS_exit, SANITIZER("runtime: a thread of the runtime ends"));
+    // Established by CI run 45132119984: without it the runtime stops the real worker at its
+    // first check of a memory range ("CHECK failed: sanitizer_posix_libcdep.cpp:324
+    // ((0)) == ((pipe(fds)))"), before the worker can answer.
+    filter.allow(SYS_pipe2, SANITIZER("runtime: tests whether memory is readable by writing it to a pipe of its own"));
+#ifdef SYS_pipe
+    filter.allow(SYS_pipe, SANITIZER("runtime: the same, older call"));
+#endif
 #ifdef SYS_readlink
     filter.allow(SYS_readlink, SANITIZER("runtime: finds its own program for reports"));
 #endif
