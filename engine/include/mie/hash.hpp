@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 #include "mie/io.hpp"
 #include "mie/result.hpp"
@@ -29,6 +30,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// SHA-256 of a buffer, lower-case hex; empty if the hash library failed.
+std::string sha256_hex(std::span<const std::uint8_t> data);
 
 inline constexpr std::size_t kHashChunkBytes = 1024 * 1024;
 

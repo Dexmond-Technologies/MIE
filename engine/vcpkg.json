@@ -6,5 +6,13 @@
     "openssl",
     "nlohmann-json",
     "catch2"
-  ]
+  ],
+  "features": {
+    "rules": {
+      "description": "The rules engine: YARA 4.5.1 from engine/vcpkg-ports (overlay port).",
+      "dependencies": [
+        "yara"
+      ]
+    }
+  }
 }

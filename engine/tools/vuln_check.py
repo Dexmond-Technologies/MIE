@@ -25,8 +25,11 @@ PINS = os.path.join(os.path.dirname(HERE), 'third_party', 'pins.json')
 OSV_URL = 'https://api.osv.dev/v1/query'
 
 
-def port_version(vcpkg, name):
-    with open(os.path.join(vcpkg, 'ports', name, 'vcpkg.json'), encoding='utf-8') as f:
+def port_version(vcpkg, name, port_dir=None):
+    # A library with a recipe of our own (an overlay port) is read from that recipe.
+    path = (os.path.join(os.path.dirname(os.path.dirname(HERE)), port_dir, 'vcpkg.json') if port_dir
+            else os.path.join(vcpkg, 'ports', name, 'vcpkg.json'))
+    with open(path, encoding='utf-8') as f:
         port = json.load(f)
     for key in ('version', 'version-semver', 'version-string', 'version-date'):
         if key in port:
@@ -84,7 +87,7 @@ def main():
 
     for name, lib in pins['libraries'].items():
         try:
-            version, port_revision = port_version(vcpkg, name)
+            version, port_revision = port_version(vcpkg, name, lib.get('port_dir'))
             tag = lib['tag'].format(version=version)
             commit = tag_commit(lib['repository'], tag)
             vulns = osv_vulnerabilities(commit)

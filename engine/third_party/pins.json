@@ -28,6 +28,16 @@
       "used_for": "unit tests only",
       "expected_version": "3.16.0",
       "expected_commit": "317ac1ed4c0bb6e6b91eafc817e05c488feffcb3"
+    },
+    "yara": {
+      "repository": "https://github.com/VirusTotal/yara",
+      "tag": "v{version}",
+      "port_dir": "engine/vcpkg-ports/yara",
+      "shipped": true,
+      "touches_hostile_bytes": true,
+      "used_for": "rule matching over file bytes; pinned to the reference's version 4.5.1 (reviewer's condition M-5)",
+      "expected_version": "4.5.1",
+      "expected_commit": "0e5b6bb9660cba500eb58dbccb027757c82cc4cf"
     }
   },
   "accepted_vulnerabilities": []

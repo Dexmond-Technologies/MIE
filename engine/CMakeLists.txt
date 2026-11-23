@@ -10,6 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(MIE_BUILD_TESTS "Build the unit tests and register the CI tests" ON)
 option(MIE_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
 option(MIE_FUZZ_ONLY "Build only the fuzz targets (Clang, libFuzzer)" OFF)
+option(MIE_WITH_RULES "Build the rules engine (YARA 4.5.1 from engine/vcpkg-ports, manifest feature 'rules')" OFF)
 set(MIE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "Repository root (holds the Python reference)")
 
 if(MSVC)
@@ -55,6 +56,14 @@ endif()
 target_include_directories(mie_core PUBLIC include)
 target_link_libraries(mie_core PUBLIC nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto)
 
+# ---- rules engine (YARA) -----------------------------------------------------------
+if(MIE_WITH_RULES)
+  find_package(unofficial-libyara CONFIG REQUIRED)
+  add_library(mie_rules STATIC src/rules/rules_yara.cpp)
+  target_include_directories(mie_rules PUBLIC include)
+  target_link_libraries(mie_rules PUBLIC mie_core PRIVATE unofficial::libyara::libyara)
+endif()
+
 # ---- local channel -----------------------------------------------------------------
 add_library(mie_channel STATIC src/channel/frame.cpp)
 if(WIN32)
@@ -75,6 +84,11 @@ target_link_libraries(mie PRIVATE mie_channel)
 
 add_executable(mie-probe src/probe/main.cpp)
 target_link_libraries(mie-probe PRIVATE mie_core)
+
+if(MIE_WITH_RULES)
+  target_link_libraries(mie-probe PRIVATE mie_rules)
+  target_compile_definitions(mie-probe PRIVATE MIE_WITH_RULES)
+endif()
 
 add_executable(mie-scoring-check src/probe/scoring_check.cpp)
 target_link_libraries(mie-scoring-check PRIVATE mie_core)
@@ -108,4 +122,10 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scoring_vectors_test.py
                    $<TARGET_FILE:mie-scoring-check> ${MIE_REPO_ROOT})
   set_tests_properties(unit io_cases parity_primitives service_smoke scoring_vectors PROPERTIES TIMEOUT 300)
+  if(MIE_WITH_RULES)
+    add_test(NAME rules_parity
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rules_parity.py
+                     $<TARGET_FILE:mie-probe> ${MIE_REPO_ROOT})
+    set_tests_properties(rules_parity PROPERTIES TIMEOUT 600)
+  endif()
 endif()
