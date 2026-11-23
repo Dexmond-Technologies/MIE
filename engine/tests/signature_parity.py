@@ -668,7 +668,10 @@ def main():
     from dexmond_mie import signature as ref
     cases, variants, roots_pem, policy, mutations = build_cases()
     hard, soft, classes = [], 0, 0
-    with tempfile.TemporaryDirectory(prefix='mie-sig-') as tmp:
+    # On Windows the reference engine keeps an executable it scanned open (the reference defect
+    # recorded in run 45111353109), so the folder cannot always be removed at the end; that
+    # must not turn the comparison into a failure.
+    with tempfile.TemporaryDirectory(prefix='mie-sig-', ignore_cleanup_errors=True) as tmp:
         roots_path = os.path.join(tmp, 'test_roots.pem')
         with open(roots_path, 'wb') as f:
             f.write(roots_pem)
