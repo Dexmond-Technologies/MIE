@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -895,15 +896,18 @@ Image parse(std::span<const std::uint8_t> data) { return Reader(data).run(); }
 
 std::vector<std::pair<std::string, std::vector<std::string>>> reference_imports(const Image& image) {
     std::vector<std::pair<std::string, std::vector<std::string>>> out;
+    std::map<std::string, std::size_t> position;
     for (const ImportLibrary& library : image.imports) {
         std::vector<std::string> names;
         for (const ImportSymbol& symbol : library.symbols) {
             names.push_back(!symbol.name.empty() ? symbol.name : "ordinal_" + std::to_string(symbol.ordinal));
         }
         const std::string dll = library.dll.empty() ? "unknown" : library.dll;
-        auto existing = std::find_if(out.begin(), out.end(), [&](const auto& entry) { return entry.first == dll; });
-        if (existing != out.end()) {
-            existing->second = std::move(names);  // a DLL listed again replaces its earlier list
+        // A map from name to position: with many import descriptors a search of the list so
+        // far would cost a quadratic number of comparisons (reviewer's finding, board B-3621).
+        const auto [existing, inserted] = position.try_emplace(dll, out.size());
+        if (!inserted) {
+            out[existing->second].second = std::move(names);  // a DLL listed again replaces its earlier list
         } else {
             out.emplace_back(dll, std::move(names));
         }
