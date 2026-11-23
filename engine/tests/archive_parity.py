@@ -57,6 +57,14 @@ SEED = int(os.environ.get('MIE_ARCHIVE_SEED', '20261123'))
 MIN_VARIANTS = int(os.environ.get('MIE_ARCHIVE_VARIANTS', '2000'))
 BATCH_FILES = 300
 LINUX = sys.platform.startswith('linux')
+# The reference is the Linux one (reviewer's ruling B-3627). On Linux the reference's answers
+# can be written to a file (MIE_ARCHIVE_REFERENCE_OUT); on another system that file
+# (MIE_ARCHIVE_REFERENCE_IN) replaces the local Python, whose zipfile/tarfile may be another
+# version, and every field is compared. An input whose bytes differ between the two systems
+# (the compression libraries of the two Pythons may pack differently) is counted and not compared.
+REFERENCE_OUT = os.environ.get('MIE_ARCHIVE_REFERENCE_OUT', '')
+REFERENCE_IN = '' if LINUX else os.environ.get('MIE_ARCHIVE_REFERENCE_IN', '')
+REFERENCE_ONLY = PROBE == '--reference-only'
 FIELDS = ('is_archive', 'members', 'reasons_hex', 'complete')
 TEXT = b'The garden needs water on Tuesday.\r\n' * 8
 MIB = 1024 * 1024
@@ -586,29 +594,61 @@ def main():
     tally = {'inputs': 0, 'archive for the reference': 0, 'archive for C++': 0, 'inputs with a difference': 0,
              'no line from the probe': 0, 'unreadable lines': 0, 'probe failures': 0}
     shown = 0
+    linux_table, out_file = None, None
+    if REFERENCE_IN:
+        linux_table = {}
+        with open(REFERENCE_IN, 'rb') as f:
+            for raw in f.read().split(b'\n'):
+                if raw.strip():
+                    record = json.loads(raw)
+                    if 'header' in record:
+                        linux_header = record['header']
+                    else:
+                        linux_table[record['file']] = record
+        tally['inputs whose bytes differ between the systems (not compared)'] = 0
+        print(f'reference answers from Linux: {len(linux_table)} inputs, {json.dumps(linux_header, sort_keys=True)}; '
+              f'this Python: {sys.version.split()[0]}')
     with tempfile.TemporaryDirectory(prefix='mie-arc-') as work:
-        engine = build_engine(work)
-        from dexmond_mie import core
+        engine, core = None, None
+        if linux_table is None:
+            engine = build_engine(work)
+            from dexmond_mie import core
         case_dir, temp_parent = os.path.join(work, 'cases'), os.path.join(work, 't')
         os.mkdir(case_dir)
         os.mkdir(temp_parent)
         sample = tempfile.mkdtemp(prefix='dexmond_arc_', dir=temp_parent)
         temp_dir_length = len(os.fsencode(os.path.realpath(sample)))
         os.rmdir(sample)
-        if not LINUX:
+        if linux_table is not None:
+            temp_dir_length = linux_header['temp_dir_length']
+        if REFERENCE_OUT and LINUX:
+            out_file = open(REFERENCE_OUT, 'w', encoding='ascii', newline='\n')
+            out_file.write(json.dumps({'header': {'temp_dir_length': temp_dir_length, 'python': sys.version.split()[0],
+                                                  'seed': SEED}}) + '\n')
+        if not LINUX and linux_table is None:
             print('not Linux: only is_archive is compared (the path rules are defined on Linux)')
 
         def compare(batch):
             nonlocal shown
-            got, unreadable, code = run_probe(case_dir, temp_dir_length)
+            got, unreadable, code = ({}, 0, 0) if REFERENCE_ONLY else run_probe(case_dir, temp_dir_length)
             tally['unreadable lines'] += unreadable
             if code != 0:
                 tally['probe failures'] += 1
                 print(f'FAIL  the probe ended with exit code {code} on the batch starting at {batch[0][0]}')
-            for name, note in batch:
+            for name, note, digest in batch:
                 path = os.path.join(case_dir, name)
-                want = reference_view(engine, core, path, temp_parent)
-                have = got.get(name)
+                if linux_table is not None:
+                    entry = linux_table.get(name)
+                    if entry is None or entry['input_sha256'] != digest:
+                        tally['inputs whose bytes differ between the systems (not compared)'] += 1
+                        os.remove(path)
+                        continue
+                    want = entry['view']
+                else:
+                    want = reference_view(engine, core, path, temp_parent)
+                if out_file is not None:
+                    out_file.write(json.dumps({'file': name, 'input_sha256': digest, 'view': want}) + '\n')
+                have = want if REFERENCE_ONLY else got.get(name)
                 tally['inputs'] += 1
                 tally['archive for the reference'] += 1 if want['is_archive'] else 0
                 tally['archive for C++'] += 1 if have and have.get('is_archive') else 0
@@ -634,13 +674,18 @@ def main():
         for name, data, note in all_cases(rng):
             with open(os.path.join(case_dir, name), 'wb') as f:
                 f.write(data)
-            batch.append((name, note))
+            batch.append((name, note, hashlib.sha256(data).hexdigest()))
             if len(batch) >= BATCH_FILES:
                 compare(batch)
                 batch = []
         if batch:
             compare(batch)
 
+    if out_file is not None:
+        out_file.close()
+    if REFERENCE_ONLY:
+        print(f"reference only: answers of {tally['inputs']} inputs written to {REFERENCE_OUT}")
+        return 0 if tally['inputs'] and REFERENCE_OUT else 1
     for field in FIELDS:
         print(f'{field}: compared {counts[field][0]}, different {counts[field][1]}')
     for key, value in tally.items():
