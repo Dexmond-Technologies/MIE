@@ -306,21 +306,24 @@ def verify_deb_lifecycle(deb_path: Path, prefix: str = "") -> None:
 
     # ---- L-5 -------------------------------------------------------------------------
     l5_errors: list[str] = []
-    # Check no mie-service runs as root
+    # Check no mie-service runs as root (/proc/<pid>/comm is world-readable)
     for pid_entry in os.listdir("/proc"):
         if not pid_entry.isdigit():
             continue
         try:
-            exe = os.path.basename(os.readlink(f"/proc/{pid_entry}/exe"))
+            comm = Path(f"/proc/{pid_entry}/comm").read_text(encoding="utf-8").strip()
             st_proc = os.stat(f"/proc/{pid_entry}")
-            if exe == "mie-service" and st_proc.st_uid == 0:
+            if comm == "mie-service" and st_proc.st_uid == 0:
                 l5_errors.append(f"mie-service running as root (pid={pid_entry})")
         except OSError:
             continue
 
     # Verify /opt/dexmond-mie/mie-autostart invoked as root exits 0 immediately without starting mie-service
     run_root_cmd(["/opt/dexmond-mie/mie-autostart"])
-    if Path("/root/.cache/dexmond-mie/service.sock").exists():
+    root_sock_chk = run_root_cmd(
+        ["sh", "-c", "if [ -e /root/.cache/dexmond-mie/service.sock ]; then echo EXISTS; fi"]
+    )
+    if "EXISTS" in root_sock_chk.stdout:
         l5_errors.append("mie-autostart created root socket when invoked as root")
 
     # Check no system service unit installed anywhere
@@ -331,13 +334,13 @@ def verify_deb_lifecycle(deb_path: Path, prefix: str = "") -> None:
         Path("/etc/init.d"),
     ):
         if sys_svc_dir.is_dir():
-            matches = [
-                str(p)
-                for p in sys_svc_dir.rglob("*")
-                if "dexmond" in p.name.lower() or p.name.lower().startswith("mie")
-            ]
-            if matches:
-                l5_errors.append(f"system service files found: {matches}")
+            for root_s, dirs_s, files_s in os.walk(sys_svc_dir):
+                for entry_name in [*dirs_s, *files_s]:
+                    low_name = entry_name.lower()
+                    if "dexmond" in low_name or low_name.startswith("mie"):
+                        l5_errors.append(
+                            f"system service entry found: {os.path.join(root_s, entry_name)}"
+                        )
 
     record(
         tag("L-5"),
@@ -504,7 +507,9 @@ def main() -> int:
     gpg_env = os.environ.get("MIE_LINUX_GPG_KEY_ID", "").strip()
     skip_logged = "SIGNING SKIPPED:" in build_log_text
     desc_has_banner = "UNSIGNED TEST BUILD" in deb_desc
-    created_keys = find_created_keys_or_signatures([Path("build-pkg")])
+    created_keys = find_created_keys_or_signatures(
+        [stage_dir, deb_path.parent, Path("build-pkg/linux-work")]
+    )
     sign_ok = (not gpg_env) and skip_logged and desc_has_banner and (not created_keys)
 
     l8_ok = lic_ok and word_ok and sign_ok
