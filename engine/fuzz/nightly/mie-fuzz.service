@@ -12,4 +12,4 @@ Nice=10
 # One core per target (100% each): the channel frame decoder and the executable reader.
 CPUQuota=200%
 MemoryMax=6G
-TimeoutStartSec=3h
+TimeoutStartSec=12h

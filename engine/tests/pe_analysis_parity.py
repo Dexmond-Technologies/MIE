@@ -12,9 +12,12 @@ _section_name, section_at_rva, get_resource_section, resource_slack_entropy; and
 PEAnalyzer.from_data for the head-window analysis of an oversize file.
 C++ side: `mie-pe-analysis-probe <dir> --packer-rule Packer_UPX`.
 
-Inputs (all generated here, harmless, no malware and no EICAR file): the executables of
-parity set S and two resource-tree executables, plus damaged variants of each, built by the
-generator of engine/tests/pe_parity.py with the seed printed below. Only files that parse
+Inputs (all generated here, harmless, no malware and no EICAR file): the base files of
+engine/tests/pe_parity.py (the executables of parity set S and the ones built there for
+resources, ordinals, delay imports, overlapping sections and 64-bit), plus damaged variants of
+each, built by that test's generator with the seed printed below. The number of variants and
+the seed follow the same environment settings (MIE_PE_VARIANTS_PER_BASE, MIE_PE_TOTAL_VARIANTS,
+MIE_PE_SEED); files are handled in batches. Only files that parse
 on BOTH sides are compared here; "parses or not" is the business of pe_parity.py.
 
 The packer rule name is given to every file on both sides (not only to the files named
@@ -144,88 +147,77 @@ def normalise(got):
 
 def main():
     rng = random.Random(pe_parity.SEED)
-    print(f'seed {pe_parity.SEED}; {pe_parity.VARIANTS_PER_BASE} damaged variants per base file; '
-          f'packer rules given to both sides: {PACKER_RULES}')
     counts = {field: [0, 0] for field in FIELDS + tuple('head.' + f for f in HEAD_FIELDS)}
     shown = 0
     tally = {'both': 0, 'reference only': 0, 'C++ only': 0, 'neither': 0, 'reference method raised': 0,
              'head compared': 0, 'head valid on one side only': 0, 'files with any difference': 0}
     confirmed_files = 0
     variants_built = 0
+    lines_read = unreadable_lines = probe_failures = 0
 
     with tempfile.TemporaryDirectory(prefix='mie-pea-') as tmp:
         bases = pe_parity.base_files(tmp)
+        per_base = pe_parity.variants_per_base(len(bases))
+        print(f'seed {pe_parity.SEED}; {per_base} damaged variants per base file; {len(bases)} base files; '
+              f'packer rules given to both sides: {PACKER_RULES}')
         case_dir = os.path.join(tmp, 'cases')
         os.mkdir(case_dir)
-        cases = []
-        for base_name, data in bases.items():
-            cases.append((base_name, data))
-            for index, variant in enumerate(pe_parity.variants(base_name, data, rng)):
-                cases.append((f'{base_name}.v{index:03d}', variant))
-                variants_built += 1
-        for name, data in cases:
-            with open(os.path.join(case_dir, name), 'wb') as f:
-                f.write(data)
-
         args = [PROBE, case_dir]
         for rule in PACKER_RULES:
             args += ['--packer-rule', rule]
-        out = subprocess.run(args, capture_output=True, timeout=800)
-        got = {}
-        unreadable = 0
-        for raw in out.stdout.split(b'\n'):   # line feeds only, never str.splitlines()
-            if not raw.strip():
-                continue
-            try:
-                record = json.loads(raw.decode('utf-8', 'replace'))
-                got[record['file']] = record
-            except (ValueError, KeyError):
-                unreadable += 1
-        print(f'probe: {len(got)} lines read, {unreadable} unreadable, exit code {out.returncode}')
 
-        for name, data in cases:
-            want = reference_view(os.path.join(case_dir, name), data)
-            have = got.get(name)
-            cpp_parsed = bool(have and have.get('parsed'))
-            if want is None or not cpp_parsed:
-                key = ('neither' if want is None and not cpp_parsed else
-                       'C++ only' if want is None else 'reference only')
-                tally[key] += 1
-                continue
-            if 'raises' in want:
-                tally['reference method raised'] += 1
-                continue
-            tally['both'] += 1
-            have = normalise(have)
-            if want['confirmed_upx_sections']:
-                confirmed_files += 1
-            different = False
-            for field in FIELDS:
-                counts[field][0] += 1
-                if want[field] != have.get(field):
-                    counts[field][1] += 1
-                    different = True
-                    if shown < 20:
-                        shown += 1
-                        print(f'DIFFERENT {name}: {field}: reference {want[field]!r}  C++ {have.get(field)!r}')
-            head_want, head_have = want['head'], have.get('head')
-            if head_want is None or head_have is None or 'raises' in head_want:
-                if (head_want is None) != (head_have is None):
-                    tally['head valid on one side only'] += 1
-            else:
-                tally['head compared'] += 1
-                for field in HEAD_FIELDS:
-                    counts['head.' + field][0] += 1
-                    if head_want[field] != head_have.get(field):
-                        counts['head.' + field][1] += 1
+        for batch in pe_parity.case_batches(bases, rng, case_dir, per_base):
+            got, unreadable, code = pe_parity.run_probe(args, timeout=800)   # line feeds only, never str.splitlines()
+            lines_read += len(got)
+            unreadable_lines += unreadable
+            if code != 0:
+                probe_failures += 1
+                print(f'FAIL  the probe ended with exit code {code} on a batch starting at {batch[0][1]}')
+            for kind, name, data in batch:
+                variants_built += 1 if kind == 'variant' else 0
+                want = reference_view(os.path.join(case_dir, name), data)
+                have = got.get(name)
+                cpp_parsed = bool(have and have.get('parsed'))
+                if want is None or not cpp_parsed:
+                    key = ('neither' if want is None and not cpp_parsed else
+                           'C++ only' if want is None else 'reference only')
+                    tally[key] += 1
+                    continue
+                if 'raises' in want:
+                    tally['reference method raised'] += 1
+                    continue
+                tally['both'] += 1
+                have = normalise(have)
+                if want['confirmed_upx_sections']:
+                    confirmed_files += 1
+                different = False
+                for field in FIELDS:
+                    counts[field][0] += 1
+                    if want[field] != have.get(field):
+                        counts[field][1] += 1
                         different = True
                         if shown < 20:
                             shown += 1
-                            print(f'DIFFERENT {name}: head.{field}: reference {head_want[field]!r}  '
-                                  f'C++ {head_have.get(field)!r}')
-            if different:
-                tally['files with any difference'] += 1
+                            print(f'DIFFERENT {name}: {field}: reference {want[field]!r}  C++ {have.get(field)!r}')
+                head_want, head_have = want['head'], have.get('head')
+                if head_want is None or head_have is None or 'raises' in head_want:
+                    if (head_want is None) != (head_have is None):
+                        tally['head valid on one side only'] += 1
+                else:
+                    tally['head compared'] += 1
+                    for field in HEAD_FIELDS:
+                        counts['head.' + field][0] += 1
+                        if head_want[field] != head_have.get(field):
+                            counts['head.' + field][1] += 1
+                            different = True
+                            if shown < 20:
+                                shown += 1
+                                print(f'DIFFERENT {name}: head.{field}: reference {head_want[field]!r}  '
+                                      f'C++ {head_have.get(field)!r}')
+                if different:
+                    tally['files with any difference'] += 1
 
+    print(f'probe: {lines_read} lines read, {unreadable_lines} unreadable')
     print(f'{len(bases)} base files, {variants_built} damaged variants; ' + '; '.join(f'{k}: {v}' for k, v in tally.items()))
     print(f'files where the packer layout is confirmed in the reference: {confirmed_files}')
     total_different = 0
@@ -234,6 +226,8 @@ def main():
         total_different += different
         print(f'{field}: {compared} compared, {different} different')
     problems = []
+    if probe_failures or unreadable_lines:
+        problems.append(f'the probe failed on {probe_failures} batches; {unreadable_lines} lines could not be read')
     if variants_built < 2000:
         problems.append(f'only {variants_built} variants were built (at least 2,000 are required)')
     if tally['both'] == 0:

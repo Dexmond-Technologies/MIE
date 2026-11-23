@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Says, for one night, whether every fuzz target has a PASS record: the line the coordinator
+# Says, for one night, whether every fuzz target and every nightly parity test has a PASS record: the line the coordinator
 # posts on the board. A night with no record at all is MISSED, which counts as not met.
 #
 # Usage: check_night.sh [YYYY-MM-DD]     (default: today's date in UTC)
 # Exit code: 0 every target PASS, 1 any FAILED, 3 any MISSED.
 set -u
 WORK="${MIE_FUZZ_WORK:-/mnt/node4-work/mie-fuzz}"
-TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe}"
+TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe} ${MIE_PARITY_TESTS-pe_parity pe_analysis_parity}"
 NIGHT="${1:-$(date -u +%Y-%m-%d)}"
 python3 - "$WORK/records.jsonl" "$NIGHT" $TARGETS <<'PY'
 import json, os, sys
@@ -23,8 +23,10 @@ for target in targets:
         worst = max(worst, 3)
         continue
     last = mine[-1]
-    print(f"{night} {target}: {last['result']} commit {last['commit'][:12]} runs {last['runs']} "
-          f"seconds {last['seconds_asked']} log sha256 {last['log_sha256'][:16]} {last['detail']}")
+    amount = (f"variants {last['runs']} seed {last.get('seed')}" if last.get("kind") == "parity"
+              else f"runs {last['runs']} seconds {last.get('seconds_asked')}")
+    print(f"{night} {target}: {last['result']} commit {last['commit'][:12]} {amount} "
+          f"log sha256 {last['log_sha256'][:16]} {last['detail']}")
     if last["result"] != "PASS":
         worst = max(worst, 1)
 sys.exit(worst)

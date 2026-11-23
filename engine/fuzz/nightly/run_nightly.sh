@@ -12,10 +12,16 @@
 # What it does: fetches branch cpp/stage1 into its own clone, builds the fuzz targets with clang
 # from the pinned vcpkg commit, runs each target for FUZZ_SECONDS on its own core, saves the log,
 # the corpus and any crash input, and appends one JSON line per target to records.jsonl.
+# Then (part 2) it builds the engine's two executable probes and runs the parity tests of the
+# executable reader and its analysis against the Python reference on at least 200,000 damaged
+# variants with a new seed each night, and appends one JSON line per test.
 #
-# It needs: git, cmake, ninja or make, clang with libFuzzer (compiler-rt), curl, zip, unzip, tar,
-# pkg-config, python3. It installs nothing and needs no root. It opens no network listener.
-# Network use: git fetch from GitHub (the repository and vcpkg) and vcpkg's source downloads.
+# It needs: git, cmake, ninja or make, clang with libFuzzer (compiler-rt), a C++ compiler for the
+# normal build, curl, zip, unzip, tar, pkg-config, python3 with the venv module. It needs no root
+# and opens no network listener. The only things it installs are Python packages into its own
+# virtual environment under the work folder (pefile 2024.8.26, and yara-python 4.5.1 if it can).
+# Network use: git fetch from GitHub (the repository and vcpkg), vcpkg's source downloads, and,
+# the first time, the Python package index for that virtual environment.
 #
 # Usage: run_nightly.sh            (configuration by environment, defaults below)
 set -u
@@ -27,6 +33,12 @@ FUZZ_SECONDS="${MIE_FUZZ_SECONDS:-3600}"
 RSS_LIMIT_MB="${MIE_FUZZ_RSS_MB:-2048}"
 # Every fuzz target built by engine/CMakeLists.txt with -DMIE_FUZZ_ONLY=ON. Add new targets here.
 TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe}"
+# Second part of the night: the parity tests of the executable reader and of its analysis
+# against the Python reference, on far more damaged variants than a push runs (reviewer, board
+# B-3620: at least 200,000 per night). Set MIE_PARITY_TESTS to an empty value to leave it out.
+PARITY_TESTS="${MIE_PARITY_TESTS-pe_parity pe_analysis_parity}"
+PARITY_TOTAL="${MIE_PE_TOTAL_VARIANTS:-200000}"
+PARITY_SEED="${MIE_PE_SEED:-$(date -u +%Y%m%d)}"     # a new seed every night, written in the log
 
 case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "MIE_FUZZ_SECONDS must be a whole number" >&2; exit 2;; esac
 
@@ -43,19 +55,23 @@ if ! flock -n 9; then
     exit 2
 fi
 
-record() {  # record <target> <result> <runs> <log file or ''> <detail>
-    local target="$1" result="$2" runs="$3" log="$4" detail="$5" log_hash=""
+record() {  # record <target> <result> <runs> <log file or ''> <detail> [kind: fuzz (default) or parity]
+    local target="$1" result="$2" runs="$3" log="$4" detail="$5" kind="${6:-fuzz}" log_hash=""
     if [ -n "$log" ] && [ -f "$log" ]; then
         log_hash="$(sha256sum "$log" | cut -d' ' -f1)"
     fi
     python3 - "$RECORDS" "$NIGHT" "$STAMP" "${COMMIT:-unknown}" "$target" "$result" "$runs" \
-        "$FUZZ_SECONDS" "$log" "$log_hash" "$detail" "$(hostname)" <<'PY'
+        "$FUZZ_SECONDS" "$log" "$log_hash" "$detail" "$(hostname)" "$kind" "$PARITY_SEED" <<'PY'
 import json, sys
-path, night, stamp, commit, target, result, runs, seconds, log, log_hash, detail, host = sys.argv[1:13]
+(path, night, stamp, commit, target, result, runs, seconds, log, log_hash, detail, host, kind,
+ seed) = sys.argv[1:15]
 line = {"night": night, "started_utc": stamp, "commit": commit, "target": target, "result": result,
-        "runs": int(runs) if runs.isdigit() else None, "seconds_asked": int(seconds),
-        "log": log, "log_sha256": log_hash, "detail": detail, "host": host,
-        "sanitizers": "address,undefined"}
+        "runs": int(runs) if runs.isdigit() else None, "log": log, "log_sha256": log_hash,
+        "detail": detail, "host": host, "kind": kind}
+if kind == "parity":    # runs = damaged variants compared with the Python reference
+    line.update({"seconds_asked": None, "sanitizers": "none (release build)", "seed": seed})
+else:                   # runs = inputs the fuzzer executed
+    line.update({"seconds_asked": int(seconds), "sanitizers": "address,undefined"})
 with open(path, "a", encoding="utf-8") as f:
     f.write(json.dumps(line, sort_keys=True) + "\n")
 print(json.dumps(line, sort_keys=True))
@@ -66,6 +82,9 @@ fail_all() {  # the night failed before any target ran: one FAILED record per ta
     local detail="$1" target
     for target in $TARGETS; do
         record "$target" "FAILED" "" "$RUN_DIR/build.log" "$detail"
+    done
+    for target in $PARITY_TESTS; do
+        record "$target" "FAILED" "" "$RUN_DIR/build.log" "$detail" parity
     done
     exit 1
 }
@@ -150,6 +169,76 @@ for target in $TARGETS; do
         record "$target" "FAILED" "${runs:-}" "$log" "exit code $code, $found crash or timeout inputs saved under $WORK/crashes/$STAMP-$target"
     fi
 done
+
+# ---- part 2: parity of the executable reader and its analysis with the Python reference ----
+# Needs a Python with pefile 2024.8.26 (the reference's parser library). It is kept in a
+# virtual environment under the work folder, created once; creating it needs network access
+# to the Python package index. yara-python 4.5.1 is installed too when it can be (the two
+# tests below do not use it; a failure to install it is written to the log and is not fatal).
+if [ -n "$PARITY_TESTS" ]; then
+    VENV="$WORK/venv"
+    BUILD_ENGINE="$WORK/build-engine"
+    parity_ready=1
+    (
+        if [ ! -x "$VENV/bin/python" ]; then
+            python3 -m venv "$VENV" || exit 1
+        fi
+        "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check "pefile==2024.8.26" || exit 1
+        "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check "yara-python==4.5.1" ||
+            echo "yara-python 4.5.1 could not be installed for this Python; not needed by the two parity tests"
+        "$VENV/bin/python" --version
+        "$VENV/bin/python" -m pip list --disable-pip-version-check 2>/dev/null | grep -i -E '^(pefile|yara-python) '
+        # The fuzz targets above are built with clang; this build uses the system's default
+        # compiler, as the GitHub Linux job does (warnings are errors, and only that compiler
+        # and MSVC have been seen to build every file clean).
+        unset CC CXX
+        rm -rf "$BUILD_ENGINE" &&
+        cmake -S "$SRC/engine" -B "$BUILD_ENGINE" -DCMAKE_BUILD_TYPE=Release -DMIE_BUILD_TESTS=OFF \
+              "-DCMAKE_TOOLCHAIN_FILE=$VCPKG/scripts/buildsystems/vcpkg.cmake" &&
+        cmake --build "$BUILD_ENGINE" --parallel "$(nproc)" --target mie-pe-probe mie-pe-analysis-probe
+    ) >"$RUN_DIR/parity-build.log" 2>&1 || parity_ready=0
+
+    if [ "$parity_ready" = "0" ]; then
+        overall=1
+        for test in $PARITY_TESTS; do
+            record "$test" "FAILED" "" "$RUN_DIR/parity-build.log" "the Python environment or the engine build failed" parity
+        done
+    else
+        pids=""
+        for test in $PARITY_TESTS; do
+            case "$test" in
+                pe_parity) probe="mie-pe-probe" ;;
+                pe_analysis_parity) probe="mie-pe-analysis-probe" ;;
+                *) probe="" ;;
+            esac
+            if [ -z "$probe" ] || [ ! -x "$BUILD_ENGINE/$probe" ]; then
+                echo "no probe for $test" >"$RUN_DIR/$test.log"
+                echo 2 >"$RUN_DIR/$test.exit"
+                continue
+            fi
+            (
+                MIE_PE_TOTAL_VARIANTS="$PARITY_TOTAL" MIE_PE_SEED="$PARITY_SEED" nice -n 10 \
+                    "$VENV/bin/python" "$SRC/engine/tests/$test.py" "$BUILD_ENGINE/$probe" "$SRC" \
+                    >"$RUN_DIR/$test.log" 2>&1
+                echo $? >"$RUN_DIR/$test.exit"
+            ) &
+            pids="$pids $!"
+        done
+        for pid in $pids; do wait "$pid"; done
+        for test in $PARITY_TESTS; do
+            code="$(cat "$RUN_DIR/$test.exit" 2>/dev/null || echo missing)"
+            log="$RUN_DIR/$test.log"
+            variants="$(sed -n 's/.* base files, \([0-9][0-9]*\) damaged variants.*/\1/p' "$log" | tail -1)"
+            last="$(grep -E "^$test: [0-9]+ differences" "$log" | tail -1)"
+            if [ "$code" = "0" ] && [ -n "$variants" ] && [ "$variants" -ge "$PARITY_TOTAL" ]; then
+                record "$test" "PASS" "$variants" "$log" "seed $PARITY_SEED; $last" parity
+            else
+                overall=1
+                record "$test" "FAILED" "${variants:-}" "$log" "seed $PARITY_SEED; exit code $code; ${last:-no result line}; at least $PARITY_TOTAL variants are required" parity
+            fi
+        done
+    fi
+fi
 
 # Keep the last 30 runs' logs; records.jsonl, corpus and crashes are never deleted here.
 ls -1d "$WORK"/runs/*/ 2>/dev/null | sort | head -n -30 | while read -r old; do rm -rf "$old"; done

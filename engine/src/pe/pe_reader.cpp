@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <optional>
 #include <set>
+#include <span>
+#include <string>
 #include <string_view>
 
 namespace mie::pe {
@@ -41,6 +43,42 @@ struct AddressSet {
     std::set<u64> members;
     u64 diff() const { return members.empty() ? 0 : *members.rbegin() - *members.begin(); }
 };
+
+// pefile's ordinal-name tables for three DLLs, copied as data (reviewer's ruling, board
+// B-3620: reporting the bare ordinal instead was not accepted as a difference).
+struct OrdinalName {
+    u16 ordinal;
+    const char* name;
+};
+#include "pe_ordinal_names.inc"
+
+// pefile:5772-5778 and 5942-5948 with ordlookup.ordLookup: an import by ordinal (name None) of
+// oleaut32.dll, ws2_32.dll or wsock32.dll (the DLL name lower-cased, ASCII) gets the table's
+// name, or "ord<N>" when the ordinal is not in the table. Other DLLs keep no name.
+void name_ordinal_imports(ImportLibrary& library) {
+    std::string dll = library.dll;
+    for (char& ch : dll) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    std::span<const OrdinalName> table;
+    if (dll == "oleaut32.dll") {
+        table = kOrdinalNamesOleaut32;
+    } else if (dll == "ws2_32.dll") {
+        table = kOrdinalNamesWs2_32;
+    } else if (dll == "wsock32.dll") {
+        table = kOrdinalNamesWsock32;
+    } else {
+        return;
+    }
+    for (ImportSymbol& symbol : library.symbols) {
+        if (!symbol.name.empty()) continue;
+        const auto found = std::lower_bound(table.begin(), table.end(), symbol.ordinal,
+                                            [](const OrdinalName& entry, u32 ordinal) { return entry.ordinal < ordinal; });
+        symbol.name = (found != table.end() && found->ordinal == symbol.ordinal)
+                          ? std::string(found->name)
+                          : "ord" + std::to_string(symbol.ordinal);
+    }
+}
 
 struct ResNode {
     bool is_dir = false;
@@ -552,7 +590,10 @@ private:
             }
             library.dll = string_at(name_rva, kMaxDllLength);
             if (!valid_dos_filename(library.dll)) library.dll = "*invalid*";
-            if (!library.dll.empty()) libraries.push_back(std::move(library));
+            if (!library.dll.empty()) {
+                name_ordinal_imports(library);
+                libraries.push_back(std::move(library));
+            }
         }
         return libraries;
     }
@@ -597,7 +638,10 @@ private:
             if (total_import_symbols_ > kMaxImportSymbols) break;
             library.dll = string_at(name_rva, kMaxDllLength);
             if (!valid_dos_filename(library.dll)) library.dll = "*invalid*";
-            if (!library.dll.empty()) libraries.push_back(std::move(library));
+            if (!library.dll.empty()) {
+                name_ordinal_imports(library);
+                libraries.push_back(std::move(library));
+            }
         }
         return libraries;
     }
@@ -673,13 +717,36 @@ private:
         nodes_.push_back(ResNode{});
         nodes_[static_cast<std::size_t>(self)].is_dir = true;
         rva += 16;
+        // pefile:4741-4775: a named entry's string (a 16-bit length, then UTF-16 text) is looked
+        // at as well. When the previous name starts before this one and its end (start + its
+        // length word) reaches this one's start, pefile takes the directory for corrupt, drops
+        // the previous name and stops the directory before this entry.
+        std::vector<std::pair<u64, u64>> names;   // (start, length word) of the names kept
+        bool have_last = false;
+        u64 last_begin = 0, last_end = 0;
+        bool overlap = false;
         for (u32 i = 0; i < count; ++i) {
             const std::optional<Range> e = get_data(rva, true, 8);
             if (!e) break;
             offset_from_rva(rva);
             if (width(*e) < 8) break;
-            u32 offset_to_data = 0;
+            u32 name_field = 0, offset_to_data = 0;
+            rd32(e->begin, name_field);
             rd32(e->begin + 4, offset_to_data);
+            if ((name_field & 0x80000000u) != 0) {
+                const u64 at = base + (name_field & 0x7FFFFFFFu);
+                u16 length = 0;                    // pefile:783-795: unreadable counts as 0
+                if (const std::optional<Range> w = get_data(at, true, 2); w && width(*w) >= 2) rd16(w->begin, length);
+                if (have_last && last_begin < at && last_end >= at) {
+                    if (!names.empty()) names.pop_back();
+                    overlap = true;
+                    break;
+                }
+                have_last = true;
+                last_begin = at;
+                last_end = at + length;
+                names.emplace_back(at, length);
+            }
             const u64 target = base + (offset_to_data & 0x7FFFFFFFu);
             int child = -1;
             if ((offset_to_data & 0x80000000u) != 0) {
@@ -701,6 +768,15 @@ private:
             }
             nodes_[static_cast<std::size_t>(self)].children.push_back(child);
             rva += 8;
+        }
+        // pefile:4902-4906 then reads every kept name (render_pascal_16 -> get_string_u_at_rva,
+        // pefile:6476-6490). Only the look-ups are repeated here, in pefile's order, because they
+        // move its "last used section" state; the text itself is not used by the reference.
+        (void)overlap;
+        for (const auto& [at, length] : names) {
+            if (length == 0) continue;
+            if (!get_data(sat_add(at, 2), true, 2)) continue;
+            get_data(sat_add(at, 2), true, std::min<u64>(static_cast<u64>(length) * 2, 256));
         }
         return self;
     }

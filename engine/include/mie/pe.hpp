@@ -47,7 +47,9 @@ struct Section {
 };
 
 struct ImportSymbol {
-    std::string name;             // empty for an import by ordinal
+    std::string name;             // an import by ordinal has no name, except from oleaut32.dll,
+                                  // ws2_32.dll and wsock32.dll: pefile names those from its own
+                                  // tables ("ord<N>" when the ordinal is not in the table)
     bool by_ordinal = false;
     std::uint32_t ordinal = 0;
     bool has_name_offset = false;
@@ -126,8 +128,9 @@ Image parse(std::span<const std::uint8_t> data);
 
 // The reference's view of the import table (pe_analyzer._get_imports at ff313e2): one entry
 // per DLL name in order of first appearance; a DLL listed again REPLACES its earlier list;
-// an import by ordinal is named "ordinal_<n>". Delay imports are not included (the
-// reference at ff313e2 does not read them).
+// an import by ordinal that pefile did not name is called "ordinal_<n>" (one that pefile named
+// from its tables keeps that name). Delay imports are not included (the reference at ff313e2
+// does not read them).
 std::vector<std::pair<std::string, std::vector<std::string>>> reference_imports(const Image& image);
 
 }  // namespace mie::pe

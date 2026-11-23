@@ -428,11 +428,15 @@ Analysis analyze(const Image& image, std::span<const std::uint8_t> data,
         }
     }
     if (!out.wx_sections.empty()) {
+        // ", ".join(names): a separator between every two names, also when a name is empty
+        // (a section with an empty name gives ", UPX1", as in the reference).
         std::string names;
+        bool first = true;
         for (const std::size_t index : out.wx_sections) {
-            if (!names.empty()) {
+            if (!first) {
                 names += ", ";
             }
+            first = false;
             names += image.sections[index].name;
         }
         out.warnings.push_back("Writable and executable section(s): " + names);
