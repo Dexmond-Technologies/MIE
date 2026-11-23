@@ -113,6 +113,19 @@ bool read_tlv(Bytes& in, Tlv& out) {
     return true;
 }
 
+// D-23 (SG-4): what may follow the last element a walker reads. Inside an explicit [0]
+// (`wrapper`) asn1crypto ignores ANY remainder (core.py:5506); after the last field of a
+// SEQUENCE it keeps further complete elements as extra children (core.py:3956) and fails on
+// bytes that are not one (_parse). Parity (D-23 on): the same. Shipped: nothing may follow.
+thread_local bool g_accept_leftovers = false;
+void end_of(Bytes rest, bool wrapper, const char* where) {
+    if (rest.empty() || (g_accept_leftovers && wrapper)) return;
+    if (!g_accept_leftovers) throw Fail{"ValueError", std::string("ASN.1: bytes left over after ") + where};
+    for (Tlv element; !rest.empty();) {
+        if (!read_tlv(rest, element)) throw Fail{"ValueError", std::string("ASN.1: incomplete element after ") + where};
+    }
+}
+
 // A REQUIRED field that signify never reads. asn1crypto 1.5.1 splits a SEQUENCE into its
 // children without looking at the tag of a required field (core.py:3893-3928: only an
 // optional or defaulted field is compared, by class and tag number, line 3899); the tag is
@@ -132,11 +145,12 @@ bool read_tlv(Bytes& in, Tlv& out) {
 // one verify() call in a thread-local, set and cleared by UnreadFieldsScope.
 thread_local bool g_accept_unread_fields = false;
 struct UnreadFieldsScope {
-    UnreadFieldsScope(bool fields, bool long_lengths) {
+    UnreadFieldsScope(bool fields, bool long_lengths, bool leftovers) {
         g_accept_unread_fields = fields;
         g_accept_long_lengths = long_lengths;
+        g_accept_leftovers = leftovers;
     }
-    ~UnreadFieldsScope() { g_accept_unread_fields = g_accept_long_lengths = false; }
+    ~UnreadFieldsScope() { g_accept_unread_fields = g_accept_long_lengths = g_accept_leftovers = false; }
     UnreadFieldsScope(const UnreadFieldsScope&) = delete;
     UnreadFieldsScope& operator=(const UnreadFieldsScope&) = delete;
 };
@@ -307,6 +321,7 @@ std::vector<Attr> parse_attributes(Bytes content) {
         Attr parsed;
         parsed.oid = expect(inner, 0x06, "attribute type").content;
         Bytes values = expect(inner, 0x31, "attribute values").content;
+        end_of(inner, false, "an attribute's value set");
         while (!values.empty()) {
             if (parsed.values.size() >= kMaxAttributes) throw Fail{"ValueError", "too many attribute values"};
             Tlv value;
@@ -364,6 +379,7 @@ Signer parse_signer(Bytes content, SignerKind kind) {
         Bytes inner = sid.content;
         out.issuer = expect(inner, 0x30, "SignerInfo issuer").whole;
         out.serial = expect(inner, 0x02, "SignerInfo serial number").whole;
+        end_of(inner, false, "SignerInfo.sid");
     }
     out.digest_alg = expect(content, 0x30, "SignerInfo.digestAlgorithm");
     Tlv next;
@@ -379,10 +395,11 @@ Signer parse_signer(Bytes content, SignerKind kind) {
     // accepted (see skip_unread). An element with tag [0] cannot arrive here: it was taken as the signed attributes.
     if (!g_accept_unread_fields && next.tag != 0x30) throw Fail{"ValueError", "ASN.1: SignerInfo.signatureAlgorithm"};
     out.signature = expect(content, 0x04, "SignerInfo.signature").content;
-    if (!content.empty()) {
+    if (!content.empty() && content[0] == 0xA1) {
         const Tlv unsigned_attrs = expect(content, 0xA1, "SignerInfo.unsignedAttrs");
         out.unauth = parse_attributes(unsigned_attrs.content);
     }
+    end_of(content, false, "SignerInfo");
 
     const bool has_content_type = find_attr(out.auth, kOidContentType) != nullptr;
     const bool has_message_digest = find_attr(out.auth, kOidMessageDigest) != nullptr;
@@ -448,11 +465,13 @@ SignedData parse_signed_data(Bytes content, DataKind kind) {
     }
     Bytes encap = expect(content, 0x30, "SignedData.encapContentInfo").content;
     const Tlv content_type = expect(encap, 0x06, "content type");
-    if (!encap.empty()) {
+    if (!encap.empty() && encap[0] == 0xA0) {
         Bytes wrapped = expect(encap, 0xA0, "encapsulated content").content;
         if (!read_tlv(wrapped, out.content)) throw Fail{"ValueError", "ASN.1: encapsulated content"};
         out.has_content = true;
+        end_of(wrapped, true, "EncapsulatedContentInfo.content");
     }
+    end_of(encap, false, "EncapsulatedContentInfo");
     Tlv next;
     if (!read_tlv(content, next)) throw Fail{"ValueError", "ASN.1: SignedData"};
     if (next.tag == 0xA0) {
@@ -473,6 +492,7 @@ SignedData parse_signed_data(Bytes content, DataKind kind) {
         if (!read_tlv(content, next)) throw Fail{"ValueError", "ASN.1: SignedData"};
     }
     if (next.tag != 0x31) throw Fail{"ValueError", "ASN.1: SignedData.signerInfos"};
+    end_of(content, false, "SignedData");
 
     if (out.digest_algs.size() > 1) {
         throw Fail{"ParseError", "SignedData.digestAlgorithms must contain exactly 1 algorithm, not " +
@@ -510,7 +530,9 @@ SignedData parse_content_info(Bytes der, DataKind kind, const char* not_signed_c
     const Tlv type = expect(inner, 0x06, "ContentInfo.contentType");
     if (!is_oid(type.content, kOidSignedData)) throw Fail{not_signed_class, not_signed_text};
     Bytes wrapped = expect(inner, 0xA0, "ContentInfo.content").content;
+    end_of(inner, false, "ContentInfo");
     const Tlv body = expect(wrapped, 0x30, "SignedData");
+    end_of(wrapped, true, "ContentInfo.content");
     return parse_signed_data(body.content, kind);
 }
 
@@ -1004,9 +1026,12 @@ IndirectData parse_indirect_data(const SignedData& signed_data) {
         if (!read_tlv(data, out.value)) throw Fail{"ValueError", "ASN.1: SpcAttributeTypeAndOptionalValue.value"};
         out.has_value = true;
     }
+    end_of(data, false, "SpcAttributeTypeAndOptionalValue");
     Bytes digest_info = expect(content, 0x30, "SpcIndirectDataContent.messageDigest").content;
     out.digest_alg = expect(digest_info, 0x30, "DigestInfo.digestAlgorithm");
     out.digest = expect(digest_info, 0x04, "DigestInfo.digest").content;
+    end_of(digest_info, false, "DigestInfo");
+    end_of(content, false, "SpcIndirectDataContent");
     return out;
 }
 
@@ -1582,7 +1607,8 @@ Result verify(std::span<const std::uint8_t> data, const Options& options) {
     }
     const Precheck checked = precheck(data);
     if (checked.status != "ok") return make_result(checked.status, checked.detail);
-    const UnreadFieldsScope unread_fields(options.accept_unread_fields, options.accept_long_lengths);
+    const UnreadFieldsScope unread_fields(options.accept_unread_fields, options.accept_long_lengths,
+                                          options.accept_leftovers);
 
     // signature.py load_pinned_store
     if (options.pinned_sha256.empty()) {
@@ -1621,7 +1647,7 @@ bool primary_view(std::span<const std::uint8_t> data, PrimaryView& out) {
     try {
         const Precheck checked = precheck(data);
         if (checked.status != "ok") return false;
-        const UnreadFieldsScope strict(false, false);
+        const UnreadFieldsScope strict(false, false, false);
         const SignedData primary =
             parse_content_info(checked.primary_der, DataKind::Authenticode, "ParseError", "not SignedData");
         const IndirectData indirect = parse_indirect_data(primary);

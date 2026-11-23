@@ -95,6 +95,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     options.accept_long_lengths = (switches & 2) != 0;
     options.accept_md5 = (switches & 2) != 0;                        // D-21, with the other parity leniencies
     options.accept_malformed_page_hashes = (switches & 16) != 0;     // D-22, bit 4
+    options.accept_leftovers = (switches & 2) != 0;                  // D-23, with the parity leniencies
     options.signer_by_second_lookup = (switches & 8) != 0;
 
     const mie::signature::Precheck checked = mie::signature::precheck(file);

@@ -89,6 +89,10 @@ struct Options {
     // one digest, offsets that do not grow, a cut last entry). ON: the same. OFF: such a
     // signature gets no cap ("invalid").
     bool accept_malformed_page_hashes = false;
+    // D-23: the reference accepts further elements after the last field it reads in a SEQUENCE,
+    // and anything after the element inside an explicit [0]. ON: the same. OFF: nothing may
+    // follow (SIGNATURE_INTEGRATION.md section 24 lists the places).
+    bool accept_leftovers = false;
 
     // ---- shipped profile only, OFF in the parity profile ---------------------------------
     // The walker alone never grants the cap: a second, independent check (second_check)

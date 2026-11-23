@@ -253,12 +253,20 @@ def page_hash_entries(pe, pairs):
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
                       wrong_stamp_digest=False, page_hashes=None, nested=None, leaf_last=False,
-                      stamp_before=(), stamp_after=(), stamp_digest='sha256'):
-    """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`."""
+                      stamp_before=(), stamp_after=(), stamp_digest='sha256', leftover=None):
+    """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`. `leftover`:
+    (place, bytes) put after the last element at that place (SG-4); in signed regions before
+    the signing, so that only the leftover can be the reason for a refusal."""
+    place, extra = leftover or (None, b'')
+
+    def x(name):
+        return extra if place == name else b''
     spc = spc_indirect(pe, digest, page_hashes)
+    if place == 'spc_end':
+        spc = der(0x30, seq_contents(spc) + extra)
     spc_contents = spc[len(spc) - len(seq_contents(spc)):]
     content_digest = hashlib.new(digest, spc_contents).digest()
-    attrs = [attribute(OID_CONTENT_TYPE, oid(OID_SPC_INDIRECT)),
+    attrs = [seq(oid(OID_CONTENT_TYPE), der(0x31, oid(OID_SPC_INDIRECT)), x('signed_attr_values_end')),
              attribute(OID_MESSAGE_DIGEST, der(0x04, content_digest))]
     signature, fields = signer_info(leaf, digest, attrs)
     certs = [c.der for c in extra_certs] + [leaf.der] if leaf_last else [leaf.der] + [c.der for c in extra_certs]
@@ -272,7 +280,7 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
                          attribute(OID_SIGNING_TIME, der(0x17, when)),
                          attribute(OID_MESSAGE_DIGEST, der(0x04, stamped))]
         _, counter_fields = signer_info(tsa, stamp_digest, counter_attrs)
-        unsigned.append(attribute(OID_COUNTER_SIGNATURE, seq(*counter_fields)))
+        unsigned.append(seq(oid(OID_COUNTER_SIGNATURE), der(0x31, seq(*counter_fields)), x('unsigned_attr_values_end')))
         certs.extend(c.der for c in (*stamp_before, tsa, *stamp_after))
     elif timestamp == 'rfc3161':
         when = stamp_time.strftime('%Y%m%d%H%M%SZ').encode()
@@ -287,9 +295,10 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
         unsigned.append(attribute(OID_MS_TIMESTAMP, token))
     if unsigned:
         fields.append(der(0xA1, b''.join(unsigned)))
+    fields.append(x('signer_end'))
     signed_data = seq(der_int(1), der(0x31, alg_id(digest)), seq(oid(OID_SPC_INDIRECT), der(0xA0, spc)),
-                      der(0xA0, b''.join(certs)), der(0x31, seq(*fields)))
-    return seq(oid(OID_SIGNED_DATA), der(0xA0, signed_data))
+                      der(0xA0, b''.join(certs)), der(0x31, seq(*fields)), x('signed_data_end'))
+    return seq(oid(OID_SIGNED_DATA), der(0xA0, signed_data + x('content_info_wrapper')), x('content_info_end'))
 
 
 def seq_contents(element):
@@ -517,6 +526,18 @@ def build_cases():
     extra('second_entry_md5', lambda: attach(pe, [blob, authenticode_blob(pe, leaf, [inter], digest='md5')]))
     extra('second_entry_page_hashes_cut', lambda: attach(
         pe, [blob, authenticode_blob(pe, leaf, [inter], page_hashes=page_hash_table(pe)[:-3])]))
+    # SG-4 (D-23): bytes after the last element at seven places: `05 00` is one more well-formed
+    # element, a lone `30` is not an element. No asserted reference status (compared; the
+    # invalid/unavailable split is not reproduced); the shipped setting is asserted in main().
+    for place in ('signer_end', 'signed_data_end', 'signed_attr_values_end', 'unsigned_attr_values_end',
+                  'content_info_end', 'content_info_wrapper', 'spc_end'):
+        for kind, extra_bytes in (('element', b'\x05\x00'), ('garbage', b'\x30')):
+            stamp = ({'timestamp': 'authenticode', 'tsa': tsa, 'stamp_time': NOW - 10 * DAY}
+                     if place == 'unsigned_attr_values_end' else {})
+            add(f'leftover_{place}_{kind}', signed(pe, leaf, [inter], leftover=(place, extra_bytes), **stamp))
+        # after the signer's unsigned attributes themselves (a time-stamped base: the extra follows [1])
+        add(f'leftover_signer_after_unsigned_{kind}', signed(pe, leaf, [inter], leftover=('signer_end', extra_bytes),
+                                                             timestamp='authenticode', tsa=tsa, stamp_time=NOW - 10 * DAY))
     # an MD5 time-stamp over an expired leaf: the reference trusts it; the shipped setting must not (D-21)
     extra('stamp_md5_rfc3161', lambda: signed(pe, expired, [inter], timestamp='rfc3161', tsa=tsa, stamp_time=mid,
                                               stamp_digest='md5'))
@@ -936,7 +957,7 @@ def main():
                 problems.append(f'cap: reference {r_cap}, C++ {c_cap}')
             if r['status'] != c['status']:
                 both_no_cap = {r['status'], c['status']} == {'invalid', 'unavailable'}
-                if both_no_cap and name not in named:
+                if both_no_cap and (name not in named or name.startswith('leftover_')):
                     soft += 1
                     print(f"NOTE  {name}: reference {r['status']} ({r['detail'][:120]!r}), C++ {c['status']} "
                           f"({c['detail'][:120]!r})")
@@ -1015,10 +1036,10 @@ def main():
             return cap and (not with_second_check or line.get('second_check') is True)
 
         shipped = probe_mode('shipped')
-        single = {d: probe_mode('strict-' + d) for d in ('d13', 'd17', 'd19', 'd20', 'd21', 'd22')}
+        single = {d: probe_mode('strict-' + d) for d in ('d13', 'd17', 'd19', 'd20', 'd21', 'd22', 'd23')}
         names_of = {'d13': 'D-13 every entry verified', 'd17': 'D-17 strict fields', 'd19': 'D-19 verified certificate',
                     'd20': 'D-20 strict lengths', 'd21': 'D-21 MD5 refused',
-                    'd22': 'D-22 well-formed page hashes only'}
+                    'd22': 'D-22 well-formed page hashes only', 'd23': 'D-23 no leftover bytes'}
         print('--- every named case in the shipped setting (strict switches, second check on) ---')
         kept, lost = 0, {}
         for name in sorted(named):
@@ -1087,6 +1108,14 @@ def main():
                   f"timestamp {r.get('timestamp')!r} ({r['detail'][:100]!r})")
             if not safe:
                 hard.append(f'{name}: the shipped setting accepts the timestamp of a certificate that did not make it: {c!r}')
+        # SG-4 (D-23): the shipped setting refuses bytes after the last element, and says so
+        for name in sorted(n for n in named if n.startswith('leftover_')):
+            c = shipped.get(name)
+            refused = c is not None and c['status'] != 'valid' and 'left over' in c['detail']
+            print(f"{'PASS' if refused else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']} "
+                  f"({None if c is None else c['detail'][:110]!r}); parity {cpp[name]['status']} cap={cap_of(cpp[name])}")
+            if not refused:
+                hard.append(f'{name}: the shipped setting does not refuse leftover bytes with the reason: {c!r}')
         # SG-2 (D-21) and SG-3 (D-22): the shipped setting gives no cap and says why
         for name, word in (('digest_md5', 'MD5'), ('page_hashes_cut', 'page-hash'),
                            ('page_hashes_offset_repeated', 'page-hash'), ('page_hashes_two_tables', 'page-hash'),
