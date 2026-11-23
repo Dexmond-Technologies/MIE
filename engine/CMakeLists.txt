@@ -27,6 +27,16 @@ endif()
 
 find_package(nlohmann_json CONFIG REQUIRED)
 
+# Decompression for the zip and tar readers (also needed by their fuzz targets).
+find_package(ZLIB REQUIRED)
+find_package(BZip2 REQUIRED)
+find_package(LibLZMA REQUIRED)
+set(MIE_ARCHIVE_SOURCES
+  src/archive/archive.cpp
+  src/archive/codec.cpp
+  src/archive/zip_reader.cpp
+  src/archive/tar_reader.cpp)
+
 # ---- fuzz-only build: the channel frame decoder under libFuzzer -------------------
 if(MIE_FUZZ_ONLY)
   add_executable(fuzz_frame fuzz/fuzz_frame.cpp src/channel/frame.cpp)
@@ -34,6 +44,14 @@ if(MIE_FUZZ_ONLY)
   target_link_libraries(fuzz_frame PRIVATE nlohmann_json::nlohmann_json)
   target_compile_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
   target_link_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined)
+
+  foreach(target fuzz_zip fuzz_tar)
+    add_executable(${target} fuzz/${target}.cpp ${MIE_ARCHIVE_SOURCES})
+    target_include_directories(${target} PRIVATE include)
+    target_link_libraries(${target} PRIVATE ZLIB::ZLIB BZip2::BZip2 LibLZMA::LibLZMA)
+    target_compile_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
+    target_link_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined)
+  endforeach()
 
   add_executable(fuzz_pe fuzz/fuzz_pe.cpp src/pe/pe_reader.cpp)
   target_include_directories(fuzz_pe PRIVATE include)
@@ -90,12 +108,25 @@ add_library(mie_pe_analysis STATIC src/pe/pe_analysis.cpp)
 target_include_directories(mie_pe_analysis PUBLIC include)
 target_link_libraries(mie_pe_analysis PUBLIC mie_pe mie_core)
 
+# ---- zip and tar container readers (own code; decompression by zlib, bzip2, liblzma) ----
+add_library(mie_archive STATIC ${MIE_ARCHIVE_SOURCES})
+target_include_directories(mie_archive PUBLIC include)
+target_link_libraries(mie_archive PRIVATE ZLIB::ZLIB BZip2::BZip2 LibLZMA::LibLZMA)
+
 # ---- rules engine (YARA) -----------------------------------------------------------
 if(MIE_WITH_RULES)
   find_package(unofficial-libyara CONFIG REQUIRED)
   add_library(mie_rules STATIC src/rules/rules_yara.cpp)
   target_include_directories(mie_rules PUBLIC include)
   target_link_libraries(mie_rules PUBLIC mie_core PRIVATE unofficial::libyara::libyara)
+
+  # ---- the scan pipeline: joins the parts into one scan (parity profile) -------------
+  add_library(mie_engine STATIC src/engine/engine.cpp)
+  target_include_directories(mie_engine PUBLIC include)
+  target_link_libraries(mie_engine PUBLIC mie_core mie_rules mie_pe_analysis mie_archive)
+
+  add_executable(mie-parity-run src/tools/parity_run.cpp)
+  target_link_libraries(mie-parity-run PRIVATE mie_engine)
 endif()
 
 # ---- local channel -----------------------------------------------------------------
@@ -126,6 +157,9 @@ endif()
 
 add_executable(mie-pe-probe src/probe/pe_probe.cpp)
 target_link_libraries(mie-pe-probe PRIVATE mie_pe nlohmann_json::nlohmann_json)
+
+add_executable(mie-archive-probe src/probe/archive_probe.cpp)
+target_link_libraries(mie-archive-probe PRIVATE mie_archive mie_core nlohmann_json::nlohmann_json)
 
 add_executable(mie-pe-analysis-probe src/probe/pe_analysis_probe.cpp)
 target_link_libraries(mie-pe-analysis-probe PRIVATE mie_pe_analysis nlohmann_json::nlohmann_json)
@@ -178,7 +212,16 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_analysis_parity.py
                    $<TARGET_FILE:mie-pe-analysis-probe> ${MIE_REPO_ROOT})
   set_tests_properties(pe_analysis_parity PROPERTIES TIMEOUT 1200)
+  add_test(NAME archive_parity
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/archive_parity.py
+                   $<TARGET_FILE:mie-archive-probe> ${MIE_REPO_ROOT})
+  set_tests_properties(archive_parity PROPERTIES TIMEOUT 3600)
   if(MIE_WITH_RULES)
+    # Gate 2: parity set S through the whole C++ engine, compared with the Python reference.
+    add_test(NAME set_s_parity
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/set_s_parity.py
+                     $<TARGET_FILE:mie-parity-run> ${MIE_REPO_ROOT})
+    set_tests_properties(set_s_parity PROPERTIES TIMEOUT 1800)
     add_test(NAME rules_parity
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rules_parity.py
                      $<TARGET_FILE:mie-probe> ${MIE_REPO_ROOT})

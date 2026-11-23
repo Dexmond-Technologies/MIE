@@ -101,7 +101,7 @@ jobs:
         run: cmake --build build --config Release --parallel 4
       - name: Test
         shell: pwsh
-        run: ctest --test-dir build -C Release --verbose --timeout 1200
+        run: ctest --test-dir build -C Release --verbose --timeout 3600
 
   sanitize:
     runs-on: ubuntu-latest
@@ -145,7 +145,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
       - name: Test
-        run: ctest --test-dir build --verbose --timeout 1200
+        run: ctest --test-dir build --verbose --timeout 3600
 
   fuzz:
     runs-on: ubuntu-latest
@@ -193,6 +193,16 @@ jobs:
           mkdir -p fuzz-corpus-pe
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe
+      - name: Fuzz the zip reader
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-zip
+          ./build/fuzz_zip -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-zip
+      - name: Fuzz the tar reader
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-tar
+          ./build/fuzz_tar -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-tar
 
   parity-tools:
     runs-on: ubuntu-latest

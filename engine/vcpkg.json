@@ -5,7 +5,10 @@
   "dependencies": [
     "openssl",
     "nlohmann-json",
-    "catch2"
+    "catch2",
+    "zlib",
+    "bzip2",
+    "liblzma"
   ],
   "features": {
     "rules": {

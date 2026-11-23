@@ -32,7 +32,7 @@ BRANCH="${MIE_FUZZ_BRANCH:-cpp/stage1}"
 FUZZ_SECONDS="${MIE_FUZZ_SECONDS:-3600}"
 RSS_LIMIT_MB="${MIE_FUZZ_RSS_MB:-2048}"
 # Every fuzz target built by engine/CMakeLists.txt with -DMIE_FUZZ_ONLY=ON. Add new targets here.
-TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe}"
+TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe fuzz_zip fuzz_tar}"
 # Second part of the night: the parity tests of the executable reader and of its analysis
 # against the Python reference, on far more damaged variants than a push runs (reviewer, board
 # B-3620: at least 200,000 per night). Set MIE_PARITY_TESTS to an empty value to leave it out.
