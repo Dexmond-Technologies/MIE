@@ -92,10 +92,32 @@ begin
   Result := '';
 end;
 
+procedure GrantWorkerAppContainerReadExec(const AppDir: String);
+var
+  IcaclsExe: String;
+  WorkerExe: String;
+  ResultCode: Integer;
+begin
+  IcaclsExe := ExpandConstant('{sys}\icacls.exe');
+  WorkerExe := AppDir + '\mie-worker.exe';
+  Log('Granting ALL APPLICATION PACKAGES (S-1-15-2-1) read and execute rights on install folder and mie-worker.exe');
+  if (not Exec(IcaclsExe, '"' + AppDir + '" /grant "*S-1-15-2-1:(OI)(CI)(RX)"',
+               AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+  begin
+    RaiseException('icacls failed on install folder with exit code ' + IntToStr(ResultCode));
+  end;
+  if (not Exec(IcaclsExe, '"' + WorkerExe + '" /grant "*S-1-15-2-1:(RX)"',
+               AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+  begin
+    RaiseException('icacls failed on mie-worker.exe with exit code ' + IntToStr(ResultCode));
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    GrantWorkerAppContainerReadExec(ExpandConstant('{app}'));
     if not WizardIsTaskSelected('autostart') then
     begin
       RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');

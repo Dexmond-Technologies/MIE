@@ -77,6 +77,62 @@ FORBIDDEN_KEY_OR_SIG_SUFFIXES = {
     ".gpg",
 }
 
+FORBIDDEN_PROGRAM_PREFIXES = (
+    "mie-worker-testhooks",
+    "mie-worker-run",
+    "mie-sandbox-",
+    "mie-probe",
+    "mie-pe-probe",
+    "mie-signature-probe",
+    "mie-archive-probe",
+    "mie-pe-analysis-probe",
+    "mie-scoring-check",
+    "mie-parity-run",
+    "mie_tests",
+    "fuzz_",
+)
+
+
+def is_forbidden_program_name(filename: str) -> bool:
+    low = filename.lower()
+    stem = low[:-4] if low.endswith(".exe") else low
+    for prefix in FORBIDDEN_PROGRAM_PREFIXES:
+        if prefix.endswith("-") or prefix.endswith("_"):
+            if low.startswith(prefix) or stem.startswith(prefix):
+                return True
+        else:
+            if stem == prefix or low == prefix:
+                return True
+    return False
+
+
+def check_worker_and_no_forbidden_programs(
+    tree_dir: Path, exe_suffix: str, require_worker: bool = True
+) -> tuple[bool, str]:
+    """Verify `mie-worker` exists (when required) and no test/sandbox/probe program exists."""
+    errors: list[str] = []
+    worker_name = f"mie-worker{exe_suffix}"
+    if require_worker:
+        worker_path = tree_dir / worker_name
+        if not worker_path.is_file() or worker_path.stat().st_size == 0:
+            errors.append(f"missing or empty {worker_name} in {tree_dir}")
+
+    forbidden_found: list[str] = []
+    if tree_dir.is_dir():
+        for p in sorted(tree_dir.rglob("*")):
+            if is_forbidden_program_name(p.name):
+                forbidden_found.append(p.relative_to(tree_dir).as_posix())
+    if forbidden_found:
+        errors.append(f"forbidden test programs found in {tree_dir}: {forbidden_found}")
+
+    if errors:
+        return False, "; ".join(errors)
+    return (
+        True,
+        f"{worker_name if require_worker else 'tree'} verified in {tree_dir.name}; "
+        "zero forbidden test/sandbox programs present",
+    )
+
 
 def check_licenses_and_notices(stage_dir: Path) -> tuple[bool, str]:
     """Verify P-7 / L-8(licences): licenses/ texts + THIRD-PARTY-NOTICES.txt + DRAFT legal files."""

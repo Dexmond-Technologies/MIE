@@ -28,6 +28,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from common_checks import check_worker_and_no_forbidden_programs
+
 PACKAGING_DIR = Path(__file__).resolve().parent
 ENGINE_DIR = PACKAGING_DIR.parent
 REPO_ROOT = ENGINE_DIR.parent
@@ -88,8 +90,14 @@ def verify_vcpkg_commit(vcpkg_root: Path, expected_commit: str) -> None:
         )
 
 
-def read_port_metadata(vcpkg_root: Path, port_name: str) -> tuple[str, str]:
-    port_json = vcpkg_root / "ports" / port_name / "vcpkg.json"
+def read_port_metadata(
+    vcpkg_root: Path, port_name: str, port_dir: str | None = None
+) -> tuple[str, str]:
+    port_json = (
+        (REPO_ROOT / port_dir / "vcpkg.json")
+        if port_dir
+        else (vcpkg_root / "ports" / port_name / "vcpkg.json")
+    )
     data = json.loads(port_json.read_text(encoding="utf-8"))
     version = None
     for k in ("version", "version-semver", "version-string", "version-date"):
@@ -380,7 +388,7 @@ def populate_licenses(
     for name, meta in pins["libraries"].items():
         if not meta.get("shipped", True):
             continue
-        port_ver, port_lic = read_port_metadata(vcpkg_root, name)
+        port_ver, port_lic = read_port_metadata(vcpkg_root, name, meta.get("port_dir"))
         expected_ver = meta["expected_version"]
         expected_commit = meta["expected_commit"]
         if port_ver != expected_ver:
@@ -559,6 +567,9 @@ def main() -> int:
         str(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",
         "-DMIE_BUILD_TESTS=OFF",
+        "-DMIE_WITH_RULES=ON",
+        "-DVCPKG_MANIFEST_FEATURES=rules",
+        f"-DVCPKG_OVERLAY_PORTS={ENGINE_DIR / 'vcpkg-ports'}",
         f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
         f"-DMIE_REPO_ROOT={REPO_ROOT}",
         f"-DPython3_EXECUTABLE={sys.executable}",
@@ -581,7 +592,7 @@ def main() -> int:
     print("Configuring CMake:", " ".join(cmake_cmd), flush=True)
     subprocess.run(cmake_cmd, check=True)
 
-    targets = ["mie-service", "mie"]
+    targets = ["mie-service", "mie", "mie-worker"]
     if args.with_ui:
         targets.append("mie-ui")
     build_cmd = [
@@ -616,10 +627,10 @@ def main() -> int:
             os.chmod(dst, 0o755)
         staged_programs.append(dst)
 
-    # Explicitly assert mie-probe and test binaries are NOT staged
-    for forbidden_prog in ("mie-probe", "mie-probe.exe", "mie_tests", "mie_tests.exe"):
-        if (stage_dir / forbidden_prog).exists():
-            raise RuntimeError(f"Forbidden non-product binary present in stage: {forbidden_prog}")
+    # Explicitly assert mie-worker is staged and NO test/sandbox/probe binaries exist
+    wkr_ok, wkr_detail = check_worker_and_no_forbidden_programs(stage_dir, exe_suffix)
+    if not wkr_ok:
+        raise RuntimeError(wkr_detail)
 
     staged_crt: list[str] = []
     if os.name == "nt":

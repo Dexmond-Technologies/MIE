@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import winreg
 from pathlib import Path
@@ -25,6 +26,7 @@ from pathlib import Path
 from common_checks import (
     check_licenses_and_notices,
     check_wording,
+    check_worker_and_no_forbidden_programs,
     find_created_keys_or_signatures,
 )
 
@@ -318,7 +320,14 @@ def running_mie_or_unins_processes() -> list[tuple[str, int]]:
             name = row[0].strip()
             low = name.lower()
             if (
-                low in ("mie.exe", "mie-service.exe", "mie-ui.exe", "unins000.exe")
+                low
+                in (
+                    "mie.exe",
+                    "mie-service.exe",
+                    "mie-worker.exe",
+                    "mie-ui.exe",
+                    "unins000.exe",
+                )
                 or (low.startswith("_iu") and low.endswith(".tmp"))
             ):
                 try:
@@ -427,11 +436,20 @@ def minimal_clean_env() -> dict[str, str]:
 def start_and_verify_installed_programs(install_dir: Path) -> tuple[bool, str, subprocess.Popen | None]:
     mie_exe = install_dir / "mie.exe"
     svc_exe = install_dir / "mie-service.exe"
+    wkr_exe = install_dir / "mie-worker.exe"
     env = minimal_clean_env()
 
     ver = subprocess.run([str(mie_exe), "version"], capture_output=True, text=True, env=env, timeout=15)
     if ver.returncode != 0 or not ver.stdout.strip().startswith("mie "):
         return False, f"mie version failed (rc={ver.returncode}, out={ver.stdout!r}, err={ver.stderr!r})", None
+
+    wkr = subprocess.run([str(wkr_exe)], input="", capture_output=True, text=True, env=env, timeout=15)
+    if wkr.returncode != 43 or "mie-worker: main reached" not in wkr.stderr:
+        return (
+            False,
+            f"mie-worker unconfined start check failed (rc={wkr.returncode}, stderr={wkr.stderr!r})",
+            None,
+        )
 
     svc = subprocess.Popen(
         [str(svc_exe)],
@@ -470,7 +488,112 @@ def start_and_verify_installed_programs(install_dir: Path) -> tuple[bool, str, s
         svc.wait(timeout=10)
         return False, f"unexpected status payload: {st_body} (expected pid={svc.pid})", None
 
-    return True, f"mie version={ver.stdout.strip()!r}; mie-service(pid={svc.pid}) answered ping and status", svc
+    return (
+        True,
+        f"mie version={ver.stdout.strip()!r}; mie-worker unconfined exit=43 (main reached); "
+        f"mie-service(pid={svc.pid}) answered ping and status",
+        svc,
+    )
+
+
+def check_windows_worker_acl_and_forbidden(
+    install_dir: Path, stage_dir: Path
+) -> tuple[bool, str]:
+    """Verify P-10: ALL APPLICATION PACKAGES (S-1-15-2-1) RX ACL on folder + mie-worker.exe, and no forbidden programs."""
+    errors: list[str] = []
+    worker_exe = install_dir / "mie-worker.exe"
+
+    # 1. Print and check icacls output on BOTH the install folder and mie-worker.exe
+    icacls_dir = subprocess.run(
+        ["icacls", str(install_dir)], check=True, capture_output=True, text=True
+    )
+    print(f"--- icacls {install_dir} ---\n{icacls_dir.stdout.rstrip()}\n--- end icacls ---", flush=True)
+
+    icacls_wkr = subprocess.run(
+        ["icacls", str(worker_exe)], check=True, capture_output=True, text=True
+    )
+    print(f"--- icacls {worker_exe} ---\n{icacls_wkr.stdout.rstrip()}\n--- end icacls ---", flush=True)
+
+    dir_lines = [
+        ln
+        for ln in icacls_dir.stdout.splitlines()
+        if "ALL APPLICATION PACKAGES:" in ln.upper() or "S-1-15-2-1:" in ln.upper()
+    ]
+    if not any("(OI)" in ln.upper() and "(CI)" in ln.upper() and "(RX)" in ln.upper() for ln in dir_lines):
+        errors.append(f"install folder icacls missing (OI)(CI)(RX) for ALL APPLICATION PACKAGES: {dir_lines}")
+
+    wkr_lines = [
+        ln
+        for ln in icacls_wkr.stdout.splitlines()
+        if "ALL APPLICATION PACKAGES:" in ln.upper() or "S-1-15-2-1:" in ln.upper()
+    ]
+    if not any("(RX)" in ln.upper() for ln in wkr_lines):
+        errors.append(f"mie-worker.exe icacls missing (RX) for ALL APPLICATION PACKAGES: {wkr_lines}")
+
+    # 2. Verify exact SID S-1-15-2-1 via Get-Acl SecurityIdentifier translation on both targets
+    ps_script = f"""
+$ErrorActionPreference = 'Stop'
+function Check-SidRx($Path, [bool]$NeedInherit) {{
+  $acl = Get-Acl -LiteralPath $Path
+  foreach ($ace in $acl.Access) {{
+    try {{
+      $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }} catch {{ continue }}
+    if ($sid -eq 'S-1-15-2-1' -and $ace.AccessControlType -eq 'Allow') {{
+      $hasRx = (($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+      $hasInh = (-not $NeedInherit) -or (
+        (($ace.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -ne 0) -and
+        (($ace.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0)
+      )
+      if ($hasRx -and $hasInh) {{ return $true }}
+    }}
+  }}
+  return $false
+}}
+$dirOk = Check-SidRx '{install_dir}' $true
+$wkrOk = Check-SidRx '{worker_exe}' $false
+Write-Output ("dir_s1_15_2_1=$dirOk;wkr_s1_15_2_1=$wkrOk")
+if (-not ($dirOk -and $wkrOk)) {{ exit 1 }}
+"""
+    ps_res = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+    )
+    if ps_res.returncode != 0:
+        errors.append(f"S-1-15-2-1 SID ACL verification failed: {ps_res.stdout.strip()} {ps_res.stderr.strip()}")
+
+    # 3. Verify mie-worker.exe is installed and NO forbidden test/sandbox programs exist
+    inst_ok, inst_detail = check_worker_and_no_forbidden_programs(install_dir, ".exe")
+    if not inst_ok:
+        errors.append(inst_detail)
+    stg_ok, stg_detail = check_worker_and_no_forbidden_programs(stage_dir, ".exe")
+    if not stg_ok:
+        errors.append(stg_detail)
+
+    # 4. Self-test that forbidden-program detector fails on each forbidden family
+    with tempfile.TemporaryDirectory(prefix="mie-forbid-selftest-") as tmp:
+        tp = Path(tmp)
+        (tp / "mie-worker.exe").write_bytes(b"MZ")
+        for bad_name in (
+            "mie-worker-testhooks.exe",
+            "mie-worker-run.exe",
+            "mie-sandbox-testchild.exe",
+        ):
+            bad_file = tp / bad_name
+            bad_file.write_bytes(b"MZ")
+            det_ok, _ = check_worker_and_no_forbidden_programs(tp, ".exe")
+            bad_file.unlink()
+            if det_ok:
+                errors.append(f"detector failed to catch {bad_name}")
+
+    if errors:
+        return False, "; ".join(errors)
+    return (
+        True,
+        f"S-1-15-2-1 (ALL APPLICATION PACKAGES) RX ACL verified on folder and mie-worker.exe "
+        f"({ps_res.stdout.strip()}); {inst_detail}",
+    )
 
 
 def main() -> int:
@@ -614,6 +737,10 @@ def main() -> int:
         "PASS" if (deps_ok and run_ok) else "FAIL",
         f"{run_detail}; {deps_detail}",
     )
+
+    # ---- P-10 (mie-worker AppContainer S-1-15-2-1 ACL & no forbidden test programs) --
+    p10_ok, p10_detail = check_windows_worker_acl_and_forbidden(install_dir, stage_dir)
+    record("P-10", "PASS" if p10_ok else "FAIL", p10_detail)
 
     # ---- P-4 (part 1: ticked default; part 2 tested after unticked reinstall) --------
     run_val = read_reg_values(winreg.HKEY_CURRENT_USER, RUN_KEY).get("Dexmond MIE", "")

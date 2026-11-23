@@ -184,7 +184,7 @@ def main() -> int:
     short_sha = manifest["short_sha"]
     if signed:
         base_filename = f"Dexmond-MIE-Setup-{version}-{short_sha}-windows-x64"
-        for exe_name in ("mie.exe", "mie-service.exe", "mie-ui.exe"):
+        for exe_name in ("mie.exe", "mie-service.exe", "mie-worker.exe", "mie-ui.exe"):
             exe_path = stage_dir / exe_name
             if exe_path.is_file():
                 sign_binary_if_configured(exe_path, cert, ts_url, log_lines)

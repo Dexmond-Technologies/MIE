@@ -53,7 +53,7 @@ def build_tar_gz(
     stage_dir: Path, out_dir: Path, archive_stem: str
 ) -> Path:
     tar_path = out_dir / f"{archive_stem}.tar.gz"
-    exec_names = {"mie", "mie-service", "mie-ui"}
+    exec_names = {"mie", "mie-service", "mie-worker", "mie-ui"}
 
     def reset_tarinfo(ti: tarfile.TarInfo) -> tarfile.TarInfo:
         ti.uid = 0
@@ -126,6 +126,7 @@ def set_clean_permissions(deb_root: Path) -> None:
     exec_rel_paths = {
         "opt/dexmond-mie/mie",
         "opt/dexmond-mie/mie-service",
+        "opt/dexmond-mie/mie-worker",
         "opt/dexmond-mie/mie-ui",
         "opt/dexmond-mie/mie-autostart",
         "usr/bin/mie",
@@ -214,7 +215,11 @@ def build_deb(
         encoding="utf-8",
     )
 
-    elf_binaries = [opt_dir / "mie", opt_dir / "mie-service"]
+    elf_binaries = [
+        opt_dir / "mie",
+        opt_dir / "mie-service",
+        opt_dir / "mie-worker",
+    ]
     if with_ui and (opt_dir / "mie-ui").is_file():
         elf_binaries.append(opt_dir / "mie-ui")
     depends = compute_shlibs_depends(elf_binaries, work_dir)

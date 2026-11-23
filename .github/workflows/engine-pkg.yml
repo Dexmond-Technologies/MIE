@@ -62,7 +62,9 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vcpkg-cache
-          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .tool-cache
@@ -103,7 +105,7 @@ jobs:
           "version=$($meta.version)" >> $env:GITHUB_OUTPUT
           "short_sha=$($meta.short_sha)" >> $env:GITHUB_OUTPUT
           "installer_name=$($meta.installer_name)" >> $env:GITHUB_OUTPUT
-      - name: Run Windows acceptance tests (P-1 to P-9)
+      - name: Run Windows acceptance tests (P-1 to P-10)
         shell: pwsh
         run: python engine/packaging/test_windows_pkg.py
       - name: Upload unsigned Windows test installer (7 days)
@@ -138,7 +140,9 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .vcpkg-cache
-          key: vcpkg-ubuntu2404-pkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json') }}
+          key: vcpkg-ubuntu2404-pkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-ubuntu2404-pkg-${{ env.VCPKG_COMMIT }}-
       - name: Build, stage, and package in Ubuntu 24.04 LTS baseline container (compatible with Ubuntu LTS and Debian 13)
         id: pkg
         run: |
@@ -182,9 +186,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends lintian
-      - name: Run Linux acceptance tests on ubuntu-latest (L-1 to L-8)
+      - name: Run Linux acceptance tests on ubuntu-latest (L-1 to L-9)
         run: python engine/packaging/test_linux_pkg.py
-      - name: Run .deb acceptance tests inside debian:13 container (L-3 to L-6)
+      - name: Run .deb acceptance tests inside debian:13 container (L-3 to L-6, L-9)
         run: |
           set -eu
           DEB_NAME="${{ steps.pkg.outputs.deb_name }}"

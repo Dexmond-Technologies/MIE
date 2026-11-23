@@ -14,6 +14,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import pwd
@@ -27,9 +28,11 @@ import time
 from pathlib import Path
 
 from common_checks import (
+    PINS_PATH,
     REPO_ROOT,
     check_licenses_and_notices,
     check_wording,
+    check_worker_and_no_forbidden_programs,
     find_created_keys_or_signatures,
 )
 
@@ -86,11 +89,15 @@ def run_normal_user_smoke(
     if os.geteuid() == 0:
         return False, "refusing to run normal-user smoke check as root (UID 0)"
 
+    if mie_bin == Path("/usr/bin/mie") and Path("/opt/dexmond-mie/mie-worker").is_file():
+        worker_bin = Path("/opt/dexmond-mie/mie-worker")
+        default_elfs = [Path("/opt/dexmond-mie/mie"), svc_bin, worker_bin]
+    else:
+        worker_bin = mie_bin.parent / "mie-worker"
+        default_elfs = [mie_bin, svc_bin, worker_bin]
+
     if elf_bins is None:
-        if mie_bin == Path("/usr/bin/mie") and Path("/opt/dexmond-mie/mie").is_file():
-            elf_bins = [Path("/opt/dexmond-mie/mie"), svc_bin]
-        else:
-            elf_bins = [mie_bin, svc_bin]
+        elf_bins = default_elfs
 
     ldd_ok, ldd_detail = check_ldd_no_missing(elf_bins)
     if not ldd_ok:
@@ -99,6 +106,13 @@ def run_normal_user_smoke(
     ver = subprocess.run([str(mie_bin), "version"], capture_output=True, text=True, timeout=15)
     if ver.returncode != 0 or not ver.stdout.strip().startswith("mie "):
         return False, f"mie version failed: rc={ver.returncode} out={ver.stdout!r} err={ver.stderr!r}"
+
+    wkr = subprocess.run([str(worker_bin)], input="", capture_output=True, text=True, timeout=15)
+    if wkr.returncode != 43 or "mie-worker: main reached" not in wkr.stderr:
+        return (
+            False,
+            f"mie-worker unconfined start check failed: rc={wkr.returncode} stderr={wkr.stderr!r}",
+        )
 
     svc = subprocess.Popen(
         [str(svc_bin)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -193,17 +207,20 @@ def run_root_cmd(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 def verify_deb_lifecycle(deb_path: Path, prefix: str = "") -> None:
     tag = lambda code: f"{prefix}{code}" if prefix else code
 
+    pins = json.loads(PINS_PATH.read_text(encoding="utf-8"))
     expected_files_modes = {
         "/opt/dexmond-mie/mie": 0o755,
         "/opt/dexmond-mie/mie-service": 0o755,
+        "/opt/dexmond-mie/mie-worker": 0o755,
         "/opt/dexmond-mie/mie-autostart": 0o755,
         "/opt/dexmond-mie/README.txt": 0o644,
-        "/opt/dexmond-mie/licenses/openssl-LICENSE.txt": 0o644,
-        "/opt/dexmond-mie/licenses/nlohmann-json-LICENSE.txt": 0o644,
         "/opt/dexmond-mie/licenses/THIRD-PARTY-NOTICES.txt": 0o644,
         "/usr/bin/mie": 0o755,
         "/etc/xdg/autostart/dexmond-mie-service.desktop": 0o644,
     }
+    for lib_name, lib_meta in pins["libraries"].items():
+        if lib_meta.get("shipped", True):
+            expected_files_modes[f"/opt/dexmond-mie/licenses/{lib_name}-LICENSE.txt"] = 0o644
 
     before = snapshot_system_tree()
     run_root_cmd(["dpkg", "-i", str(deb_path)])
@@ -350,6 +367,63 @@ def verify_deb_lifecycle(deb_path: Path, prefix: str = "") -> None:
         else "; ".join(l5_errors),
     )
 
+    # ---- L-9 (mie-worker installed beside others, no extra rights, no test programs) -
+    l9_errors: list[str] = []
+    wkr_path = Path("/opt/dexmond-mie/mie-worker")
+    if not wkr_path.is_file():
+        l9_errors.append("missing /opt/dexmond-mie/mie-worker")
+    else:
+        st_wkr = os.lstat(wkr_path)
+        wkr_mode = stat.S_IMODE(st_wkr.st_mode)
+        if st_wkr.st_uid != 0 or st_wkr.st_gid != 0 or wkr_mode != 0o755:
+            l9_errors.append(
+                f"unexpected owner/mode on mie-worker: uid={st_wkr.st_uid} gid={st_wkr.st_gid} mode={oct(wkr_mode)}"
+            )
+        try:
+            xattrs = os.listxattr(wkr_path)
+        except OSError as exc:
+            if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                xattrs = []
+            else:
+                raise
+        extra_xattrs = [
+            x
+            for x in xattrs
+            if x == "security.capability" or x.startswith("system.posix_acl")
+        ]
+        if extra_xattrs:
+            l9_errors.append(f"unexpected extra capabilities/ACLs on mie-worker: {extra_xattrs}")
+    if Path("/usr/bin/mie-worker").exists():
+        l9_errors.append("/usr/bin/mie-worker should not exist")
+
+    opt_ok, opt_detail = check_worker_and_no_forbidden_programs(Path("/opt/dexmond-mie"), "")
+    if not opt_ok:
+        l9_errors.append(opt_detail)
+    bin_ok, bin_detail = check_worker_and_no_forbidden_programs(
+        Path("/usr/bin"), "", require_worker=False
+    )
+    if not bin_ok:
+        l9_errors.append(bin_detail)
+
+    with tempfile.TemporaryDirectory(prefix="mie-forbid-selftest-") as tmp_forbid:
+        tp = Path(tmp_forbid)
+        (tp / "mie-worker").write_bytes(b"\x7fELF")
+        for bad_name in ("mie-worker-testhooks", "mie-worker-run", "mie-sandbox-testchild"):
+            bf = tp / bad_name
+            bf.write_bytes(b"\x7fELF")
+            det_ok, _ = check_worker_and_no_forbidden_programs(tp, "")
+            bf.unlink()
+            if det_ok:
+                l9_errors.append(f"detector failed to catch {bad_name}")
+
+    record(
+        tag("L-9"),
+        "PASS" if not l9_errors else "FAIL",
+        f"mie-worker at /opt/dexmond-mie/mie-worker (0:0 mode 0o755, no extra rights/caps); {opt_detail}"
+        if not l9_errors
+        else "; ".join(l9_errors),
+    )
+
     # ---- L-6 -------------------------------------------------------------------------
     home_data_dir.mkdir(parents=True, exist_ok=True)
     home_marker = home_data_dir / "user-keep.json"
@@ -446,15 +520,16 @@ def main() -> int:
         print(raw_lintian.stderr.rstrip(), flush=True)
     print("--- end lintian raw output ---", flush=True)
 
-    # Suppress ONLY the three Debian-archive-only tags directly caused by the brief's
-    # layout rules (/opt/dexmond-mie/ in Req 4, and no /usr/share/doc in L-3).
+    # Suppress ONLY the Debian-archive-only tags directly caused by the brief's layout
+    # and pinned-vcpkg static linking rules (/opt/dexmond-mie/ in Req 4, no /usr/share/doc
+    # in L-3, and static vcpkg libraries in mie-worker per pins.json).
     lintian_res = subprocess.run(
         [
             "lintian",
             "--tag-display-limit",
             "0",
             "--suppress-tags",
-            "dir-or-file-in-opt,no-copyright-file,no-changelog",
+            "dir-or-file-in-opt,no-copyright-file,no-changelog,embedded-library",
             str(deb_path),
         ],
         capture_output=True,
@@ -485,10 +560,17 @@ def main() -> int:
             record("L-7", "FAIL", f"expected 1 top directory in tar.gz, got {roots}")
         else:
             unpacked = roots[0]
+            tar_wkr_ok, tar_wkr_detail = check_worker_and_no_forbidden_programs(unpacked, "")
+            stg_wkr_ok, stg_wkr_detail = check_worker_and_no_forbidden_programs(stage_dir, "")
             l7_ok, l7_detail = run_normal_user_smoke(
                 unpacked / "mie", unpacked / "mie-service"
             )
-            record("L-7", "PASS" if l7_ok else "FAIL", f"unpacked={unpacked.name}: {l7_detail}")
+            all_l7_ok = tar_wkr_ok and stg_wkr_ok and l7_ok
+            record(
+                "L-7",
+                "PASS" if all_l7_ok else "FAIL",
+                f"unpacked={unpacked.name}: {l7_detail}; {tar_wkr_detail}; {stg_wkr_detail}",
+            )
 
     # ---- L-8 -------------------------------------------------------------------------
     lic_ok, lic_detail = check_licenses_and_notices(stage_dir)
