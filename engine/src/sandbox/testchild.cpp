@@ -615,6 +615,13 @@ int main(int argc, char** argv) {
 #endif
     } else if (action == "spawn") {
         try_spawn(line);
+    } else if (action == "environment") {
+        // The folder variables as THIS process sees them (item SW-1: does Windows point them
+        // into the container's folder for a container?).
+        for (const char* name : {"TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE"}) {
+            const char* value = std::getenv(name);
+            line.text(name, value != nullptr ? value : "");
+        }
     } else if (action == "handles") {
         list_inherited(line);
     } else if (action == "write-handle") {

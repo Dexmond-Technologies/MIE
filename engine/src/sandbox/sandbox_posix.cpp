@@ -218,6 +218,8 @@ const char* to_string(ChildResult::End end) {
 
 bool sanitizer_build() { return MIE_SANITIZER_BUILD != 0; }
 
+std::string appcontainer_folder_text() { return {}; }
+
 std::string appcontainer_sid_text(std::string& error) {
     error = "AppContainer is a Windows mechanism";
     return {};

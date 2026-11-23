@@ -58,7 +58,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--sid") {
         std::string error;
         const std::string sid = mie::sandbox::appcontainer_sid_text(error);
-        std::printf("{\"sid\":%s,\"error\":%s}\n", json_text(sid).c_str(), json_text(error).c_str());
+        std::printf("{\"sid\":%s,\"folder\":%s,\"error\":%s}\n", json_text(sid).c_str(),
+                    json_text(mie::sandbox::appcontainer_folder_text()).c_str(), json_text(error).c_str());
         return 0;
     }
     if (argc < 4) {

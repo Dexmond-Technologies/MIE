@@ -31,6 +31,7 @@ WALL = "20"  # seconds, the limit of every case that does not set its own
 
 P1 = "r-01 point 1: a network connection from the confined child fails"
 P1B = "r-01 point 1 (not the local loop): a connection to the machine's own network address fails"
+SW1 = "SW-1: what the confined child can write in its own container folder, and that the parent empties it"
 SHIPPED = "SB-1: a child built with the shipped library ignores the test switches in its environment"
 P2 = "r-01 point 2: reading a file in the user's profile that was not handed over fails"
 P3 = "r-01 point 3: starting another process from the confined child fails"
@@ -476,6 +477,66 @@ def run_cases(parent, child, shipped_child, windows, linux, work):
         return ("PASS" if good else "FAIL"), brief(result, inner)
     case("refusal: with allow_weaker (tests only) the run goes on and SAYS it is weaker",
          weaker_only_when_asked)
+
+    # ---- SW-1: the container's own folder (Windows) -------------------------------------------
+    def own_folder():
+        done = subprocess.run([parent, "--sid"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        folder = json.loads(done.stdout.split(b"\n")[0].decode("ascii")).get("folder", "")
+        if not folder:
+            return "FAIL", "the test parent did not name the container folder: %r" % (done.stdout[:300],)
+        result, seen = run_parent(parent, child, [], ["environment"])
+        seen = seen or {}
+        print("SW-1: container folder (computed by the parent): %s" % folder, flush=True)
+        print("SW-1: folder variables as the confined child sees them: %s" % json.dumps(
+            {name: seen.get(name) for name in ("TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE")},
+            sort_keys=True), flush=True)
+        places = []
+        for place in [folder, os.path.join(folder, "AC"), os.path.join(folder, "AC", "Temp"),
+                      seen.get("TEMP"), seen.get("TMP")]:
+            if place and os.path.normcase(place) not in [os.path.normcase(known) for known in places]:
+                places.append(place)
+
+        def inside(path):
+            return os.path.normcase(os.path.abspath(path)).startswith(
+                os.path.normcase(os.path.abspath(folder)) + os.sep)
+
+        written_inside, written_outside, refused_at = [], [], []
+        for number, place in enumerate(places):
+            path = os.path.join(place, "mie-sw1-%d-%d.txt" % (os.getpid(), number))
+            result, inner = run_parent(parent, child, [], ["write-path", path])
+            created = bool(inner and inner.get("opened")) and os.path.exists(path)
+            if created and inside(path):
+                written_inside.append(path)
+            elif created:
+                written_outside.append(path)
+            else:
+                refused_at.append("%s (error %s)" % (path, (inner or {}).get("error")))
+            print("SW-1: create %s: %s" % (path, "WRITTEN" if created else "refused"), flush=True)
+            # Every confined start empties the folder, so a file written by this child is looked
+            # at here, before the next child is started.
+        last = written_inside[-1] if written_inside else None
+        after, after_inner = run_parent(parent, child, [], ["whoami"])
+        said = after.get("confinement", "")
+        said = said[said.find("container folder:"):] if "container folder:" in said else "(the parent said nothing)"
+        left = [path for path in written_inside if os.path.exists(path)]
+        for path in written_outside:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        text = "tried: create a file in %s. WRITTEN inside the container folder: %s. WRITTEN OUTSIDE it: %s. " \
+            "Refused: %s. Then a second confined child was started; the parent said: %s; files of the first " \
+            "children still there afterwards: %s" % (
+                places, written_inside or "none", written_outside or "none", refused_at or "none", said,
+                left or "none")
+        good = not written_outside and not left and after.get("end") == "exited" \
+            and (last is None or "emptied before the start" in said)
+        return ("PASS" if good else "FAIL"), text
+    if windows:
+        case(SW1, own_folder)
+    else:
+        record("NOT RUN", SW1, "Windows only: on Linux the confined worker has no folder of its own; it can "
+               "open no path at all (r-01 points 2 and 4)")
 
     # ---- SB-1: the shipped library has no test switches -----------------------------------------
     def shipped_ignores_switches():

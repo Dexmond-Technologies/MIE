@@ -118,6 +118,12 @@ std::string describe_self();
 // installer or a test can give that SID read access to the program folder. Empty elsewhere.
 std::string appcontainer_sid_text(std::string& error);
 
+// Windows: the worker container's own folder (%LOCALAPPDATA%\Packages\<container name>), the
+// one place the confined worker can write. run_confined empties it before every confined
+// start and says so in ChildResult::confinement. Nothing in the product reads it. Empty
+// elsewhere: on Linux the worker has no folder at all.
+std::string appcontainer_folder_text();
+
 // True in a build with a memory-error sanitizer. Such a build reserves terabytes of
 // address space, so the address-space limit cannot be applied to it; only the parent's
 // watch on resident memory remains. Never true for a shipped build.

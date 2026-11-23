@@ -228,6 +228,169 @@ PSID container_sid(std::string& how, std::string& error) {
     return nullptr;
 }
 
+// ---- the container's own folder (reviewer's item SW-1) -----------------------------------
+//
+// An AppContainer has a profile folder, %LOCALAPPDATA%\Packages\<container name>, which the
+// confined worker CAN write. Nothing in the product reads it. So that what one worker leaves
+// there is not found by the next one, the parent EMPTIES the folder before every confined
+// start: every file is removed, and every folder below the second level (the folders Windows
+// itself made, the root's children and their children, stay as empty folders).
+//
+// Discipline, because the content was written by a process that may be hostile:
+//   - nothing is ever followed: every entry is opened WITHOUT following a link or junction
+//     (FILE_FLAG_OPEN_REPARSE_POINT); a link is removed as a link, never entered;
+//   - every opened entry is asked for its real, final path, which must lie inside the
+//     folder's own real path; an entry that leads elsewhere (a swapped parent) is left alone
+//     and counted;
+//   - removal is done through the opened handle, not by name again;
+//   - bounded: 10,000 entries, 3 seconds, 32 levels.
+// A failure to empty is REPORTED in ChildResult::confinement and does not stop the start:
+// leftover content is data only a later confined worker could read (no network, no other
+// place to put it), while refusing to start would let one hostile file that leaves an
+// undeletable entry switch off all later scanning.
+
+std::wstring container_folder() {
+    const std::wstring local = environment_value(L"LOCALAPPDATA");
+    if (local.empty()) {
+        return {};
+    }
+    return local + L"\\Packages\\" + kContainerName;
+}
+
+std::wstring final_path_of(HANDLE handle) {
+    std::vector<wchar_t> buffer(32768);
+    const DWORD n = ::GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()),
+                                                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n == 0 || n >= buffer.size()) {
+        return {};
+    }
+    return std::wstring(buffer.data(), n);
+}
+
+// Opens a file, a folder or a link ITSELF (the last part of the path is not followed).
+HANDLE open_entry(const std::wstring& path) {
+    return ::CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+bool delete_by_handle(HANDLE handle) {
+    FILE_DISPOSITION_INFO gone{};
+    gone.DeleteFile = TRUE;
+    if (::SetFileInformationByHandle(handle, FileDispositionInfo, &gone, sizeof gone)) {
+        return true;
+    }
+    FILE_BASIC_INFO basic{};  // times of zero = unchanged; clears a read-only mark
+    basic.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    ::SetFileInformationByHandle(handle, FileBasicInfo, &basic, sizeof basic);
+    return ::SetFileInformationByHandle(handle, FileDispositionInfo, &gone, sizeof gone) != FALSE;
+}
+
+struct EmptyState {
+    std::wstring root;  // the folder's real, final path
+    int removed = 0;
+    int links = 0;      // links removed as links
+    int failed = 0;     // could not be opened or removed
+    int outside = 0;    // led outside the folder: left alone
+    int budget = 10000;
+    ULONGLONG deadline = 0;
+    bool cut = false;   // a bound was reached
+};
+
+void empty_directory(const std::wstring& path, int depth, EmptyState& state) {
+    if (depth > 32) {
+        state.cut = true;
+        return;
+    }
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW found{};
+    const HANDLE search = ::FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &found,
+                                             FindExSearchNameMatch, nullptr, 0);
+    if (search == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        const std::wstring name = found.cFileName;
+        if (name != L"." && name != L"..") {
+            names.push_back(name);
+        }
+    } while (::FindNextFileW(search, &found));
+    ::FindClose(search);
+
+    for (const std::wstring& name : names) {
+        if (--state.budget < 0 || ::GetTickCount64() > state.deadline) {
+            state.cut = true;
+            return;
+        }
+        const std::wstring child = path + L"\\" + name;
+        HANDLE entry = open_entry(child);
+        if (entry == INVALID_HANDLE_VALUE) {
+            ++state.failed;
+            continue;
+        }
+        const std::wstring real = final_path_of(entry);
+        const bool inside = real.size() > state.root.size() &&
+                            ::_wcsnicmp(real.c_str(), state.root.c_str(), state.root.size()) == 0 &&
+                            real[state.root.size()] == L'\\';
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!inside) {
+            ++state.outside;
+        } else if (!::GetFileInformationByHandle(entry, &info)) {
+            ++state.failed;
+        } else if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            delete_by_handle(entry) ? ++state.links : ++state.failed;  // the link itself; never entered
+        } else if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            empty_directory(child, depth + 1, state);
+            if (depth + 1 > 2) {  // the first two levels are the folders Windows made: kept, empty
+                delete_by_handle(entry) ? ++state.removed : ++state.failed;
+            }
+        } else {
+            delete_by_handle(entry) ? ++state.removed : ++state.failed;
+        }
+        ::CloseHandle(entry);
+    }
+}
+
+// Empties the container's folder; returns the sentence for ChildResult::confinement.
+std::string empty_container_folder() {
+    const std::wstring folder = container_folder();
+    if (folder.empty()) {
+        return "NOT EMPTIED: LOCALAPPDATA is not set, the folder's place is unknown";
+    }
+    HANDLE root = open_entry(folder);
+    if (root == INVALID_HANDLE_VALUE) {
+        const DWORD code = ::GetLastError();
+        return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
+                   ? std::string("no folder at the expected place (nothing to empty)")
+                   : win_error("NOT EMPTIED: the folder could not be opened", code);
+    }
+    EmptyState state;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool is_link =
+        !::GetFileInformationByHandle(root, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    state.root = final_path_of(root);
+    ::CloseHandle(root);
+    if (is_link || state.root.empty()) {
+        return "NOT EMPTIED: the folder is a link or its real path cannot be read; refused";
+    }
+    state.deadline = ::GetTickCount64() + 3000;
+    empty_directory(folder, 0, state);
+    std::string text = "emptied before the start: " + std::to_string(state.removed) + " removed";
+    if (state.links > 0) {
+        text += ", " + std::to_string(state.links) + " links removed without following them";
+    }
+    if (state.failed > 0) {
+        text += ", " + std::to_string(state.failed) + " COULD NOT BE REMOVED";
+    }
+    if (state.outside > 0) {
+        text += ", " + std::to_string(state.outside) + " entries LEFT ALONE because they led outside the folder";
+    }
+    if (state.cut) {
+        text += ", STOPPED at the bound (10000 entries, 3 s, 32 levels): the folder is NOT empty";
+    }
+    return text;
+}
+
 struct PipeReader {
     HANDLE handle = nullptr;
     std::string text;
@@ -279,6 +442,8 @@ bool sanitizer_build() {
 void exit_on_out_of_memory() {
     std::set_new_handler([] { std::_Exit(kOutOfMemoryExitCode); });
 }
+
+std::string appcontainer_folder_text() { return narrow(container_folder()); }
 
 std::string appcontainer_sid_text(std::string& error) {
     error.clear();
@@ -402,6 +567,12 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         } else {
             return fail_start("the worker's AppContainer could not be set up: " + why_not);
         }
+    }
+
+    // ---- the container's own folder is emptied before the worker starts (item SW-1) --------
+    std::string folder_text = "not used (no container)";
+    if (in_container) {
+        folder_text = empty_container_folder();
     }
 
     // ---- pipes: the child's ends are inheritable, the parent's are not ---------------------
@@ -756,7 +927,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     result.confinement = container_text + (with_policies ? "+mitigations (" + mitigation_text + " )" : "") +
                          "+job (memory limit " + std::to_string(limits.memory_bytes) +
                          " bytes, one process, kill on close, UI restrictions)+handle list; environment (names): " +
-                         variable_names;
+                         variable_names + "; container folder: " + folder_text;
     if (!err_reader.text.empty()) {
         result.detail = "standard error: " + err_reader.text;
     }
