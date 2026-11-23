@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+struct x509_st;  // OpenSSL's X509, declared here so that this header needs no OpenSSL header
+
 namespace mie::signature {
 // ASCII lower case (policy.cpp).
 std::string lower(std::string text);
@@ -26,5 +28,8 @@ struct PrimaryView {
 
 // False when the file has no well-formed first entry.
 bool primary_view(std::span<const std::uint8_t> data, PrimaryView& out);
+
+// measure.cpp (SG-5): "type:bits/digest,...,type:bits" of a chain, first certificate first.
+std::string describe_chain(const std::vector<x509_st*>& chain);
 
 }  // namespace mie::signature::detail

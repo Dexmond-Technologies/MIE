@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <vector>
@@ -64,6 +65,24 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     put32(file, optional + 108, 16);    // NumberOfRvaAndSizes
     put32(file, optional + 144, static_cast<std::uint32_t>(kHeaderSize));   // certificate table offset
     put32(file, optional + 148, static_cast<std::uint32_t>(table.size()));  // certificate table size
+    // SG-6: with bit 5 the first six table bytes also overwrite the header fields on which the
+    // reference's precheck and signify's reading could part (SizeOfOptionalHeader, the magic,
+    // NumberOfRvaAndSizes, the directory entry's offset and size, for PE32 and PE32+ alike), so
+    // the comparison of the two readings is reachable by the fuzzer if it is reachable at all.
+    put32(file, optional + 128, static_cast<std::uint32_t>(kHeaderSize));   // the PE32 place of the entry
+    put32(file, optional + 132, static_cast<std::uint32_t>(table.size()));
+    if ((switches & 32) != 0 && table.size() >= 6) {
+        put16(file, 0x94, static_cast<std::uint16_t>(table[0] | (table[1] << 8)));
+        put16(file, optional, (table[2] & 1) != 0 ? 0x10B : 0x20B);
+        put32(file, optional + 92, table[3]);
+        put32(file, optional + 108, table[3]);
+        const std::uint32_t moved = static_cast<std::uint32_t>(kHeaderSize) - table[4];
+        const std::uint32_t length = static_cast<std::uint32_t>(table.size()) + table[5] - 128u;
+        for (const std::size_t at : {optional + 128, optional + 144}) {
+            put32(file, at, moved);
+            put32(file, at + 4, length);
+        }
+    }
     file.insert(file.end(), table.begin(), table.end());
 
     mie::signature::Options options;
@@ -85,6 +104,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                               result.status == "unavailable";
     if (!known_status) MIE_FUZZ_STOP();
     if (result.status == "valid" || result.publisher_allowed || result.certificate_table_verified) MIE_FUZZ_STOP();
+    // SG-6: unreachable by a file, by reading; if the fuzzer ever reaches it, that is a finding
+    if (result.detail.find("the two readings of the executable's header disagree") != std::string::npos) MIE_FUZZ_STOP();
     if (checked.status != "ok" && result.status != checked.status) MIE_FUZZ_STOP();
     if (checked.status == "ok" && (checked.entries == 0 || checked.primary_der.empty())) MIE_FUZZ_STOP();
     if ((switches & 4) != 0) {

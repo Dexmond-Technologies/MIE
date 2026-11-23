@@ -1263,7 +1263,7 @@ VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layou
 // switch `second_lookup`. The timestamp decides whether an expired signer still counts.
 std::optional<std::int64_t> trusted_signing_time(const SignedData& primary, const std::vector<X509*>& primary_certs,
                                                  const Roots& roots, bool second_lookup,
-                                                 std::ptrdiff_t verified_index) {
+                                                 std::ptrdiff_t verified_index, std::string& chain_text) {
     const Countersignature counter = read_countersignature(primary.signer);
     if (!counter.present) return std::nullopt;
     std::vector<X509Ptr> token_certificates;
@@ -1294,6 +1294,7 @@ std::optional<std::int64_t> trusted_signing_time(const SignedData& primary, cons
     if (!build_chain(certificate, others, roots, counter.time, chain, error) || path_uses_weak_hash(chain)) {
         return std::nullopt;
     }
+    chain_text = detail::describe_chain(raw(chain));
     bool present = false;
     if (!has_usage(extended_key_usages(certificate, present), kEkuTimeStamping)) return std::nullopt;
     return counter.time;
@@ -1364,6 +1365,12 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
 
     // PARSE: every entry of the certificate table (signature.py primary_signature).
     const Layout layout = signify_layout(data);
+    // SG-6: precheck_data and signify each read the header; they must name the same table. By
+    // reading no file makes them differ (SIGNATURE_INTEGRATION.md section 24); the fuzz target
+    // stops if this ever fires.
+    if (layout.table.start != checked.cert_offset || layout.table.end != data.size()) {
+        return make_result("invalid", "the two readings of the executable's header disagree");
+    }
     std::vector<SignedData> signatures;
     for (Bytes entry : table_entries(data, layout)) {
         signatures.push_back(
@@ -1410,9 +1417,11 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     if (leaf == nullptr) throw Fail{"ValueError", "signer certificate not in the signature certificate set"};
     // a time-stamp that relies on MD5 is not trusted (D-21): the signer is judged at the present time
     const bool stamp_md5 = !options.accept_md5 && verified_by.countersigner_digest == "md5";
+    std::string timestamp_chain;
     const std::optional<std::int64_t> signing_time =
         stamp_md5 ? std::optional<std::int64_t>()
-                  : trusted_signing_time(primary, pool, roots, options.signer_by_second_lookup, verified_by.countersigner);
+                  : trusted_signing_time(primary, pool, roots, options.signer_by_second_lookup, verified_by.countersigner,
+                                         timestamp_chain);
 
     // _leaf_checks
     bool eku_present = false;
@@ -1478,6 +1487,8 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     out.file_digest = verified_by.file_digest;
     out.signer_digest = verified_by.signer_digest;
     out.countersigner_digest = verified_by.countersigner_digest;
+    out.signer_chain = detail::describe_chain(raw(chain));
+    out.timestamp_chain = signing_time ? timestamp_chain : std::string();
     out.cert_offset = checked.cert_offset;
     out.cert_size = checked.cert_size;
     return out;

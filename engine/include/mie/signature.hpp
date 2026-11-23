@@ -122,6 +122,12 @@ struct Result {
     std::string file_digest;
     std::string signer_digest;
     std::string countersigner_digest;
+    // "valid" only (reviewer's SG-5, counted on the corpus, no refusal): keys and signature
+    // digests along the chains that were checked, "type:bits/digest,...,type:bits", from the
+    // certificate that verified (signer, time-stamper) to the root, the root's own signature
+    // digest left out. The first entry is the signer's (time-stamper's) key.
+    std::string signer_chain;
+    std::string timestamp_chain;
 };
 
 // signature.py verify_portable with data given and no file to re-stat. No timeout here:

@@ -20,6 +20,7 @@
 
 #include "mie/io.hpp"
 #include "mie/signature.hpp"
+#include "../signature/internal.hpp"  // detail::primary_view: the walker's own file-digest verdict (SG-7)
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -192,6 +193,9 @@ int main(int argc, char** argv) {
             std::getline(std::cin, ignored);
         }
         const mie::signature::Precheck checked = mie::signature::precheck(data);
+        // SG-7: the walker's reading of the first entry (strict) and the file digest it computes
+        mie::signature::detail::PrimaryView view;
+        const bool walker_view = mie::signature::detail::primary_view(data, view);
         const mie::signature::Result result = mie::signature::verify(data, options);
         const bool valid = result.status == "valid";
         mie::signature::SecondCheck second;
@@ -222,6 +226,10 @@ int main(int argc, char** argv) {
             {"file_digest", result.file_digest},
             {"signer_digest", result.signer_digest},
             {"countersigner_digest", result.countersigner_digest},
+            {"walker_digest_name", walker_view ? json(view.digest_name) : json(nullptr)},
+            {"walker_digest_equal", walker_view ? json(view.signed_digest == view.image_digest) : json(nullptr)},
+            {"signer_chain", result.signer_chain},
+            {"timestamp_chain", result.timestamp_chain},
             {"opened", file != nullptr},
             {"cap_handle_opened", cap_opened},
             {"cap_handle_bytes_equal", cap_bytes_equal},
