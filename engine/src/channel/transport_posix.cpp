@@ -187,6 +187,30 @@ std::string parent_of(const std::string& path) {
 // The directory that holds the socket must be a real directory (not a link), owned by
 // the current user and closed to everyone else. The service creates it 0700 if it is
 // missing; a client only checks it, so another account cannot pose as the service.
+enum class DirectoryState { Private, Missing, OtherAccount, Unusable };
+
+DirectoryState directory_state(const std::string& directory, std::string& error) {
+    struct stat st {};
+    if (::lstat(directory.c_str(), &st) != 0) {
+        const bool missing = (errno == ENOENT || errno == ENOTDIR);
+        error = errno_text("lstat");
+        return missing ? DirectoryState::Missing : DirectoryState::Unusable;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        error = "socket directory is not a directory";
+        return DirectoryState::Unusable;
+    }
+    if (st.st_uid != ::geteuid()) {
+        error = "socket directory belongs to another account";
+        return DirectoryState::OtherAccount;
+    }
+    if ((st.st_mode & 0077) != 0) {
+        error = "socket directory is open to other users";
+        return DirectoryState::Unusable;
+    }
+    return DirectoryState::Private;
+}
+
 bool directory_is_private(const std::string& directory, std::string& error) {
     struct stat st {};
     if (::lstat(directory.c_str(), &st) != 0) {
@@ -251,6 +275,10 @@ std::unique_ptr<Server> listen(const Endpoint& endpoint, ListenStatus& status, s
         return nullptr;
     }
     if (!prepare_directory(parent_of(endpoint.name), error)) {
+        std::string ignored;
+        if (directory_state(parent_of(endpoint.name), ignored) == DirectoryState::OtherAccount) {
+            status = ListenStatus::HeldByOtherAccount;
+        }
         return nullptr;
     }
 
@@ -299,13 +327,28 @@ std::unique_ptr<Server> listen(const Endpoint& endpoint, ListenStatus& status, s
 }
 
 std::unique_ptr<Connection> connect(const Endpoint& endpoint, std::string& error) {
+    ConnectStatus status = ConnectStatus::Error;
+    return connect(endpoint, status, error);
+}
+
+std::unique_ptr<Connection> connect(const Endpoint& endpoint, ConnectStatus& status, std::string& error) {
+    status = ConnectStatus::Error;
     error.clear();
     sockaddr_un address{};
     if (!fill_address(endpoint.name, address, error)) {
         return nullptr;
     }
-    if (!directory_is_private(parent_of(endpoint.name), error)) {
-        return nullptr;
+    switch (directory_state(parent_of(endpoint.name), error)) {
+        case DirectoryState::Private:
+            break;
+        case DirectoryState::Missing:
+            status = ConnectStatus::NotRunning;
+            return nullptr;
+        case DirectoryState::OtherAccount:
+            status = ConnectStatus::HeldByOtherAccount;
+            return nullptr;
+        case DirectoryState::Unusable:
+            return nullptr;
     }
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -314,10 +357,14 @@ std::unique_ptr<Connection> connect(const Endpoint& endpoint, std::string& error
     }
     ::fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof address) != 0) {
+        if (errno == ENOENT || errno == ECONNREFUSED) {
+            status = ConnectStatus::NotRunning;
+        }
         error = errno_text("connect");
         ::close(fd);
         return nullptr;
     }
+    status = ConnectStatus::Ok;
     return std::make_unique<PosixConnection>(fd);
 }
 

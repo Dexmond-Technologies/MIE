@@ -17,7 +17,14 @@ Outcome per file:
 
 PASS only if: 0 unexplained, 0 verdict differences of any cause, explained <= N (default 5),
 and the rule-file hashes in the two headers are equal.
-Exit code: 0 PASS, 1 FAIL, 2 usage or unreadable input.
+
+Error classes (r-01, board B-3551): the corpus sets are expected to hold no unreadable and no
+non-regular entry. The number of entries of each error class is reported for each side. If any
+count is above 0 the run STOPS (exit 3): the corpus is inspected first; such entries are never
+compared away. --allow-error-classes turns the stop off; it exists for the tests of this tool
+and must not be used on v1, B' or S.
+
+Exit code: 0 PASS, 1 FAIL, 2 usage or unreadable input, 3 STOPPED on error-class entries.
 
 --explained file: {"<relative path>": {"library": "...", "field": "score|categories|error_class", "reason": "..."}}
 The cap of 5 is across all sets together; run the tool once per set and add the counts, or pass
@@ -57,7 +64,17 @@ def load(path):
 def compare(reference, candidate, explained, max_explained):
     ref_header, ref_files = reference
     cand_header, cand_files = candidate
+    def class_counts(files):
+        counts = {}
+        for record in files.values():
+            cls = record.get('error_class')
+            if cls is not None:
+                counts[cls] = counts.get(cls, 0) + 1
+        return counts
+
     report = {'identical': 0, 'explained': [], 'unexplained': [], 'verdict_differences': [],
+              'error_classes_reference': class_counts(ref_files),
+              'error_classes_candidate': class_counts(cand_files),
               'rules_equal': ref_header.get('rules') == cand_header.get('rules'),
               'files_reference': len(ref_files), 'files_candidate': len(cand_files)}
 
@@ -106,6 +123,8 @@ def main():
     parser.add_argument('--max-explained', type=int, default=5)
     parser.add_argument('--identical', action='store_true')
     parser.add_argument('--json', action='store_true', help='print the full report as JSON')
+    parser.add_argument('--allow-error-classes', action='store_true',
+                        help='do not stop when a side holds error-class entries (tool tests only)')
     args = parser.parse_args()
 
     try:
@@ -131,10 +150,18 @@ def main():
         print(f"unexplained differences: {len(report['unexplained'])}")
         print(f"verdict differences: {len(report['verdict_differences'])}")
         print(f"rule files equal: {'yes' if report['rules_equal'] else 'NO'}")
+        print(f"error classes, reference: {json.dumps(report['error_classes_reference'], sort_keys=True)}")
+        print(f"error classes, candidate: {json.dumps(report['error_classes_candidate'], sort_keys=True)}")
         for entry in report['unexplained'][:50]:
             print('  UNEXPLAINED', json.dumps(entry, sort_keys=True))
         for entry in report['explained']:
             print('  explained', json.dumps(entry, sort_keys=True))
+    stopped = bool(report['error_classes_reference'] or report['error_classes_candidate'])
+    if stopped and not args.allow_error_classes:
+        print('RESULT: STOPPED. The sets must hold no unreadable and no non-regular entry; '
+              'inspect the corpus before any comparison.')
+        return 3
+    if not args.json:
         print('RESULT:', 'PASS' if report['pass'] else 'FAIL')
     return 0 if report['pass'] else 1
 

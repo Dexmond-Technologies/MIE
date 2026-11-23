@@ -23,6 +23,11 @@ enum class SubjectKind { File };
 // NotScanned: the input was refused or unreadable. No score.
 enum class ScanState { Scanned, NotFullyScanned, NotScanned };
 
+// State of the rule set the scan ran with (the reference's ON / DEGRADED / YARA-OFF).
+// On: every rule file compiled. Degraded: some rule files failed and were left out.
+// Off: no rules at all.
+enum class RulesState { On, Degraded, Off };
+
 struct Hashes {
     std::string md5;
     std::string sha1;
@@ -56,11 +61,29 @@ struct ScanResult {
     std::vector<Finding> findings;
     Hashes hashes;
     std::uint64_t size = 0;
+
+    // What produced this result (reviewer's condition W-1, board B-3551). A verdict
+    // means nothing without knowing which engine, which profile and which rules.
+    std::string engine_version;                 // for example "0.0.1-week0"
+    std::string profile;                        // "parity" or "stage1"
+    RulesState rules_state = RulesState::Off;
+    std::string rules_sha256;                   // hash of the rule set; empty when rules are Off
+
     bool operator==(const ScanResult&) const = default;
 };
 
 const char* to_string(SubjectKind kind);
 const char* to_string(ScanState state);
+const char* to_string(RulesState state);
+
+// The rules every result must obey. Returns false and says why if it does not.
+//   - A scan with rules Degraded or Off is never `scanned`: it is `not_fully_scanned`
+//     (or `not_scanned`), so it can never be shown as a clean result.
+//   - A state other than `scanned` carries a reason; `scanned` carries none.
+//   - `not_scanned` carries no score, no verdict and no findings.
+// from_json refuses a result that breaks these rules. Every producer calls this
+// before it hands a result on.
+bool consistent(const ScanResult& result, std::string& why);
 
 // Canonical JSON: keys sorted, no white space. Two equal results give equal bytes.
 std::string to_json(const ScanResult& result);

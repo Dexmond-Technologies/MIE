@@ -37,6 +37,18 @@ refuses unknown fields, wrong types and unknown schema versions.
 | `findings` | list of findings | |
 | `hashes.md5`, `hashes.sha1`, `hashes.sha256` | lower-case hex | |
 | `size` | whole number | bytes |
+| `engine.version` | text | version of the engine that produced the result |
+| `engine.profile` | `parity` or `stage1` | which set of rules and switches was used; `parity` never ships |
+| `rules.state` | `ON`, `DEGRADED`, `OFF` | state of the rule set the scan ran with |
+| `rules.sha256` | lower-case hex, or empty when rules are `OFF` | hash of the rule set: SHA-256 over one line per loaded rule file, sorted by file name, each line `<file name> <SHA-256 of the file>` and a line feed |
+
+Rules every result obeys (`mie::consistent`; the reader refuses a result that breaks one; added
+in week 0 on the reviewer's condition W-1, board B-3551, before any track built against the format):
+- A scan with rules `DEGRADED` or `OFF` is never `scanned`: it is `not_fully_scanned` (or
+  `not_scanned`). It can therefore never be shown as a clean result.
+- A state other than `scanned` carries a `reason`; `scanned` carries none.
+- `not_scanned` carries no score, no verdict and no findings.
+- Rules `OFF` carries no rule-set hash.
 
 ## 3. Channel messages (protocol version 1)
 
@@ -78,7 +90,7 @@ Operations of version 1:
 | op | built in week 0 | request body | response body |
 |---|---|---|---|
 | `ping` | yes | none | `{"ok":true,"pong":true}` |
-| `status` | yes | none | `ok`, `service`, `version`, `protocol`, `result_schema`, `pid`, `engine` (`absent` in week 0), `monitoring`, `rules` |
+| `status` | yes | none | `ok`, `service`, `version`, `protocol`, `result_schema`, `pid`, `engine` (`absent` in week 0), `monitoring`, `rules` (`ON`, `DEGRADED`, `OFF`), `profile`, `rules_sha256` (both empty in week 0) |
 | `shutdown` | yes | none | `{"ok":true,"stopping":true}` |
 | `scan` | no (reserved) | `{"path": text}` | a result in format 2 |
 | `quarantine.list`, `quarantine.add`, `quarantine.restore`, `quarantine.delete` | no (reserved) | | |
@@ -86,6 +98,12 @@ Operations of version 1:
 | anything else | | | `{"ok":false,"error":"unknown_op"}` |
 
 Events (`type` = `event`, service to client) are reserved for scan progress and alerts.
+
+When the channel's name is held by another account (C++: `ListenStatus::HeldByOtherAccount`,
+`ConnectStatus::HeldByOtherAccount`), no program treats that as "running" or as plain "not
+running". Each shows this one sentence (`mie::channel::kHeldByOtherAccountMessage`):
+"Another account on this computer is holding MIE's channel name. MIE's background service
+cannot run, and this computer is not protected by MIE." Exit codes: `mie-service` 5, `mie` 6.
 
 ## 4. Scoring data file
 

@@ -65,6 +65,8 @@ void serve(mie::channel::Connection& connection) {
                 {"engine", "absent"},
                 {"monitoring", false},
                 {"rules", "OFF"},
+                {"profile", ""},
+                {"rules_sha256", ""},
                 {"note", "week 0 skeleton: no scan engine yet; nothing is scanned"},
             };
         } else if (request.op == "shutdown") {
@@ -122,6 +124,10 @@ int main(int argc, char** argv) {
         if (status == mie::channel::ListenStatus::AlreadyRunning) {
             std::fputs("mie-service: already running for this user\n", stderr);
             return 3;
+        }
+        if (status == mie::channel::ListenStatus::HeldByOtherAccount) {
+            std::fprintf(stderr, "mie-service: %s\n", mie::channel::kHeldByOtherAccountMessage);
+            return 5;
         }
         std::fprintf(stderr, "mie-service: cannot listen: %s\n", error.c_str());
         return 2;

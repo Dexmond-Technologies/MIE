@@ -25,6 +25,39 @@ const char* to_string(ScanState state) {
     return "not_scanned";
 }
 
+const char* to_string(RulesState state) {
+    switch (state) {
+        case RulesState::On: return "ON";
+        case RulesState::Degraded: return "DEGRADED";
+        case RulesState::Off: return "OFF";
+    }
+    return "OFF";
+}
+
+bool consistent(const ScanResult& r, std::string& why) {
+    if (r.state == ScanState::Scanned && r.rules_state != RulesState::On) {
+        why = "a scan with rules DEGRADED or OFF cannot be 'scanned'";
+        return false;
+    }
+    if (r.state == ScanState::Scanned && !r.reason.empty()) {
+        why = "'scanned' carries no reason";
+        return false;
+    }
+    if (r.state != ScanState::Scanned && r.reason.empty()) {
+        why = "a state other than 'scanned' needs a reason";
+        return false;
+    }
+    if (r.state == ScanState::NotScanned && (r.score != 0 || !r.verdict.empty() || !r.findings.empty())) {
+        why = "'not_scanned' carries no score, verdict or findings";
+        return false;
+    }
+    if (r.rules_state == RulesState::Off && !r.rules_sha256.empty()) {
+        why = "rules OFF carries no rule-set hash";
+        return false;
+    }
+    return true;
+}
+
 std::string to_json(const ScanResult& r) {
     json findings = json::array();
     for (const Finding& f : r.findings) {
@@ -46,6 +79,8 @@ std::string to_json(const ScanResult& r) {
         {"findings", findings},
         {"hashes", json{{"md5", r.hashes.md5}, {"sha1", r.hashes.sha1}, {"sha256", r.hashes.sha256}}},
         {"size", r.size},
+        {"engine", json{{"version", r.engine_version}, {"profile", r.profile}}},
+        {"rules", json{{"state", to_string(r.rules_state)}, {"sha256", r.rules_sha256}}},
     };
     // nlohmann::json keeps object keys sorted; dump() without arguments has no white space.
     // Invalid UTF-8 in a text field is replaced, never thrown.
@@ -106,7 +141,7 @@ bool from_json(std::string_view text, ScanResult& out, std::string& error) {
         return false;
     }
     if (!only_keys(j, {"schema_version", "subject", "state", "reason", "score", "verdict",
-                       "findings", "hashes", "size"}, error)) {
+                       "findings", "hashes", "size", "engine", "rules"}, error)) {
         return false;
     }
 
@@ -178,6 +213,31 @@ bool from_json(std::string_view text, ScanResult& out, std::string& error) {
         return false;
     }
     r.size = size.get<std::uint64_t>();
+
+    const json& engine = j.at("engine");
+    if (!only_keys(engine, {"version", "profile"}, error)) return false;
+    if (!get_string(engine, "version", r.engine_version, error)) return false;
+    if (!get_string(engine, "profile", r.profile, error)) return false;
+
+    const json& rules = j.at("rules");
+    if (!only_keys(rules, {"state", "sha256"}, error)) return false;
+    std::string rules_state;
+    if (!get_string(rules, "state", rules_state, error)) return false;
+    if (rules_state == "ON") {
+        r.rules_state = RulesState::On;
+    } else if (rules_state == "DEGRADED") {
+        r.rules_state = RulesState::Degraded;
+    } else if (rules_state == "OFF") {
+        r.rules_state = RulesState::Off;
+    } else {
+        error = "unknown rules state";
+        return false;
+    }
+    if (!get_string(rules, "sha256", r.rules_sha256, error)) return false;
+
+    if (!consistent(r, error)) {
+        return false;
+    }
 
     out = std::move(r);
     return true;

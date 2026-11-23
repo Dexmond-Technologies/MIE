@@ -147,5 +147,35 @@ with tempfile.TemporaryDirectory(prefix='mie-svc-') as tmp:
     code = subprocess.run([CLI, '--endpoint', endpoint, 'bogus'], capture_output=True, timeout=30).returncode
     check('an unknown command-line operation is a usage error (exit 2)', code == 2, f'(exit {code})')
 
+    # The channel name held by ANOTHER account: neither program may treat that as "running" or
+    # as "not running"; both must say in plain words that MIE is not protecting this computer.
+    # Built here by handing the socket directory to root, which needs sudo without a password
+    # (present on the GitHub Ubuntu runner).
+    HELD = 'not protected by MIE'
+    if os.name == 'nt':
+        print('NOT RUN  channel name held by another account: on Windows this needs a pipe created by '
+              'another account, which this test cannot make; not written in week 0')
+    else:
+        held_dir = os.path.join(tmp, 'held')
+        os.mkdir(held_dir, 0o700)
+        took = subprocess.run(['sudo', '-n', 'chown', 'root:root', held_dir], capture_output=True)
+        if took.returncode != 0:
+            print('NOT RUN  channel name held by another account: no password-less sudo to hand the '
+                  'directory to another account')
+        else:
+            try:
+                held_endpoint = os.path.join(held_dir, 'service.sock')
+                code, out, err = cli(held_endpoint, 'ping')
+                check('command line: channel name held by another account gives exit 6 and the plain sentence',
+                      code == 6 and HELD in err, f'(exit {code}: {err})')
+                refused = subprocess.run([SERVICE, '--endpoint', held_endpoint], capture_output=True, timeout=30)
+                refused_err = refused.stderr.decode('utf-8', 'replace').strip()
+                check('service: channel name held by another account gives exit 5 and the plain sentence',
+                      refused.returncode == 5 and HELD in refused_err,
+                      f'(exit {refused.returncode}: {refused_err})')
+            finally:
+                subprocess.run(['sudo', '-n', 'chown', f'{os.getuid()}:{os.getgid()}', held_dir],
+                               capture_output=True)
+
 print(f'service_smoke: {len(failures)} failed')
 sys.exit(1 if failures else 0)

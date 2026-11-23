@@ -393,13 +393,20 @@ std::unique_ptr<Server> listen(const Endpoint& endpoint, ListenStatus& status, s
                 if (ours) {
                     status = ListenStatus::AlreadyRunning;
                 } else {
+                    status = ListenStatus::HeldByOtherAccount;
                     error = "the endpoint name is held by a pipe of another account";
                 }
-            } else if (::GetLastError() == ERROR_PIPE_BUSY) {
-                // All instances are busy: it cannot be opened to look at its owner.
-                error = "the endpoint name is in use and its owner could not be checked";
             } else {
-                error = "the endpoint name is held by a pipe that cannot be opened by this user";
+                const DWORD probe_code = ::GetLastError();
+                if (probe_code == ERROR_ACCESS_DENIED) {
+                    // It exists and this user may not even open it: made by another account.
+                    status = ListenStatus::HeldByOtherAccount;
+                    error = "the endpoint name is held by a pipe that cannot be opened by this user";
+                } else {
+                    // Busy, or gone again: its owner could not be checked.
+                    error = win_error("the endpoint name is in use and its owner could not be checked; probe",
+                                      probe_code);
+                }
             }
         } else {
             error = win_error("CreateNamedPipeW", code);
@@ -411,6 +418,12 @@ std::unique_ptr<Server> listen(const Endpoint& endpoint, ListenStatus& status, s
 }
 
 std::unique_ptr<Connection> connect(const Endpoint& endpoint, std::string& error) {
+    ConnectStatus status = ConnectStatus::Error;
+    return connect(endpoint, status, error);
+}
+
+std::unique_ptr<Connection> connect(const Endpoint& endpoint, ConnectStatus& status, std::string& error) {
+    status = ConnectStatus::Error;
     error.clear();
     const std::wstring name = widen(endpoint.name);
     if (name.empty()) {
@@ -429,6 +442,12 @@ std::unique_ptr<Connection> connect(const Endpoint& endpoint, std::string& error
         }
         const DWORD code = ::GetLastError();
         if (code != ERROR_PIPE_BUSY) {
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                status = ConnectStatus::NotRunning;
+            } else if (code == ERROR_ACCESS_DENIED) {
+                // The pipe exists but this user may not open it: not this user's service.
+                status = ConnectStatus::HeldByOtherAccount;
+            }
             error = win_error("CreateFileW(pipe)", code);
             return nullptr;
         }
@@ -440,8 +459,10 @@ std::unique_ptr<Connection> connect(const Endpoint& endpoint, std::string& error
     }
     if (!owned_by_current_user(pipe, error)) {
         ::CloseHandle(pipe);
+        status = ConnectStatus::HeldByOtherAccount;
         return nullptr;
     }
+    status = ConnectStatus::Ok;
     return std::make_unique<WinConnection>(pipe, false);
 }
 

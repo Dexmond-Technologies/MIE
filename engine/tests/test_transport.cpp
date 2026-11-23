@@ -86,9 +86,11 @@ TEST_CASE("a request reaches the server and the answer comes back", "[transport]
     });
 
     std::string client_error;
-    auto client = connect(test.endpoint, client_error);
+    ConnectStatus connect_status = ConnectStatus::Error;
+    auto client = connect(test.endpoint, connect_status, client_error);
     INFO(client_error);
     REQUIRE(client != nullptr);
+    REQUIRE(connect_status == ConnectStatus::Ok);
 
     Message request;
     request.id = 99;
@@ -135,9 +137,11 @@ TEST_CASE("a second listener on the same endpoint is told one is running", "[tra
 TEST_CASE("connecting where nobody listens fails cleanly", "[transport]") {
     TestEndpoint test("nobody");
     std::string error;
-    auto client = connect(test.endpoint, error);
+    ConnectStatus status = ConnectStatus::Ok;
+    auto client = connect(test.endpoint, status, error);
     REQUIRE(client == nullptr);
     REQUIRE_FALSE(error.empty());
+    REQUIRE(status == ConnectStatus::NotRunning);
 }
 
 TEST_CASE("accept returns without a client when the wait runs out", "[transport]") {

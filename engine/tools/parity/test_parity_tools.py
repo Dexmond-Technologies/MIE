@@ -198,3 +198,46 @@ def test_reference_runner_on_harmless_files(tmp_path):
     assert compare.identical(outs[0], outs[1])
     report = compare.compare(compare.load(outs[0]), compare.load(outs[1]), {}, 0)
     assert report['pass'] and report['identical'] == 3
+
+
+def _write(path, head, records):
+    path.write_text('\n'.join(json.dumps(x, sort_keys=True) for x in [head] + records) + '\n', encoding='utf-8')
+
+
+def test_error_class_counts_are_reported_per_side():
+    a = side(rec('a.bin', None, None, [], error='x', error_class='unreadable'),
+             rec('b.bin', None, None, [], error='File not found', error_class='not_found'), rec('c.bin'))
+    b = side(rec('a.bin', None, None, [], error='y', error_class='unreadable'),
+             rec('b.bin', None, None, [], error='z', error_class='not_found'), rec('c.bin'))
+    report = compare.compare(a, b, {}, 5)
+    assert report['error_classes_reference'] == {'unreadable': 1, 'not_found': 1}
+    assert report['error_classes_candidate'] == {'unreadable': 1, 'not_found': 1}
+
+
+def test_any_error_class_entry_stops_the_run(tmp_path):
+    """r-01: a count above 0 stops the run for inspection of the corpus; it is not compared away."""
+    tool = os.path.join(HERE, 'compare.py')
+    ref, cand = tmp_path / 'ref.jsonl', tmp_path / 'cand.jsonl'
+    same = [rec('a.bin'), rec('b.bin', None, None, [], error='x', error_class='not_regular')]
+    _write(ref, header(), same)
+    _write(cand, header(), same)
+    stopped = subprocess.run([sys.executable, tool, str(ref), str(cand)], capture_output=True, text=True)
+    assert stopped.returncode == 3, stopped.stdout
+    assert 'STOPPED' in stopped.stdout and '"not_regular": 1' in stopped.stdout
+    allowed = subprocess.run([sys.executable, tool, str(ref), str(cand), '--allow-error-classes'],
+                             capture_output=True, text=True)
+    assert allowed.returncode == 0, allowed.stdout
+
+    clean = [rec('a.bin'), rec('b.bin')]
+    _write(ref, header(), clean)
+    _write(cand, header(), clean)
+    passed = subprocess.run([sys.executable, tool, str(ref), str(cand)], capture_output=True, text=True)
+    assert passed.returncode == 0 and 'RESULT: PASS' in passed.stdout
+
+
+def test_other_class_where_the_reference_gave_a_verdict_is_a_difference():
+    """r-01: `other`/unreadable may never be the class of a file the reference judged."""
+    a = side(rec('a.bin', 0, 'CLEAN', []))
+    b = side(rec('a.bin', None, None, [], error='NOT SCANNED: other', error_class='unreadable'))
+    report = compare.compare(a, b, {'a.bin': {'library': 'x', 'field': 'error_class', 'reason': 'x'}}, 5)
+    assert not report['pass'] and len(report['verdict_differences']) == 1

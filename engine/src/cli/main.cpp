@@ -12,7 +12,8 @@ void usage() {
     std::fputs("usage: mie [--endpoint NAME] ping|status|shutdown\n"
                "       mie version\n"
                "exit codes: 0 ok, 1 the service answered with an error, 2 usage,\n"
-               "            4 the service is not reachable, 5 no valid answer\n",
+               "            4 the service is not reachable, 5 no valid answer,\n"
+               "            6 another account holds MIE's channel name\n",
                stderr);
 }
 
@@ -50,7 +51,12 @@ int main(int argc, char** argv) {
             return 4;
         }
     }
-    const auto connection = mie::channel::connect(endpoint, error);
+    mie::channel::ConnectStatus connect_status = mie::channel::ConnectStatus::Error;
+    const auto connection = mie::channel::connect(endpoint, connect_status, error);
+    if (!connection && connect_status == mie::channel::ConnectStatus::HeldByOtherAccount) {
+        std::fprintf(stderr, "mie: %s\n", mie::channel::kHeldByOtherAccountMessage);
+        return 6;
+    }
     if (!connection) {
         std::fprintf(stderr, "mie: the service is not reachable: %s\n", error.c_str());
         return 4;
