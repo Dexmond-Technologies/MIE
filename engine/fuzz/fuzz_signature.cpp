@@ -10,6 +10,7 @@
 // turns D-17 (five unread fields accepted) on; bit 2 also runs the second check
 // (second_check.cpp: on Linux OpenSSL's own PKCS#7 parser and verification) on the same
 // bytes, whatever the walker said. With an empty store it can never agree: "agree" aborts.
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,14 @@
 #include <vector>
 
 #include "mie/signature.hpp"
+
+// Says where the target stopped (the line), so a stop in CI can be read from the log alone.
+[[noreturn]] inline void mie_fuzz_stop(int line) {
+    std::fprintf(stderr, "fuzz_signature: the rule at line %d of fuzz_signature.cpp does not hold\n", line);
+    std::abort();
+}
+#define MIE_FUZZ_STOP() mie_fuzz_stop(__LINE__)
+
 
 namespace {
 
@@ -70,13 +79,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 
     const bool known_status = result.status == "valid" || result.status == "invalid" || result.status == "unsigned" ||
                               result.status == "unavailable";
-    if (!known_status) std::abort();
-    if (result.status == "valid" || result.publisher_allowed || result.certificate_table_verified) std::abort();
-    if (checked.status != "ok" && result.status != checked.status) std::abort();
-    if (checked.status == "ok" && (checked.entries == 0 || checked.primary_der.empty())) std::abort();
+    if (!known_status) MIE_FUZZ_STOP();
+    if (result.status == "valid" || result.publisher_allowed || result.certificate_table_verified) MIE_FUZZ_STOP();
+    if (checked.status != "ok" && result.status != checked.status) MIE_FUZZ_STOP();
+    if (checked.status == "ok" && (checked.entries == 0 || checked.primary_der.empty())) MIE_FUZZ_STOP();
     if ((switches & 4) != 0) {
         const mie::signature::SecondCheck second = mie::signature::second_check(file, result, options);
-        if (second.agree || second.reason.empty()) std::abort();
+        if (second.agree || second.reason.empty()) MIE_FUZZ_STOP();
     }
     return 0;
 }

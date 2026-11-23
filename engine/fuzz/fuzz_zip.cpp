@@ -1,6 +1,7 @@
 // libFuzzer target: the zip reader must never crash, hang, read out of bounds or produce
 // more than its limits allow on any bytes, in the parity profile and with the shipped
 // profile's switches. The tar reader is reached too when the bytes are not a zip.
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -8,10 +9,20 @@
 
 #include "mie/archive.hpp"
 
+// Says where the target stopped (the line), so a stop in CI can be read from the log alone.
+[[noreturn]] inline void mie_fuzz_stop(int line) {
+    std::fprintf(stderr, "fuzz_zip: the rule at line %d of fuzz_zip.cpp does not hold\n", line);
+    std::abort();
+}
+#define MIE_FUZZ_STOP() mie_fuzz_stop(__LINE__)
+
+#define REQUIRE(condition) require_at((condition), __LINE__)
+
+
 namespace {
 
-void require(bool condition) {
-    if (!condition) std::abort();
+void require_at(bool condition, int line) {
+    if (!condition) mie_fuzz_stop(line);
 }
 
 void check(std::span<const std::uint8_t> file, mie::archive::Options options) {
@@ -29,26 +40,26 @@ void check(std::span<const std::uint8_t> file, mie::archive::Options options) {
     budget.bytes = 8 << 20;
     const Extraction extraction = extract(file, budget, options);
 
-    require(extraction.complete == extraction.reasons.empty());
-    require(extraction.members.size() <= 64);
-    require(budget.members >= 0 && budget.members <= 64);
+    REQUIRE(extraction.complete == extraction.reasons.empty());
+    REQUIRE(extraction.members.size() <= 64);
+    REQUIRE(budget.members >= 0 && budget.members <= 64);
     // What was produced stays under the hard ceiling plus one block of output.
-    require(budget.produced <= options.hard_produced_bytes + (64u << 20));
+    REQUIRE(budget.produced <= options.hard_produced_bytes + (64u << 20));
     std::uint64_t total = 0;
     for (const Member& member : extraction.members) {
-        require(member.bytes != nullptr);
-        require(member.bytes->size() <= static_cast<std::uint64_t>(options.max_member_bytes));
-        require(!member.disk_path.empty());
+        REQUIRE(member.bytes != nullptr);
+        REQUIRE(member.bytes->size() <= static_cast<std::uint64_t>(options.max_member_bytes));
+        REQUIRE(!member.disk_path.empty());
         total += member.bytes->size();
     }
-    require(total <= 64ull * static_cast<std::uint64_t>(options.max_member_bytes));
+    REQUIRE(total <= 64ull * static_cast<std::uint64_t>(options.max_member_bytes));
     // A file detect() does not take for an archive has no members, and extract() says why.
     if (kind == Kind::NotArchive) {
-        require(extraction.members.empty() || extraction.kind == Kind::Tar);
-        require(!extraction.complete);
+        REQUIRE(extraction.members.empty() || extraction.kind == Kind::Tar);
+        REQUIRE(!extraction.complete);
     }
-    if (extraction.kind == Kind::NotArchive) require(extraction.members.empty());
-    if (kind == Kind::Zip) require(extraction.kind == Kind::Zip);
+    if (extraction.kind == Kind::NotArchive) REQUIRE(extraction.members.empty());
+    if (kind == Kind::Zip) REQUIRE(extraction.kind == Kind::Zip);
 }
 
 }  // namespace

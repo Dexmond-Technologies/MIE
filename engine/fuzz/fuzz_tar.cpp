@@ -13,10 +13,20 @@
 
 #include "mie/archive.hpp"
 
+// Says where the target stopped (the line), so a stop in CI can be read from the log alone.
+[[noreturn]] inline void mie_fuzz_stop(int line) {
+    std::fprintf(stderr, "fuzz_tar: the rule at line %d of fuzz_tar.cpp does not hold\n", line);
+    std::abort();
+}
+#define MIE_FUZZ_STOP() mie_fuzz_stop(__LINE__)
+
+#define REQUIRE(condition) require_at((condition), __LINE__)
+
+
 namespace {
 
-void require(bool condition) {
-    if (!condition) std::abort();
+void require_at(bool condition, int line) {
+    if (!condition) mie_fuzz_stop(line);
 }
 
 void fit_checksums(std::vector<std::uint8_t>& data) {
@@ -63,19 +73,19 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     budget.bytes = 8 << 20;
     const Extraction extraction = extract(file, budget, options);
 
-    require(extraction.complete == extraction.reasons.empty());
-    require(extraction.members.size() <= 64);
-    require(budget.members >= 0 && budget.members <= 64);
-    require(budget.produced <= options.hard_produced_bytes + (64u << 20));
+    REQUIRE(extraction.complete == extraction.reasons.empty());
+    REQUIRE(extraction.members.size() <= 64);
+    REQUIRE(budget.members >= 0 && budget.members <= 64);
+    REQUIRE(budget.produced <= options.hard_produced_bytes + (64u << 20));
     for (const Member& member : extraction.members) {
-        require(member.bytes != nullptr);
-        require(member.bytes->size() <= static_cast<std::uint64_t>(options.max_member_bytes));
-        require(!member.disk_path.empty());
-        require(member.disk_path.find('\0') == std::string::npos);
-        require(member.disk_path.front() != '/');
+        REQUIRE(member.bytes != nullptr);
+        REQUIRE(member.bytes->size() <= static_cast<std::uint64_t>(options.max_member_bytes));
+        REQUIRE(!member.disk_path.empty());
+        REQUIRE(member.disk_path.find('\0') == std::string::npos);
+        REQUIRE(member.disk_path.front() != '/');
     }
-    if (extraction.kind == Kind::NotArchive) require(extraction.members.empty());
-    if (kind == Kind::Tar) require(extraction.kind == Kind::Tar);
-    if (kind == Kind::Zip) require(extraction.kind == Kind::Zip);
+    if (extraction.kind == Kind::NotArchive) REQUIRE(extraction.members.empty());
+    if (kind == Kind::Tar) REQUIRE(extraction.kind == Kind::Tar);
+    if (kind == Kind::Zip) REQUIRE(extraction.kind == Kind::Zip);
     return 0;
 }
