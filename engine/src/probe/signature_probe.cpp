@@ -21,9 +21,66 @@
 #include "mie/io.hpp"
 #include "mie/signature.hpp"
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 using nlohmann::json;
+
+#if defined(_WIN32)
+// The cap path's own handle (reviewer's ruling on the Windows second check): the file is
+// opened a SECOND time WITHOUT write sharing (reading and deleting stay shared), hashed
+// through that handle, and WinVerifyTrust runs on it. Any failure costs only the cap.
+// Here for the test tool only; mie::io is not changed and the general scan keeps its sharing.
+struct CapHandle {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool opened = false;
+    bool bytes_equal = false;  // what is read through it equals what the walker was given
+    bool identity_known = false;
+    BY_HANDLE_FILE_INFORMATION identity{};
+};
+
+CapHandle open_cap_handle(const std::filesystem::path& path, std::span<const std::uint8_t> expected) {
+    CapHandle cap;
+    cap.handle = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (cap.handle == INVALID_HANDLE_VALUE) return cap;
+    cap.opened = true;
+    cap.identity_known = ::GetFileInformationByHandle(cap.handle, &cap.identity) != FALSE;
+    std::vector<std::uint8_t> read(expected.size() + 1);
+    std::size_t done = 0;
+    while (done < read.size()) {
+        DWORD got = 0;
+        const DWORD want = static_cast<DWORD>(std::min<std::size_t>(read.size() - done, 1u << 20));
+        if (::ReadFile(cap.handle, read.data() + done, want, &got, nullptr) == FALSE || got == 0) break;
+        done += got;
+    }
+    cap.bytes_equal = done == expected.size() && std::equal(expected.begin(), expected.end(), read.begin());
+    return cap;
+}
+
+// Is the file now behind `path` still the one the cap handle holds (volume serial number and
+// file index)? "same", "different", "path gone" or "not known".
+const char* path_identity(const std::filesystem::path& path, const CapHandle& cap) {
+    if (!cap.identity_known) return "not known";
+    const HANDLE now = ::CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (now == INVALID_HANDLE_VALUE) return "path gone";
+    BY_HANDLE_FILE_INFORMATION other{};
+    const bool read = ::GetFileInformationByHandle(now, &other) != FALSE;
+    ::CloseHandle(now);
+    if (!read) return "not known";
+    return other.dwVolumeSerialNumber == cap.identity.dwVolumeSerialNumber &&
+                   other.nFileIndexHigh == cap.identity.nFileIndexHigh && other.nFileIndexLow == cap.identity.nFileIndexLow
+               ? "same"
+               : "different";
+}
+#endif
 
 std::string read_text(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -109,6 +166,19 @@ int main(int argc, char** argv) {
             handle = file->native_handle();
         }
         const std::span<const std::uint8_t> data(bytes.data(), bytes.size());
+        json cap_opened = nullptr;
+        json cap_bytes_equal = nullptr;
+        std::string identity_after = "not checked";
+#if defined(_WIN32)
+        CapHandle cap;
+        if (pause) {
+            // the cap path: a second open without write sharing; its bytes must be the walker's
+            cap = open_cap_handle(path, data);
+            cap_opened = cap.opened;
+            cap_bytes_equal = cap.bytes_equal;
+            handle = cap.opened && cap.bytes_equal ? reinterpret_cast<std::intptr_t>(cap.handle) : -1;
+        }
+#endif
         if (pause) {
             const json opened = {{"record", "opened"}, {"file", path.filename().string()}, {"bytes", bytes.size()}};
             std::fputs(opened.dump(-1, ' ', true, json::error_handler_t::replace).c_str(), stdout);
@@ -123,6 +193,12 @@ int main(int argc, char** argv) {
         mie::signature::SecondCheck second;
         const bool second_asked = (shipped && valid) || pause;
         if (second_asked) second = mie::signature::second_check(data, result, options, handle);
+#if defined(_WIN32)
+        if (pause && cap.opened) {
+            identity_after = path_identity(path, cap);  // after the check: did the path still name this file?
+            ::CloseHandle(cap.handle);
+        }
+#endif
         json line = {
             {"file", path.filename().string()},
             {"precheck_status", checked.status},
@@ -140,6 +216,9 @@ int main(int argc, char** argv) {
             {"second_check", second_asked ? json(second.agree) : json(nullptr)},
             {"second_check_reason", second.reason},
             {"opened", file != nullptr},
+            {"cap_handle_opened", cap_opened},
+            {"cap_handle_bytes_equal", cap_bytes_equal},
+            {"path_identity_after_check", identity_after},
         };
         // ASCII only, invalid UTF-8 replaced: the test splits the output on b'\n' alone.
         const std::string text = line.dump(-1, ' ', true, json::error_handler_t::replace);

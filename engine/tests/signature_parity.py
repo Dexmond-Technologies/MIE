@@ -698,94 +698,156 @@ def engine_part(ref, inputs, tmp, roots_path, pinned, policy):
 
 
 def handle_test(inputs, tmp, roots_path, pinned, policy_path):
-    """Term (4) of r-01's ruling on the Windows second check: ONE open, the same handle for the
-    worker, the hash and the Windows check. The probe ('shipped-pause') opens the file through
-    mie::io::open_regular, reads it, and waits; meanwhile this test tries to change what the PATH
-    holds (overwrite in place, then rename another file over it). Either the system refuses both
-    (stated), or the probe's answer must be the one for the ORIGINAL bytes.
-    The Windows part of the answer can only be told with a file Windows itself trusts: set
-    MIE_REAL_SIGNED_FILE to a program with an embedded Microsoft signature. With the generated
-    file (signed under the throwaway root, which Windows does not trust) that part is NOT DETERMINED.
+    """The cap path on Windows (reviewer's ruling after B-3632; it replaces "deny-write on every scan").
+    General scans keep their sharing. Only when a file would get the cap, the parent opens it a
+    SECOND time WITHOUT write sharing (reading and deleting stay shared), hashes through that
+    handle (equal to the worker's bytes, or no cap) and runs WinVerifyTrust on that handle.
+    The probe mode 'shipped-pause' does exactly that and then waits for a line on standard input.
+    During the wait this test
+      1. tries to OVERWRITE the file in place: the system must refuse (no write sharing);
+      2. RENAMES another file over the path (possible: delete sharing): the walker's answer must
+         be for the original bytes, and the probe's identity comparison (volume serial number and
+         file index of the handle against the path's) must say "different" or "path gone".
+    And it MEASURES, on a real program with an embedded signature that WinVerifyTrust accepts
+    (found on this machine, COPIED into the test's folder, the original never touched), whether
+    WinVerifyTrust judges the open handle or re-opens the path after the rename.
     Windows only. Returns the lines that must fail the test."""
     if os.name != 'nt':
-        print('NOT RUN  handle test (term 4 of the Windows second check): Windows only')
+        print('NOT RUN  cap-path handle test: Windows only')
         return []
-    real = os.environ.get('MIE_REAL_SIGNED_FILE')
-    use_real = bool(real) and os.path.isfile(real)
-    work = os.path.join(tmp, 'handle')
-    os.mkdir(work)
-    path = os.path.join(work, 'subject.bin')
-    if use_real:
-        shutil.copyfile(real, path)
-    else:
-        with open(path, 'wb') as f:
-            f.write(inputs['valid_sha256'])
-    with open(path, 'rb') as f:
-        original = hashlib.sha256(f.read()).hexdigest()
-    replacement = inputs['unsigned']
-    other = os.path.join(tmp, 'handle-replacement.bin')
-    with open(other, 'wb') as f:
-        f.write(replacement)
-
-    proc = subprocess.Popen([PROBE, roots_path, pinned, policy_path, work, 'shipped-pause'],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    answer, changed = None, []
-    try:
-        while True:
-            raw = proc.stdout.readline()
-            if not raw:
-                break
-            line = json.loads(raw.decode('ascii'))
-            if line.get('record') == 'settings':
-                print('SETTINGS (shipped-pause):', json.dumps(line, sort_keys=True))
-            elif line.get('record') == 'opened':
-                def overwrite():
-                    with open(path, 'r+b') as f:
-                        f.write(replacement)
-                        f.truncate()
-                for label, attempt in (('overwritten in place', overwrite),
-                                       ('another file renamed over it', lambda: os.replace(other, path))):
-                    try:
-                        attempt()
-                        changed.append(label)
-                    except OSError as e:
-                        print(f'HANDLE  while the probe holds the file open, "{label}" was REFUSED by the system: {e}')
-                proc.stdin.write(b'\n')
-                proc.stdin.flush()
-            elif 'file' in line:
-                answer = line
-        proc.wait(timeout=300)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-    with open(path, 'rb') as f:
-        now = hashlib.sha256(f.read()).hexdigest()
-    print(f"HANDLE  file used: {'a real signed file (MIE_REAL_SIGNED_FILE)' if use_real else 'generated, throwaway root'}; "
-          f'changes that went through: {changed or "none"}; content behind the path changed: {now != original}')
-    if answer is None:
-        return ['handle test: the probe gave no answer']
-    print(f"HANDLE  probe answer: walker {answer['status']} publisher {answer.get('publisher')!r} "
-          f"({answer['detail'][:100]!r}); second check {answer.get('second_check')} ({answer.get('second_check_reason')!r})")
-    if not changed:
-        print('PASS  handle test: the system refused every change while the file was open (deny-write holds)')
-        return []
-    print('NOTE  handle test: the file COULD be changed while the probe held it open: mie::io::open_regular does not '
-          'deny writing or deleting (term 4 asks for deny-write; that is a change in mie::io)')
     failures = []
-    # the replacement is an unsigned file; the original is signed (the generated one: valid here)
-    walker_follows = answer['status'] != 'unsigned' if use_real else answer['status'] == 'valid'
-    print(f"{'PASS' if walker_follows else 'FAIL'}  handle test: the walker's answer is the one for the ORIGINAL bytes")
-    if not walker_follows:
-        failures.append(f'handle test: the walker answered for the replaced content: {answer!r}')
-    if use_real:
-        windows_follows = 'WinVerifyTrust did not accept' not in (answer.get('second_check_reason') or '')
-        print(f"{'PASS' if windows_follows else 'FAIL'}  handle test: WinVerifyTrust judged the ORIGINAL (the open handle), "
-              f'not the unsigned file now behind the path')
-        if not windows_follows:
-            failures.append(f'handle test: WinVerifyTrust did not follow the handle: {answer!r}')
+    unsigned = os.path.join(tmp, 'handle-unsigned.bin')
+    not_accepted = ('WinVerifyTrust did not accept', 'no open file handle', 'not well formed', "not the file's digest")
+
+    def run(source_bytes, label, changes):
+        """One probe run on a private copy; `changes` are tried while the probe waits."""
+        work = tempfile.mkdtemp(prefix='handle-', dir=tmp)
+        path = os.path.join(work, 'subject.bin')
+        with open(path, 'wb') as f:
+            f.write(source_bytes)
+        with open(unsigned, 'wb') as f:
+            f.write(inputs['unsigned'])
+        proc = subprocess.Popen([PROBE, roots_path, pinned, policy_path, work, 'shipped-pause'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        answer, outcome = None, {}
+        try:
+            while True:
+                raw = proc.stdout.readline()
+                if not raw:
+                    break
+                line = json.loads(raw.decode('ascii'))
+                if line.get('record') == 'opened':
+                    for name, change in changes:
+                        try:
+                            change(path)
+                            outcome[name] = 'went through'
+                        except OSError as e:
+                            outcome[name] = f'REFUSED by the system ({e})'
+                    proc.stdin.write(b'\n')
+                    proc.stdin.flush()
+                elif 'file' in line:
+                    answer = line
+            proc.wait(timeout=300)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        for name, result in outcome.items():
+            print(f'HANDLE  {label}: {name}: {result}')
+        if answer is not None:
+            print(f"HANDLE  {label}: walker {answer['status']} publisher {answer.get('publisher')!r}; cap handle opened "
+                  f"{answer.get('cap_handle_opened')}, its bytes equal the walker's {answer.get('cap_handle_bytes_equal')}; "
+                  f"second check {answer.get('second_check')} ({answer.get('second_check_reason')!r}); "
+                  f"path identity after the check: {answer.get('path_identity_after_check')}")
+        return answer, outcome
+
+    def overwrite(path):
+        with open(path, 'r+b') as f:
+            f.write(inputs['unsigned'])
+            f.truncate()
+
+    def rename_over(path):
+        os.replace(unsigned, path)
+
+    # 1 and 2 on the generated, validly signed file (walker: valid)
+    answer, outcome = run(inputs['valid_sha256'], 'generated file', [('overwrite in place', overwrite),
+                                                                    ('rename another file over the path', rename_over)])
+    if answer is None:
+        return ['cap-path handle test: the probe gave no answer']
+    refused = outcome.get('overwrite in place', '').startswith('REFUSED')
+    print(f"{'PASS' if refused else 'FAIL'}  cap path: an overwrite while the cap handle is open is refused by the system")
+    if not refused:
+        failures.append('cap path: the file could be overwritten while the no-write-sharing handle was open')
+    follows = answer['status'] == 'valid' and answer.get('cap_handle_bytes_equal') is True
+    print(f"{'PASS' if follows else 'FAIL'}  cap path: the walker's answer is for the ORIGINAL bytes and the cap handle read the same bytes")
+    if not follows:
+        failures.append(f'cap path: answer not for the original bytes: {answer!r}')
+    if outcome.get('rename another file over the path') == 'went through':
+        caught = answer.get('path_identity_after_check') in ('different', 'path gone')
+        print(f"{'PASS' if caught else 'FAIL'}  cap path: after a rename over the path the identity comparison says "
+              f"{answer.get('path_identity_after_check')!r}")
+        if not caught:
+            failures.append(f'cap path: a rename over the path was not caught by the identity comparison: {answer!r}')
     else:
-        print('NOT DETERMINED  handle test, Windows part: Windows does not trust the throwaway root, so WinVerifyTrust '
-              'refuses the generated file either way; set MIE_REAL_SIGNED_FILE to a file with an embedded Microsoft signature')
+        print('NOTE  cap path: the rename over the path was refused too on this system; the identity comparison was not exercised')
+
+    # the measurement: does WinVerifyTrust judge the handle or re-open the path?
+    real = os.environ.get('MIE_REAL_SIGNED_FILE')
+    candidates = [real] if real and os.path.isfile(real) else []
+    if not candidates:
+        from dexmond_mie import signature as ref
+        roots = [os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), d)
+                 for d in ('Windows Defender', 'PowerShell', 'dotnet', 'Microsoft Office', 'Common Files\\microsoft shared')]
+        roots += [os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), 'Microsoft'),
+                  os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')]
+        looked = 0
+        for top in roots:
+            for folder, _, names in os.walk(top):
+                if looked >= 1500 or len(candidates) >= 12:
+                    break
+                for name in sorted(names):
+                    if looked >= 1500 or len(candidates) >= 12:
+                        break
+                    if not name.lower().endswith(('.exe', '.dll')):
+                        continue
+                    full = os.path.join(folder, name)
+                    looked += 1
+                    try:
+                        if os.path.getsize(full) > 4 * 1024 * 1024:
+                            continue
+                        with open(full, 'rb') as f:
+                            if ref.precheck_data(f.read())[0] == 'ok':      # it carries an embedded signature
+                                candidates.append(full)
+                    except OSError:
+                        continue
+        print(f'HANDLE  looked at {looked} system programs; {len(candidates)} carry an embedded signature')
+    chosen = None
+    for full in candidates:
+        with open(full, 'rb') as f:
+            data = f.read()
+        baseline, _ = run(data, f'real file {os.path.basename(full)}, untouched', [])
+        reason = (baseline or {}).get('second_check_reason') or ''
+        if baseline is not None and reason and not any(word in reason for word in not_accepted):
+            chosen = (full, data, reason)
+            break
+    if chosen is None:
+        print('NOT DETERMINED  whether WinVerifyTrust judges the handle or re-opens the path: no program with an embedded '
+              'signature that WinVerifyTrust accepts was found here (set MIE_REAL_SIGNED_FILE)')
+        return failures
+    full, data, reason = chosen
+    print(f'HANDLE  measuring with a private copy of {full} (sha256 {hashlib.sha256(data).hexdigest()}); untouched, '
+          f'WinVerifyTrust accepted it (second check went on to: {reason!r})')
+    after, outcome = run(data, 'real file, another file renamed over its path', [('rename another file over the path', rename_over)])
+    if after is None or outcome.get('rename another file over the path') != 'went through':
+        print('NOT DETERMINED  the rename over the real file\'s copy did not go through')
+        return failures
+    reason_after = after.get('second_check_reason') or ''
+    if any(word in reason_after for word in not_accepted):
+        print(f'MEASURED  WinVerifyTrust RE-OPENED THE PATH: after the rename it judged the replacement ({reason_after!r}). '
+              f"The identity comparison said {after.get('path_identity_after_check')!r}. Per the ruling: compare the "
+              f'identity after the check and refuse on a difference, or drop delete sharing on the cap path.')
+    else:
+        print(f'MEASURED  WinVerifyTrust JUDGED THE OPEN HANDLE: after the rename its answer is still the one for the '
+              f'original ({reason_after!r}); path identity after the check: {after.get("path_identity_after_check")!r}')
     return failures
 
 
