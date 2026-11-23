@@ -3,7 +3,12 @@
 # Linux machine without root (the corpus machine). The same script runs in CI on Ubuntu 24.04 with
 # its own gcc and Python (job signature-recipe), so the recipe is tested before anyone runs it.
 #
-#   build_signature_probe.sh WORK_DIR
+#   [PYTHON=/path/to/python3.12.16] build_signature_probe.sh WORK_DIR
+#
+# The reviewer requires Python 3.12.16 for the reference side (ruling on gate 3, 2026-11-23). If the
+# system's python3 is another version, give a 3.12.16 interpreter in PYTHON; without root it can be
+# had for example with `uv python install 3.12.16` (then PYTHON="$(uv python find 3.12.16)").
+# The script refuses any other version unless MIE_ALLOW_OTHER_PYTHON=1 (then it says so).
 #
 # Run from the top of a checkout of the MIE repository at the commit to test. It needs: git,
 # cmake (3.25 or newer), a C++20 compiler (gcc 13 or newer), make or ninja, curl, zip, unzip, tar,
@@ -32,7 +37,17 @@ cmake -S "$REPO/engine" -B "$WORK/build" -DCMAKE_BUILD_TYPE=Release -DMIE_BUILD_
       "-DCMAKE_TOOLCHAIN_FILE=$WORK/vcpkg/scripts/buildsystems/vcpkg.cmake"
 cmake --build "$WORK/build" --parallel "$(nproc)" --target mie-signature-probe
 
-[ -x "$WORK/venv/bin/python" ] || python3 -m venv "$WORK/venv"
+PY="${PYTHON:-python3}"
+version="$("$PY" -c 'import platform; print(platform.python_version())')"
+if [ "$version" != "3.12.16" ]; then
+    if [ "${MIE_ALLOW_OTHER_PYTHON:-0}" = "1" ]; then
+        echo "WARNING: Python $version, not 3.12.16 (MIE_ALLOW_OTHER_PYTHON=1): not valid for the reviewer's run"
+    else
+        echo "Python $version found; 3.12.16 is required (set PYTHON, see the head of this script)" >&2
+        exit 2
+    fi
+fi
+[ -x "$WORK/venv/bin/python" ] || "$PY" -m venv "$WORK/venv"
 "$WORK/venv/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes \
     -r "$REPO/requirements-signify.lock"
 

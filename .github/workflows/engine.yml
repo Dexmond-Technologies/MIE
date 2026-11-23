@@ -412,12 +412,19 @@ jobs:
           key: vcpkg-ubuntu-24.04-system-gcc-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
           restore-keys: |
             vcpkg-ubuntu-24.04-system-gcc-${{ env.VCPKG_COMMIT }}-
+      # The reviewer requires Python 3.12.16 for the reference side; the corpus machine's system
+      # Python is 3.12.3, so the recipe takes a 3.12.16 interpreter in PYTHON, as here.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: py31216
+        with:
+          python-version: "3.12.16"
       - name: The recipe, exactly as the corpus machine runs it
         run: |
           set -eu
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-          python3 --version; c++ --version | head -1; cmake --version | head -1
-          engine/tools/parity/build_signature_probe.sh "$RUNNER_TEMP/sig" | tee "$RUNNER_TEMP/recipe.txt"
+          /usr/bin/python3 --version; c++ --version | head -1; cmake --version | head -1
+          PYTHON="${{ steps.py31216.outputs.python-path }}" \
+            engine/tools/parity/build_signature_probe.sh "$RUNNER_TEMP/sig" | tee "$RUNNER_TEMP/recipe.txt"
       - name: Selection and comparison on set S (both profiles)
         run: |
           set -u
