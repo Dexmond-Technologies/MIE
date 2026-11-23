@@ -807,16 +807,53 @@ def main():
                        for kind in ('rfc3161', 'authenticode')]
         stamp_pairs = [f'stamp_two_suitable_{order}_first_{kind}' for order in ('other', 'real')
                        for kind in ('rfc3161', 'authenticode')]
-        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256', *stamp_twins,
-                     *stamp_pairs):
+        for name in sorted(named):          # ALL named cases
             with open(os.path.join(twins, name + '.bin'), 'wb') as f:
                 f.write(dict(inputs)[name])
-        done = subprocess.run([PROBE, roots_path, pinned, policy_path, twins, 'shipped'], capture_output=True, timeout=600)
-        shipped = {}
-        for raw in done.stdout.split(b'\n'):
-            if raw.strip():
-                line = json.loads(raw.decode('ascii'))
-                shipped[line['file'][:-4]] = line
+
+        def probe_mode(mode):
+            done = subprocess.run([PROBE, roots_path, pinned, policy_path, twins, mode], capture_output=True, timeout=900)
+            out = {}
+            for raw in done.stdout.split(b'\n'):
+                if raw.strip():
+                    line = json.loads(raw.decode('ascii'))
+                    out[line['file'][:-4]] = line
+            return out
+
+        def cap_of(line, with_second_check=False):
+            cap = line is not None and line['status'] == 'valid' and line['publisher_allowed'] is True
+            return cap and (not with_second_check or line.get('second_check') is True)
+
+        shipped = probe_mode('shipped')
+        single = {d: probe_mode('strict-' + d) for d in ('d13', 'd17', 'd19', 'd20')}
+        names_of = {'d13': 'D-13 every entry verified', 'd17': 'D-17 strict fields', 'd19': 'D-19 verified certificate',
+                    'd20': 'D-20 strict lengths'}
+        print('--- every named case in the shipped setting (strict switches, second check on) ---')
+        kept, lost = 0, {}
+        for name in sorted(named):
+            p_line, s_line = cpp.get(name), shipped.get(name)
+            p_cap, s_walker, s_cap = cap_of(p_line), cap_of(s_line), cap_of(s_line, True)
+            second = 'not asked' if s_line is None or s_line.get('second_check') is None else (
+                'agrees' if s_line['second_check'] else f"DISAGREES ({s_line.get('second_check_reason')})")
+            why = ''
+            if p_cap and s_cap:
+                kept += 1
+            elif p_cap:
+                if s_walker:
+                    no_handle = 'no open file handle' in (s_line.get('second_check_reason') or '')
+                    why = ('second check has no file handle (Windows, handle not passed yet)' if no_handle
+                           else 'second check disagrees')
+                else:
+                    alone = [names_of[d] for d in single if not cap_of(single[d].get(name))]
+                    why = ' + '.join(alone) if alone else 'other (no single switch alone)'
+                lost[why] = lost.get(why, 0) + 1
+            print(f"SHIPPED {name}: parity {None if p_line is None else p_line['status']} cap={p_cap}; shipped "
+                  f"{None if s_line is None else s_line['status']} cap={s_cap}; second check {second}"
+                  + (f'; cap lost to: {why}' if why else ''))
+            if s_cap and not p_cap:
+                hard.append(f'{name}: the shipped setting grants a cap that parity does not: {s_line!r}')
+        print(f'shipped setting: of the named cases valid with cap in parity, {kept} keep the cap, '
+              f'{sum(lost.values())} lose it: {json.dumps(lost, sort_keys=True)}')
         for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first'):
             c = shipped.get(name)
             r = reference_result(ref, dict(inputs)[name], roots_path, pinned, loaded_policy)

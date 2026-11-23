@@ -604,6 +604,10 @@ SignedData parse_content_info(Bytes der, DataKind kind, const char* not_signed_c
 }
 
 // ---- certificates ----------------------------------------------------------------------
+// ORDER- AND COUNT-STABLE, and it must stay so: exactly one certificate per element of
+// `ders`, in the same order, or an exception. The position of "the certificate that
+// verified" (VerifiedBy, finding SG-1) is carried from one call of this function to a
+// later call on the same list; the callers check the count again where they use it.
 std::vector<X509Ptr> load_certificates(const std::vector<Bytes>& ders) {
     std::vector<X509Ptr> out;
     for (Bytes der : ders) {
@@ -827,8 +831,12 @@ void verify_attribute_signature(X509* certificate, const Signer& signer, const D
 template <typename TimeFor>
 X509* verify_signer(const Signer& signer, const std::vector<X509*>& pool, const Roots& roots, TimeFor time_for,
                    const char* eku_oid, const char* eku_name, const char* signer_class) {
-    std::vector<X509*> all = raw(roots.certs);
-    all.insert(all.end(), pool.begin(), pool.end());
+    // The file's own certificates first, the pinned store's after (r-01, B-3632 follow-up): of
+    // a certificate present in both, the file's copy is "the one that verified", as the
+    // reference judges the file's copy (signature.py:297-310, 320-333). signify walks the
+    // store first (x509/context.py:369); the order changes no answer, only which copy is named.
+    std::vector<X509*> all = pool;
+    for (const X509Ptr& root : roots.certs) all.push_back(root.get());
     const DigestAlg algorithm = digest_algorithm(signer.digest_alg, "SignerInfo.digestAlgorithm");
     std::optional<Fail> first_error;
     X509* verified = nullptr;
@@ -1267,6 +1275,7 @@ std::optional<std::int64_t> trusted_signing_time(const SignedData& primary, cons
     // `verified_index` counts in the set the countersigner was searched in; that set is the
     // front of `pool` in both cases (the token's certificates, or the signature's own).
     const std::size_t searched = counter.rfc3161 ? token_certificates.size() : primary_certs.size();
+    if (counter.rfc3161 && token_certificates.size() != counter.token.certs.size()) return std::nullopt;
     pool.insert(pool.end(), primary_certs.begin(), primary_certs.end());
     X509* certificate = nullptr;
     if (second_lookup) {
@@ -1375,6 +1384,8 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     // AFTER: the reference's own checks.
     const std::vector<X509Ptr> certificates = load_certificates(primary.certs);
     const std::vector<X509*> pool = raw(certificates);
+    // the positions in `verified_by` were counted in an earlier load of the same list
+    if (pool.size() != primary.certs.size()) throw Fail{"ValueError", "the certificate list changed between two loads"};
     // Which certificate is "the signer" from here on (usage, dates, chain, publisher name)?
     // The reference looks it up AGAIN by issuer name and serial number among the signature's
     // certificates and takes the FIRST match (signature.py:297-310), which need not be the

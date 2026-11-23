@@ -31,16 +31,20 @@ std::string read_text(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc != 5 && argc != 6) {
-        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped]\n", stderr);
+        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped|strict-d13|strict-d17|strict-d19|strict-d20]\n", stderr);
         return 2;
     }
     mie::signature::Options options;
     // "parity" (the default): the reference's leniency on five unread fields (D-17) is on and
     // there is no second check. "shipped": strict fields, and the second check must agree.
-    const bool shipped = argc == 6 && std::string(argv[5]) == "shipped";
-    options.accept_unread_fields = !shipped;
-    options.signer_by_second_lookup = !shipped;
-    options.accept_long_lengths = !shipped;
+    // "strict-d13", "strict-d17", "strict-d19", "strict-d20": parity with that ONE numbered
+    // difference switched to its shipped value, so a test can say which one changed an answer.
+    const std::string mode = argc == 6 ? argv[5] : "parity";
+    const bool shipped = mode == "shipped";
+    options.verify_every_entry = shipped || mode == "strict-d13";
+    options.accept_unread_fields = !(shipped || mode == "strict-d17");
+    options.signer_by_second_lookup = !(shipped || mode == "strict-d19");
+    options.accept_long_lengths = !(shipped || mode == "strict-d20");
     options.require_second_check = shipped;
     mie::signature::load_roots_file(argv[1], options);
     const std::string pinned = argv[2];
