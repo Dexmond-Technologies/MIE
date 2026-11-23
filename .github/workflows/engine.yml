@@ -296,6 +296,7 @@ jobs:
             ${{ runner.temp }}/set_s/reference.jsonl
             ${{ runner.temp }}/set_s/reference.details.jsonl
             ${{ runner.temp }}/set_s/archive.reference.jsonl
+            ${{ runner.temp }}/set_s/files/a*.zip
           if-no-files-found: error
           retention-days: 7
 

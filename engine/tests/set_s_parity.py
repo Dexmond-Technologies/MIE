@@ -23,6 +23,7 @@ construction, so the folder must not be watched by any real scanner while this r
 """
 import json
 import os
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,14 @@ def header_of(path):
                 if record.get('record') == 'header':
                     return record
     return None
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def manifest_check(cpp, cpp2):
@@ -127,6 +136,26 @@ def main():
             if os.path.exists(os.path.join(linux_dir, 'reference.details.jsonl')):
                 shutil.copyfile(os.path.join(linux_dir, 'reference.details.jsonl'), ref_details)
             print('REFERENCE FAILED ON WINDOWS: using the reference table made on Linux in this run')
+            # The set's generator packs some zip files with the zlib of the Python that runs it;
+            # another Python packs the same content into other bytes. A file whose hash is not the
+            # manifest's is replaced by the Linux job's copy, and the hash is checked again.
+            with open(os.path.join(PARITY, 'set_s.manifest.json'), encoding='utf-8') as f:
+                wanted = {e['path']: e['sha256'] for e in json.load(f)['files'] if e.get('sha256')}
+            replaced, wrong = [], []
+            for name, digest in sorted(wanted.items()):
+                local = os.path.join(files, name)
+                if not os.path.isfile(local) or file_sha256(local) == digest:
+                    continue
+                linux_copy = os.path.join(linux_dir, 'files', name)
+                if os.path.isfile(linux_copy) and file_sha256(linux_copy) == digest:
+                    shutil.copyfile(linux_copy, local)
+                    replaced.append(name)
+                else:
+                    wrong.append(name)
+            print(f'files generated with other bytes here and replaced by the Linux copy: {len(replaced)} {replaced}')
+            if wrong:
+                print(f'FAIL  files whose bytes are not the manifest\'s and for which no Linux copy came: {wrong}')
+                return 1
 
         engine_args = [RUNNER, '--corpus', files, '--rules', os.path.join(REPO, 'rules'), '--reputation', reputation,
                        '--scoring', os.path.join(REPO, 'engine', 'data', 'scoring.reference.json')]
