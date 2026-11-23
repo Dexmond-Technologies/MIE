@@ -3,7 +3,7 @@
 a folder of files and writes one JSON line per file.
 
     run_reference.py --corpus DIR --out FILE.jsonl [--no-reputation] [--reputation FILE]
-                     [--details FILE.jsonl]
+                     [--details FILE.jsonl] [--times FILE.jsonl]
     run_reference.py --describe          (prints the header record only: versions, rule hashes)
 
 Output format (also the format the C++ engine will write for the comparison):
@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -106,7 +107,7 @@ def header(rules_dir, options):
     return record
 
 
-def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_path=None):
+def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_path=None, times_path=None):
     sys.path.insert(0, REPO)
     from dexmond_mie.core import Engine  # imported late: --describe must work without it
 
@@ -115,8 +116,10 @@ def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_
         shutil.copytree(os.path.join(REPO, 'rules'), rules_copy)
         rep_copy = os.path.join(work, 'reputation.json')
         shutil.copy(reputation_file or os.path.join(REPO, 'data', 'reputation.json'), rep_copy)
+        engine_started = time.perf_counter()
         engine = Engine(rules_dir=rules_copy, reputation_db=rep_copy, use_reputation=use_reputation,
                         auto_evolution=False)
+        engine_seconds = time.perf_counter() - engine_started  # building the Engine once (rules compiled)
 
         files = []
         for root, dirs, names in os.walk(corpus):
@@ -130,6 +133,11 @@ def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_
                        'reputation_sha256': sha256_of(rep_copy)}
             head = header(rules_copy, options)
             details = open(details_path, 'w', encoding='utf-8', newline='\n') if details_path else None
+            # --times: seconds around engine.scan_file only, per file; the Engine was built once
+            # above, as the reference runs as a long-lived process. Does not change --out.
+            times = open(times_path, 'w', encoding='utf-8', newline='\n') if times_path else None
+            if times is not None:
+                times.write(json.dumps({'record': 'engine_built', 'seconds': engine_seconds}, sort_keys=True) + '\n')
             head['yara_status'] = getattr(engine.yara_engine, 'status', None)
             out.write(json.dumps(head, sort_keys=True) + '\n')
             for path in files:
@@ -145,7 +153,11 @@ def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_
                     continue
                 record['sha256'] = sha256_of(path)
                 record['size'] = st.st_size
+                scan_started = time.perf_counter()
                 result = engine.scan_file(path)
+                if times is not None:
+                    times.write(json.dumps({'path': rel, 'seconds': time.perf_counter() - scan_started},
+                                           sort_keys=True) + '\n')
                 if 'error' in result:
                     record['error'] = str(result['error'])
                     record['error_class'] = error_class(record['error'])
@@ -166,6 +178,8 @@ def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_
                 out.write(json.dumps(record, sort_keys=True) + '\n')
             if details is not None:
                 details.close()
+            if times is not None:
+                times.close()
     return len(files)
 
 
@@ -178,6 +192,7 @@ def main():
     parser.add_argument('--reputation', help='reputation list to use instead of data/reputation.json '
                                              '(set S brings its own; a copy is used, never the file itself)')
     parser.add_argument('--details', help='also write every finding of every file (JSON lines)')
+    parser.add_argument('--times', help='also write the seconds of engine.scan_file per file (JSON lines)')
     parser.add_argument('--describe', action='store_true', help='print the header record and stop')
     args = parser.parse_args()
 
@@ -187,7 +202,7 @@ def main():
     if not args.corpus or not args.out:
         parser.error('--corpus and --out are required')
     count = scan_corpus(os.path.abspath(args.corpus), args.out, not args.no_reputation,
-                        args.reputation, args.details)
+                        args.reputation, args.details, args.times)
     print(f'run_reference: {count} files, results in {args.out}')
     return 0
 

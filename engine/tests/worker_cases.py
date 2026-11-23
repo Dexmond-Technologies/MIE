@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 RUNNER, WORKER, WORKER_HOOKS, PARITY_RUNNER = (os.path.abspath(p) for p in sys.argv[1:5])
 REPO = os.path.abspath(sys.argv[5])
@@ -113,11 +114,14 @@ def main():
 
         # --times: the unconfined runner's time per file, to put beside the confined worker's.
         direct_times = os.path.join(tmp, 'direct.times.jsonl')
+        direct_started = time.perf_counter()
         code, out, err = run([PARITY_RUNNER, '--corpus', files, '--out', direct, '--details', direct_details,
                               '--times', direct_times] + common)
         if code == 2:  # a runner without --times
             direct_times = ''
+            direct_started = time.perf_counter()
             code, out, err = run([PARITY_RUNNER, '--corpus', files, '--out', direct, '--details', direct_details] + common)
+        direct_wall = time.perf_counter() - direct_started
         print(out.strip(), flush=True)
         if code != 0:
             print('NOT RUN mie-parity-run failed (exit %d): %s' % (code, err.strip()[-800:]))
@@ -126,8 +130,10 @@ def main():
         # The wall limit is raised for this part only: under a sanitizer build the large files
         # of the set take longer than the product's 60 seconds. The product's limit is tested
         # in part B.
+        confined_started = time.perf_counter()
         code, out, err = worker_run(WORKER, files, confined, common,
                                     ['--details', confined_details, '--log', log, '--wall', '900'])
+        confined_wall = time.perf_counter() - confined_started
         print(out.strip(), flush=True)
         if err.strip():
             print(err.strip()[-1500:], flush=True)
@@ -214,6 +220,63 @@ def main():
             print('  UNCONFINED test runner per file: NOT MEASURED (this mie-parity-run has no --times)', flush=True)
         print('  (the unconfined runner compiles the rules once for all files; a worker compiles them for its one file)',
               flush=True)
+
+        # The PYTHON REFERENCE's time per file on the same set (reviewer's line A-8: "not worse
+        # than the Python reference at the median and the 95th percentile"). Linux only: the
+        # reference stops on Windows on an archive that holds an executable. PRINTED, NEVER
+        # ASSERTED: set S is 58 generated files, not the corpus, and a CI runner is not the
+        # reference machine.
+        sanitized = bool(describe and describe[0].get('sanitizer_build'))
+        if not LINUX:
+            print('A-8 on set S: NOT MEASURED here (the Python reference is run on Linux only)', flush=True)
+        else:
+            reference_times = os.path.join(tmp, 'reference.times.jsonl')
+            code, out, err = run([PY, os.path.join(PARITY, 'run_reference.py'), '--corpus', files,
+                                  '--out', os.path.join(tmp, 'reference.jsonl'), '--times', reference_times,
+                                  '--reputation', os.path.join(set_dir, 'set_s.reputation.json')])
+            reference = {r['path']: r['seconds'] * 1000.0 for r in records(reference_times)
+                         if 'seconds' in r and 'path' in r}
+            engine_built = [r['seconds'] for r in records(reference_times) if r.get('record') == 'engine_built']
+            confined_ms = {j['path']: j.get('total_ms', 0.0) for j in scanned if j.get('answered')}
+            common_paths = sorted(set(reference) & set(confined_ms))
+            if code != 0 or not common_paths:
+                print('A-8 on set S: NOT MEASURED (the reference run gave no times: exit %d, %s)' % (
+                    code, err.strip()[-300:]), flush=True)
+            else:
+                def at(values, share):
+                    values = sorted(values)
+                    return values[min(len(values) - 1, int(round(share * (len(values) - 1))))]
+
+                ref = [reference[p] for p in common_paths]
+                cpp = [confined_ms[p] for p in common_paths]
+                print('A-8 on set S, %d files, milliseconds per file, measured on this CI runner%s:' % (
+                    len(common_paths), ' (SANITIZER BUILD of the C++ side: its times are not the product\'s)' if sanitized else ''))
+                print('  Python reference, Engine.scan_file, engine built once:   median %.1f, 95th percentile %.1f, max %.1f' % (
+                    at(ref, 0.5), at(ref, 0.95), max(ref)))
+                print('  C++ through a confined worker, total in the parent:      median %.1f, 95th percentile %.1f, max %.1f' % (
+                    at(cpp, 0.5), at(cpp, 0.95), max(cpp)))
+                print('  ratio C++ / reference: at the median %.2f, at the 95th percentile %.2f' % (
+                    at(cpp, 0.5) / max(at(ref, 0.5), 0.001), at(cpp, 0.95) / max(at(ref, 0.95), 0.001)))
+                # Totals over the same files (reviewer, B-3631), seconds.
+                unconfined_all = {r['path']: r.get('total_ms', 0.0) for r in records(direct_times)} if direct_times else {}
+                unconfined_sum = sum(unconfined_all.get(p, 0.0) for p in common_paths) / 1000.0
+                print('  TOTAL over these %d files, seconds:' % len(common_paths))
+                print('    Python reference: scan_file calls %.3f; building the Engine once (not in that sum) %s' % (
+                    sum(ref) / 1000.0, '%.3f' % engine_built[0] if engine_built else 'NOT MEASURED'))
+                print('    C++ through confined workers: sum of the parent\'s per-file totals %.3f; wall time of the whole '
+                      'mie-worker-run (one describing worker, listing and writing included) %.3f' % (
+                          sum(cpp) / 1000.0, confined_wall))
+                if direct_times:
+                    print('    C++ unconfined test runner: sum per file %.3f; its one-time set-up and writing (whole '
+                          'mie-parity-run %.3f minus that sum; rules compiled once in it) %.3f' % (
+                              unconfined_sum, direct_wall, max(direct_wall - sum(unconfined_all.values()) / 1000.0, 0.0)))
+                else:
+                    print('    C++ unconfined test runner: per file NOT MEASURED; whole mie-parity-run %.3f' % direct_wall)
+                print('A-8 on set S: confined C++ %s slower than the reference at the median; %s slower at the 95th '
+                      'percentile. (A statement of these numbers only: 58 generated files, not the corpus; a CI runner, '
+                      'not the reference machine; nothing is asserted on it.)' % (
+                          'IS' if at(cpp, 0.5) > at(ref, 0.5) else 'is not',
+                          'IS' if at(cpp, 0.95) > at(ref, 0.95) else 'is not'), flush=True)
 
         # ---------------------------------------------------------------- part B
         small = os.path.join(tmp, 'small')
