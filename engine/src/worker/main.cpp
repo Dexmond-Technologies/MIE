@@ -11,7 +11,8 @@
 //   4. the job is read from standard input: scoring table, reputation list and the text of
 //      every rule file. The worker opens no path. Rules are compiled from source;
 //   5. the one file handed over by the parent is scanned through the pipeline;
-//   6. the answer is written as one channel frame on standard output.
+//   6. the answer is written as one channel frame on standard output, with the system's write
+//      call in a loop and the count checked: no buffered stream, nothing left to a flush at exit.
 //
 // The shipped program takes NO arguments and honours NO test switch: a job that carries a
 // test fault is refused (exit code 45). The same source is built a second time as
@@ -20,6 +21,7 @@
 //
 // The Authenticode check is not wired in: every signature is "unavailable" (no cap).
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -94,22 +96,65 @@ bool read_job_bytes(std::vector<std::uint8_t>& out) {
     }
 }
 
+// Writes bytes to standard output with the system's own write call, in a loop, and counts
+// what the system took. No buffered stream is involved, so nothing depends on a flush when
+// the process ends. Returns the number of bytes the system accepted.
+std::size_t write_all_to_standard_output(const char* data, std::size_t size) {
+    std::size_t done = 0;
+    while (done < size) {
+#if defined(_WIN32)
+        const std::size_t step = size - done < (1u << 20) ? size - done : (1u << 20);
+        const int n = _write(1, data + done, static_cast<unsigned int>(step));
+        if (n <= 0) {
+            break;
+        }
+#else
+        const ssize_t n = ::write(1, data + done, size - done);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+#endif
+        done += static_cast<std::size_t>(n);
+    }
+    return done;
+}
+
+#if defined(MIE_WORKER_TEST_HOOKS)
+// TEST BUILD ONLY: how the answer is to be spoiled ("answer-none", "answer-half",
+// "answer-extra"); empty = not at all. Set from the job's test_fault.
+std::string g_answer_fault;
+#endif
+
 bool write_answer(const json& body) {
     mie::channel::Message message;
     message.id = 1;
     message.type = mie::channel::MessageType::Response;
     message.op = mie::worker::kAnswerOp;
     message.body = body;
-    const std::string frame = mie::channel::encode_frame(message);
+    std::string frame = mie::channel::encode_frame(message);
     if (frame.empty()) {
         return false;
     }
-    const bool written = std::fwrite(frame.data(), 1, frame.size(), stdout) == frame.size();
-    const bool flushed = std::fflush(stdout) == 0;
-    // For the parent's log when an answer does not arrive whole: what this side handed to the system.
-    say("answer frame of " + std::to_string(frame.size()) + " bytes: written " + (written ? "yes" : "NO") +
-        ", flushed " + (flushed ? "yes" : "NO"));
-    return flushed && written;
+    std::size_t to_write = frame.size();
+#if defined(MIE_WORKER_TEST_HOOKS)
+    // The worker then ends with exit code 0, as a worker would whose answer was lost on the way.
+    if (g_answer_fault == "answer-none") {
+        to_write = 0;
+    } else if (g_answer_fault == "answer-half") {
+        to_write = frame.size() / 2;
+    } else if (g_answer_fault == "answer-extra") {
+        frame += "extra bytes after the frame";
+        to_write = frame.size();
+    }
+#endif
+    const std::size_t written = write_all_to_standard_output(frame.data(), to_write);
+    // For the parent's log when an answer does not arrive whole: what the system took from this side.
+    say("answer frame of " + std::to_string(frame.size()) + " bytes: the system took " + std::to_string(written) +
+        " of " + std::to_string(to_write));
+    return written == to_write;
 }
 
 #if defined(MIE_WORKER_TEST_HOOKS)
@@ -205,7 +250,11 @@ int run(int argc, char** argv) {
 
     if (!job.test_fault.empty()) {
 #if defined(MIE_WORKER_TEST_HOOKS)
-        test_fault(job.test_fault);
+        if (job.test_fault.rfind("answer-", 0) == 0) {
+            g_answer_fault = job.test_fault;  // takes effect when the answer is written
+        } else {
+            test_fault(job.test_fault);
+        }
 #else
         say("the job carries a test switch; this build has no test hooks");
         return mie::worker::kExitTestSwitch;
@@ -273,6 +322,13 @@ int run(int argc, char** argv) {
 
     const Clock::time_point scan_start = Clock::now();
     mie::ScanResult result = engine.scan_open(*file, job.display_name);
+#if defined(MIE_WORKER_TEST_HOOKS)
+    if (g_answer_fault == "answer-wrong-file" && result.state != mie::ScanState::NotScanned) {
+        // TEST BUILD ONLY: a well-formed, consistent answer that speaks about another file.
+        result.hashes.sha256 = std::string(64, '0');
+        result.subject.sha256 = result.hashes.sha256;
+    }
+#endif
     body["kind"] = "scan";
     body["scan_ms"] = milliseconds_since(scan_start);
     std::string why_inconsistent;

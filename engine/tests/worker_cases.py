@@ -245,7 +245,11 @@ def main():
                   got.get('a.txt') == base.get('a.txt') and got.get('c.txt') == base.get('c.txt'))
             check(ok, 'B: a worker that %s: b.txt is %r with reason %r (worker end %r); a.txt and c.txt are as without '
                       'the fault: %s; the parent ended normally (exit %d)' % (
-                          {'spin': 'never ends', 'crash': 'dies', 'allocate': 'exhausts its memory'}[kind],
+                          {'spin': 'never ends', 'crash': 'dies', 'allocate': 'exhausts its memory',
+                           'answer-none': 'exits 0 having written NOTHING',
+                           'answer-half': 'exits 0 having written HALF of its answer frame',
+                           'answer-extra': 'exits 0 having written a whole frame FOLLOWED BY EXTRA BYTES',
+                           'answer-wrong-file': 'exits 0 with a well-formed answer about ANOTHER FILE (other hash)'}[kind],
                           b.get('verdict'), reason.get('reason'), job.get('end'),
                           got.get('a.txt') == base.get('a.txt') and got.get('c.txt') == base.get('c.txt'), code))
 
@@ -253,6 +257,12 @@ def main():
         # (under a sanitizer build a crash may be an ordinary exit of the sanitizer's own)
         fault_case('crash', ['crashed', 'ended without an answer'], 60, 600)
         fault_case('allocate', ['memory limit'], 300, 1200)
+        # "Exit code 0 with an answer that is not exactly one whole frame about the handed-over file"
+        # is a failed worker (reviewer, B-3631): each form has its own case and its own reason.
+        fault_case('answer-none', ['the answer is cut short (0 bytes received'], 60, 600)
+        fault_case('answer-half', ['the answer is cut short ('], 60, 600)
+        fault_case('answer-extra', ['bytes follow the answer'], 60, 600)
+        fault_case('answer-wrong-file', ['names another file than the one handed over'], 60, 600)
 
         # ---------------------------------------------------------------- part C
         table = os.path.join(tmp, 'shipped-fault.jsonl')
