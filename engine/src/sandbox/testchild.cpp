@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -228,6 +229,60 @@ void try_descriptor_change(Line& line, const std::string& action) {
 }
 #endif
 
+// Lists what this process holds that it got from its parent.
+//   Linux: every open descriptor (asked one by one with fcntl F_GETFD, the only way left once
+//     paths cannot be opened), and how the handed-over file is open.
+//   Windows: every handle value that is valid AND marked inheritable. A handle a process
+//     inherits keeps that mark; the handles Windows itself opens in every new process, and the
+//     ones the program opens, do not have it. So "inheritable" = "came from the parent".
+// Not shown: numbers above the scanned range (printed as "scanned").
+void list_inherited(Line& line) {
+    std::string list;
+#if defined(_WIN32)
+    constexpr std::uintptr_t kHighest = 0x40000;  // handle values are multiples of 4
+    long long valid = 0;
+    for (std::uintptr_t value = 4; value <= kHighest; value += 4) {
+        DWORD flags = 0;
+        if (!::GetHandleInformation(reinterpret_cast<HANDLE>(value), &flags)) {
+            continue;
+        }
+        ++valid;
+        if ((flags & HANDLE_FLAG_INHERIT) != 0) {
+            list += (list.empty() ? "" : ",") + std::to_string(value);
+        }
+    }
+    line.raw("inheritable_handles", "[" + list + "]");
+    line.number("valid_handles", valid);
+    line.number("scanned", static_cast<long long>(kHighest));
+    const auto standard = [](DWORD which) {
+        return std::to_string(reinterpret_cast<std::uintptr_t>(::GetStdHandle(which)));
+    };
+    line.raw("standard_handles", "[" + standard(STD_INPUT_HANDLE) + "," + standard(STD_OUTPUT_HANDLE) + "," +
+                                     standard(STD_ERROR_HANDLE) + "]");
+    line.number("file_handle", inherited_number());
+#else
+    long highest = 1L << 20;
+    struct rlimit limit {};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_max != RLIM_INFINITY &&
+        limit.rlim_max < static_cast<rlim_t>(highest)) {
+        highest = static_cast<long>(limit.rlim_max);
+    }
+    for (long fd = 0; fd < highest; ++fd) {
+        if (::fcntl(static_cast<int>(fd), F_GETFD) != -1) {
+            list += (list.empty() ? "" : ",") + std::to_string(fd);
+        }
+    }
+    line.raw("open_descriptors", "[" + list + "]");
+    line.number("scanned", highest);
+    const long long file = inherited_number();
+    line.number("file_descriptor", file);
+    const int mode = file >= 0 ? ::fcntl(static_cast<int>(file), F_GETFL) : -1;
+    line.text("file_access", mode == -1 ? "unknown"
+                             : (mode & O_ACCMODE) == O_RDONLY ? "read-only"
+                             : (mode & O_ACCMODE) == O_WRONLY ? "write-only" : "read-write");
+#endif
+}
+
 int allocate_until_refused(Line& line) {
     // 16 MiB at a time, every page written so that it is really used, up to 4 GiB.
     constexpr std::size_t kChunk = 16u * 1024 * 1024;
@@ -263,6 +318,10 @@ int main(int argc, char** argv) {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    // The very first thing: one line on standard error, so that a parent that gets nothing
+    // else knows whether main() was reached at all.
+    std::fputs("mie-sandbox-testchild: main reached\n", stderr);
+    std::fflush(stderr);
     const std::string action = argc > 1 ? argv[1] : "";
     Line line;
     line.text("action", action);
@@ -313,6 +372,10 @@ int main(int argc, char** argv) {
         line.flag("opened", file != nullptr);
         line.number("error", file != nullptr ? 0 : errno);
         if (file != nullptr) {
+            char first = 0;
+            if (action == "open-path") {
+                line.number("bytes_read", static_cast<long long>(std::fread(&first, 1, 1, file)));
+            }
             std::fclose(file);
         }
     } else if (action == "connect") {
@@ -336,6 +399,8 @@ int main(int argc, char** argv) {
 #endif
     } else if (action == "spawn") {
         try_spawn(line);
+    } else if (action == "handles") {
+        list_inherited(line);
     } else if (action == "write-handle") {
         try_write_handle(line);
     } else if (action == "fchmod-handle" || action == "ftruncate-handle" || action == "unlisted-call") {

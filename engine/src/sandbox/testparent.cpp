@@ -7,6 +7,7 @@
 //       runs CHILD ACTION [arguments] through mie::sandbox::run_confined and prints the
 //       ChildResult as one line of ASCII JSON.
 // Options: --unconfined, --allow-weaker, --break (test hook: the confinement fails),
+//   --no-mitigations (test hook, Windows: container without the policies),
 //   --wall SECONDS, --memory BYTES, --file PATH (opened here, handed over as a handle),
 //   --stdin TEXT, --max-output BYTES, --then-echo (after the run, a second run of "echo" in
 //   the same parent process: shows the parent carries on).
@@ -85,6 +86,8 @@ int main(int argc, char** argv) {
             options.allow_weaker = true;
         } else if (argument == "--break") {
             options.test_break_confinement = true;
+        } else if (argument == "--no-mitigations") {
+            options.test_without_mitigations = true;
         } else if (argument == "--then-echo") {
             then_echo = true;
         } else if (argument == "--wall" && has_value) {

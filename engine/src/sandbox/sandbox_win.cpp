@@ -105,18 +105,9 @@ std::wstring environment_value(const wchar_t* name) {
     return std::wstring(buffer.data(), n);
 }
 
-// The variables the child starts with (without the MIE_* ones, added by the caller).
-//
-// First CI run: CreateProcessW for the AppContainer failed with error 203 ("environment
-// variable not found") when the block held only SystemRoot, windir and SystemDrive, while the
-// same block started an ordinary process. Creating an AppContainer process makes Windows
-// rewrite some variables of the block for the container (the local application data and
-// temporary folders); a block without them is refused. So the child now gets the user's
-// DEFAULT environment, as Windows builds it at logon (CreateEnvironmentBlock, not inherited
-// from this process: nothing the service's own environment holds is passed on). If that
-// cannot be had, a fixed list of names is copied from this process instead. `source` says
-// which, and it is part of ChildResult::confinement.
-std::vector<std::wstring> base_environment(std::string& source) {
+// The user's default environment as Windows builds it at logon (not this process's own).
+// Used only to look up a name that this process does not have.
+std::vector<std::wstring> default_environment() {
     std::vector<std::wstring> variables;
     HANDLE token = nullptr;
     if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, &token)) {
@@ -125,30 +116,78 @@ std::vector<std::wstring> base_environment(std::string& source) {
             for (const wchar_t* entry = static_cast<const wchar_t*>(block); *entry != L'\0';) {
                 const std::wstring text(entry);
                 entry += text.size() + 1;
-                if (text[0] != L'=') {
-                    variables.push_back(text);
-                }
+                variables.push_back(text);
             }
             ::DestroyEnvironmentBlock(block);
         }
         ::CloseHandle(token);
     }
-    if (!variables.empty()) {
-        source = "user default environment";
-        return variables;
-    }
+    return variables;
+}
+
+// The variables the child starts with (without the MIE_* ones, added by the caller): an
+// ALLOW LIST of names. Nothing else of the service's or the user's environment is passed.
+//
+// History: with only SystemRoot, windir and SystemDrive, CreateProcessW for the AppContainer
+// failed with error 203 ("environment variable not found"); with the user's whole default
+// environment it worked, but that can hold secrets (review finding). The list below is the
+// first three plus the five names Windows rewrites for a container, plus a PATH of the system
+// folders only. NOT KNOWN: whether these five are the ones whose absence gave error 203; if
+// 203 comes back the error text lists the names passed.
+std::vector<std::wstring> child_environment() {
+    std::vector<std::wstring> variables;
+    std::vector<std::wstring> defaults;
+    bool defaults_read = false;
     for (const wchar_t* name :
-         {L"ALLUSERSPROFILE", L"APPDATA", L"CommonProgramFiles", L"COMPUTERNAME", L"HOMEDRIVE", L"HOMEPATH",
-          L"LOCALAPPDATA", L"NUMBER_OF_PROCESSORS", L"OS", L"PROCESSOR_ARCHITECTURE", L"ProgramData",
-          L"ProgramFiles", L"PUBLIC", L"SystemDrive", L"SystemRoot", L"TEMP", L"TMP", L"USERDOMAIN", L"USERNAME",
-          L"USERPROFILE", L"windir"}) {
-        const std::wstring value = environment_value(name);
+         {L"SystemRoot", L"windir", L"SystemDrive", L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE", L"TEMP", L"TMP"}) {
+        std::wstring value = environment_value(name);
+        if (value.empty()) {
+            if (!defaults_read) {
+                defaults = default_environment();
+                defaults_read = true;
+            }
+            const std::wstring prefix = std::wstring(name) + L"=";
+            for (const std::wstring& entry : defaults) {
+                if (entry.size() > prefix.size() && ::_wcsnicmp(entry.c_str(), prefix.c_str(), prefix.size()) == 0) {
+                    value = entry.substr(prefix.size());
+                    break;
+                }
+            }
+        }
         if (!value.empty()) {
             variables.push_back(std::wstring(name) + L"=" + value);
         }
     }
-    source = "fixed list of variables copied from the parent";
+    const std::wstring root = environment_value(L"SystemRoot");
+    if (!root.empty()) {
+        variables.push_back(L"PATH=" + root + L"\\System32;" + root);  // the system folders only
+    }
     return variables;
+}
+
+// A few exit codes of a process that could not start or crashed, in words.
+std::string status_words(DWORD code) {
+    switch (code) {
+        case 0xC0000005u: return "access violation";
+        case 0xC0000017u: return "no memory";
+        case 0xC0000022u: return "access denied (a program file or library could not be read)";
+        case 0xC000007Bu: return "invalid image format";
+        case 0xC00000FDu: return "stack overflow";
+        case 0xC0000135u: return "a library (DLL) was not found";
+        case 0xC0000139u: return "an entry point was not found in a library";
+        case 0xC0000142u: return "a library failed to initialise";
+        case 0xC0000409u: return "fast fail / stack buffer overrun";
+        case 0xC0000428u: return "image refused by a signature or image-load policy";
+        case 259u: return "still running";
+        default: return "";
+    }
+}
+
+std::string hex_code(DWORD code) {
+    char text[32];
+    std::snprintf(text, sizeof text, "0x%08lX", static_cast<unsigned long>(code));
+    const std::string words = status_words(code);
+    return words.empty() ? std::string(text) : std::string(text) + " (" + words + ")";
 }
 
 bool starts_with_mie(const std::wstring& variable) {
@@ -191,6 +230,7 @@ PSID container_sid(std::string& how, std::string& error) {
 struct PipeReader {
     HANDLE handle = nullptr;
     std::string text;
+    std::atomic<std::size_t> received{0};  // every byte that arrived, kept or not
     std::size_t limit = 0;
     bool kill_on_overflow = false;
     HANDLE job = nullptr;
@@ -203,6 +243,7 @@ struct PipeReader {
             if (!::ReadFile(handle, buffer, static_cast<DWORD>(sizeof buffer), &got, nullptr) || got == 0) {
                 return;  // the pipe is broken: every write end is closed (the child is gone)
             }
+            received += got;
             const std::size_t room = text.size() < limit ? limit - text.size() : 0;
             const std::size_t take = got < room ? got : room;
             text.append(buffer, take);
@@ -475,6 +516,12 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         }
         container_text += " WEAKER: built without:" + not_built;
     }
+    // Test hook: start in the container WITHOUT the policies, to tell whether a policy is
+    // what keeps a child from starting. The result says WEAKER.
+    const bool with_policies = in_container && !options.test_without_mitigations;
+    if (in_container && !with_policies) {
+        container_text += " WEAKER: test hook: no mitigation or child-process policy";
+    }
     const DWORD attribute_count = 4;  // the most that are ever set below
     SIZE_T attribute_size = 0;
     ::InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &attribute_size);
@@ -501,13 +548,14 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
                                          sizeof capabilities, nullptr, nullptr)) {
             return fail_start(win_error("UpdateProcThreadAttribute (AppContainer)", ::GetLastError()));
         }
-        if (mitigation != 0 &&
+        if (with_policies && mitigation != 0 &&
             !::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation,
                                          sizeof mitigation, nullptr, nullptr)) {
             return fail_start(win_error("UpdateProcThreadAttribute (mitigation policy)", ::GetLastError()));
         }
 #if defined(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY) && defined(PROCESS_CREATION_CHILD_PROCESS_RESTRICTED)
-        if (!::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy,
+        if (with_policies &&
+            !::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy,
                                          sizeof child_policy, nullptr, nullptr)) {
             return fail_start(win_error("UpdateProcThreadAttribute (child-process policy)", ::GetLastError()));
         }
@@ -520,8 +568,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     for (const std::string& argument : arguments) {
         append_quoted(command_line, widen(argument));
     }
-    std::string environment_source;
-    std::vector<std::wstring> variables = base_environment(environment_source);
+    std::vector<std::wstring> variables = child_environment();
     // No MIE_* variable comes from anywhere but the lines below.
     variables.erase(std::remove_if(variables.begin(), variables.end(), starts_with_mie), variables.end());
     if (options.confine) {
@@ -537,7 +584,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     std::sort(variables.begin(), variables.end(), [](const std::wstring& a, const std::wstring& b) {
         return ::_wcsicmp(a.c_str(), b.c_str()) < 0;
     });
-    std::string variable_names;  // names only, for the error text; never the values
+    std::string variable_names;  // names only, for the result text; never the values
     for (const std::wstring& variable : variables) {
         variable_names += (variable_names.empty() ? "" : " ") + narrow(variable.substr(0, variable.find(L'=')));
     }
@@ -558,14 +605,30 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
 
     // Created SUSPENDED: the process does not run one instruction before it is in the job.
     const std::wstring program_text = program.wstring();
+    // No error dialogs, ever. A process that cannot start (a library it cannot read, an image
+    // a policy refuses) otherwise makes Windows show a dialog and WAIT for a click that never
+    // comes in a service; the child would sit until the time limit (second CI run: every
+    // confined child was killed at the limit having used almost no memory). The error mode is
+    // inherited by the child from this process, so it is set here, for the whole service
+    // process, and left set. With it a failed start ENDS the child with a status code.
+    ::SetErrorMode(::GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    // The child's current folder: the system folder, which every container can read. (It
+    // would otherwise be the service's current folder, which the container may not open.)
+    std::vector<wchar_t> system_folder(MAX_PATH + 1);
+    const UINT folder_length = ::GetSystemDirectoryW(system_folder.data(), static_cast<UINT>(system_folder.size()));
+    const wchar_t* current_folder =
+        folder_length > 0 && folder_length < system_folder.size() ? system_folder.data() : nullptr;
+    // DETACHED_PROCESS: no console at all. The child talks through its three pipes; a console
+    // would need a console host process, which the one-process job and the child-process
+    // policy are there to forbid.
     if (!::CreateProcessW(program_text.c_str(), command_line.data(), nullptr, nullptr, TRUE,
                           CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
-                              CREATE_NO_WINDOW,
-                          environment.data(), nullptr, &startup.StartupInfo, &process)) {
+                              DETACHED_PROCESS,
+                          environment.data(), current_folder, &startup.StartupInfo, &process)) {
         const DWORD code = ::GetLastError();
         return fail_start(win_error("CreateProcess", code) +
                           (code == ERROR_ENVVAR_NOT_FOUND
-                               ? " (environment: " + environment_source + "; names passed: " + variable_names + ")"
+                               ? " (names of the variables passed: " + variable_names + ")"
                                : "") +
                           (code == ERROR_ACCESS_DENIED && in_container
                                ? " (inside an AppContainer the program file and its folder must be readable by"
@@ -583,7 +646,14 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     close_handle(child_out);
     close_handle(child_err);
     close_handle(file_copy);
-    ::ResumeThread(process.hThread);
+    // ResumeThread returns the thread's suspend count before the call: 1 for a thread created
+    // suspended and now running, (DWORD)-1 on failure.
+    const DWORD resumed = ::ResumeThread(process.hThread);
+    if (resumed == static_cast<DWORD>(-1)) {
+        const DWORD code = ::GetLastError();
+        ::TerminateProcess(process.hProcess, 1);
+        return fail_start(win_error("ResumeThread", code));
+    }
 
     // ---- run: three threads move the bytes, this thread watches the clock ------------------
     PipeReader out_reader;
@@ -596,9 +666,11 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     err_reader.limit = 16 * 1024;
     std::thread out_thread([&] { out_reader.run(); });
     std::thread err_thread([&] { err_reader.run(); });
+    std::atomic<std::size_t> input_written{0};
     std::thread in_thread([&] {
         std::size_t written = 0;
         while (written < input.size()) {
+            input_written = written;
             const std::size_t part = std::min<std::size_t>(input.size() - written, 64 * 1024);
             DWORD done = 0;
             if (!::WriteFile(parent_in, input.data() + written, static_cast<DWORD>(part), &done, nullptr)) {
@@ -606,13 +678,32 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
             }
             written += done;
         }
+        input_written = written;
         close_handle(parent_in);  // the child sees the end of its input
     });
 
     const DWORD wall_ms = static_cast<DWORD>(limits.wall_seconds > 0 ? limits.wall_seconds : 0) * 1000u;
     bool killed_time = false;
+    std::string at_limit;  // what the child looked like when the time limit came
     if (::WaitForSingleObject(process.hProcess, wall_ms) != WAIT_OBJECT_0) {
         killed_time = true;
+        DWORD code_then = 0;
+        ::GetExitCodeProcess(process.hProcess, &code_then);
+        // ResumeThread again only to READ the suspend count (0 = the thread was running or
+        // waiting, 1 or more = it was still suspended); the child is killed on the next line.
+        const DWORD suspend_count = ::ResumeThread(process.hThread);
+        FILETIME created{}, ended{}, kernel{}, user{};
+        unsigned long long cpu_ms = 0;
+        if (::GetProcessTimes(process.hProcess, &created, &ended, &kernel, &user)) {
+            const unsigned long long ticks =
+                ((static_cast<unsigned long long>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+                ((static_cast<unsigned long long>(user.dwHighDateTime) << 32) | user.dwLowDateTime);
+            cpu_ms = ticks / 10000;
+        }
+        at_limit = "at the limit: process state " + hex_code(code_then) + ", main thread suspend count " +
+                   (suspend_count == static_cast<DWORD>(-1) ? std::string("unreadable")
+                                                            : std::to_string(suspend_count)) +
+                   ", processor time used " + std::to_string(cpu_ms) + " ms; ";
         ::TerminateJobObject(job, 1);  // kills every process of the job at once
         ::WaitForSingleObject(process.hProcess, 5000);
     }
@@ -647,10 +738,10 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     }
 
     result.output = std::move(out_reader.text);
-    result.confinement = container_text + (in_container ? "+mitigations (" + mitigation_text + " )" : "") +
+    result.confinement = container_text + (with_policies ? "+mitigations (" + mitigation_text + " )" : "") +
                          "+job (memory limit " + std::to_string(limits.memory_bytes) +
-                         " bytes, one process, kill on close, UI restrictions)+handle list; environment: " +
-                         environment_source;
+                         " bytes, one process, kill on close, UI restrictions)+handle list; environment (names): " +
+                         variable_names;
     if (!err_reader.text.empty()) {
         result.detail = "standard error: " + err_reader.text;
     }
@@ -659,11 +750,18 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     };
     result.exit_code = static_cast<int>(exit_code);
     const bool overflow = out_reader.overflow.load();
+    // What the parent saw, for a child that did not end by itself in the ordinary way.
+    const std::string diagnosis =
+        "diagnosis: ResumeThread at start returned " + std::to_string(resumed) + " (1 = was suspended, now runs); " +
+        at_limit + "exit code " + hex_code(exit_code) + "; bytes received from standard output " +
+        std::to_string(out_reader.received.load()) + ", from standard error " +
+        std::to_string(err_reader.received.load()) + "; bytes of input written " +
+        std::to_string(input_written.load()) + " of " + std::to_string(input.size());
     cleanup();
 
     if (killed_time) {
         result.end = ChildResult::End::KilledByTimeLimit;
-        with_detail("killed at the time limit of " + std::to_string(limits.wall_seconds) + " seconds");
+        with_detail("killed at the time limit of " + std::to_string(limits.wall_seconds) + " seconds; " + diagnosis);
     } else if (overflow) {
         result.end = ChildResult::End::Crashed;
         with_detail("killed: more output than the allowed " + std::to_string(max_output_bytes) + " bytes");
@@ -673,7 +771,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
                                    : "the child ran out of its memory limit (an allocation was refused)");
     } else if ((exit_code & 0xC0000000u) == 0xC0000000u) {
         result.end = ChildResult::End::Crashed;  // an NTSTATUS error code: unhandled exception
-        with_detail("ended by an unhandled exception, code " + std::to_string(exit_code));
+        with_detail("could not start or ended by an unhandled exception; " + diagnosis);
     } else {
         result.end = ChildResult::End::Exited;
     }

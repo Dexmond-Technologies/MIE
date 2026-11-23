@@ -52,6 +52,10 @@ struct RunOptions {
     // true: behave as if applying the confinement had failed. Only for the test that shows
     // the result is then StartFailed and not a silent unconfined run.
     bool test_break_confinement = false;
+    // true (Windows): start in the AppContainer but without the mitigation and child-process
+    // policies, to tell whether a policy keeps a child from starting. The result says WEAKER.
+    // Only for tests.
+    bool test_without_mitigations = false;
 };
 
 struct ChildResult {

@@ -121,6 +121,20 @@ jobs:
           MIE_SET_S_REFERENCE: ${{ runner.temp }}/set-s-reference
           MIE_ARCHIVE_REFERENCE_IN: ${{ runner.temp }}/set-s-reference/archive.reference.jsonl
         run: ctest --test-dir build -C Release --verbose --timeout 3600
+      # The system calls the confined test child really makes, against the shipped allow list.
+      # (The reviewer's ruling asks for this on the REAL worker with OpenSSL and YARA; that
+      # program does not exist yet, so this step does not yet satisfy the ruling.)
+      - name: Sandbox allow list against a trace (test child)
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y strace
+          head -c 65536 /dev/urandom > "$RUNNER_TEMP/trace-sample.bin"
+          python3 engine/tools/sandbox_trace_check.py \
+            --source engine/src/sandbox/sandbox_posix.cpp \
+            --keep "$RUNNER_TEMP/sandbox-trace.txt" -- \
+            build/mie-sandbox-testparent build/mie-sandbox-testchild \
+            --file "$RUNNER_TEMP/trace-sample.bin" -- read-handle
 
   sanitize:
     runs-on: ubuntu-latest
