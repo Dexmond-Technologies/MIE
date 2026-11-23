@@ -2,7 +2,8 @@
 """Parity harness, reference side: runs the PYTHON reference engine of this checkout over
 a folder of files and writes one JSON line per file.
 
-    run_reference.py --corpus DIR --out FILE.jsonl [--no-reputation]
+    run_reference.py --corpus DIR --out FILE.jsonl [--no-reputation] [--reputation FILE]
+                     [--details FILE.jsonl]
     run_reference.py --describe          (prints the header record only: versions, rule hashes)
 
 Output format (also the format the C++ engine will write for the comparison):
@@ -105,7 +106,7 @@ def header(rules_dir, options):
     return record
 
 
-def scan_corpus(corpus, out_path, use_reputation):
+def scan_corpus(corpus, out_path, use_reputation, reputation_file=None, details_path=None):
     sys.path.insert(0, REPO)
     from dexmond_mie.core import Engine  # imported late: --describe must work without it
 
@@ -113,7 +114,7 @@ def scan_corpus(corpus, out_path, use_reputation):
         rules_copy = os.path.join(work, 'rules')
         shutil.copytree(os.path.join(REPO, 'rules'), rules_copy)
         rep_copy = os.path.join(work, 'reputation.json')
-        shutil.copy(os.path.join(REPO, 'data', 'reputation.json'), rep_copy)
+        shutil.copy(reputation_file or os.path.join(REPO, 'data', 'reputation.json'), rep_copy)
         engine = Engine(rules_dir=rules_copy, reputation_db=rep_copy, use_reputation=use_reputation,
                         auto_evolution=False)
 
@@ -125,7 +126,10 @@ def scan_corpus(corpus, out_path, use_reputation):
         files.sort(key=lambda p: os.path.relpath(p, corpus).replace(os.sep, '/'))
 
         with open(out_path, 'w', encoding='utf-8', newline='\n') as out:
-            head = header(rules_copy, {'use_reputation': use_reputation})
+            options = {'use_reputation': use_reputation,
+                       'reputation_sha256': sha256_of(rep_copy)}
+            head = header(rules_copy, options)
+            details = open(details_path, 'w', encoding='utf-8', newline='\n') if details_path else None
             head['yara_status'] = getattr(engine.yara_engine, 'status', None)
             out.write(json.dumps(head, sort_keys=True) + '\n')
             for path in files:
@@ -149,7 +153,19 @@ def scan_corpus(corpus, out_path, use_reputation):
                     record['score'] = result.get('score')
                     record['verdict'] = result.get('verdict')
                     record['categories'] = sorted(f.get('category', '') for f in result.get('findings', []))
+                    if details is not None:
+                        # the reference's own findings in full, for the coverage check of set S
+                        details.write(json.dumps({
+                            'path': rel, 'score': record['score'], 'verdict': record['verdict'],
+                            'findings': result.get('findings', []),
+                            'yara': result.get('yara', []),
+                            'archive_not_unpacked': result.get('details', {}).get('archive_not_unpacked'),
+                            'archive_coverage': (result.get('details', {}).get('archive') or {}).get('coverage'),
+                            'partial_scan': result.get('details', {}).get('partial_scan'),
+                        }, sort_keys=True, default=str) + '\n')
                 out.write(json.dumps(record, sort_keys=True) + '\n')
+            if details is not None:
+                details.close()
     return len(files)
 
 
@@ -159,6 +175,9 @@ def main():
     parser.add_argument('--out')
     parser.add_argument('--no-reputation', action='store_true',
                         help='do not consult the known-hash list (the reference\'s measuring mode)')
+    parser.add_argument('--reputation', help='reputation list to use instead of data/reputation.json '
+                                             '(set S brings its own; a copy is used, never the file itself)')
+    parser.add_argument('--details', help='also write every finding of every file (JSON lines)')
     parser.add_argument('--describe', action='store_true', help='print the header record and stop')
     args = parser.parse_args()
 
@@ -167,7 +186,8 @@ def main():
         return 0
     if not args.corpus or not args.out:
         parser.error('--corpus and --out are required')
-    count = scan_corpus(os.path.abspath(args.corpus), args.out, not args.no_reputation)
+    count = scan_corpus(os.path.abspath(args.corpus), args.out, not args.no_reputation,
+                        args.reputation, args.details)
     print(f'run_reference: {count} files, results in {args.out}')
     return 0
 

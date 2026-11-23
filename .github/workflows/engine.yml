@@ -6,6 +6,8 @@
 #   a manual run takes the number of seconds as input (3600 = the reviewer's one-hour line).
 # - parity-tools: the parity harness's own tests, the scoring data file against the Python
 #   reference source, and the record of the YARA library version.
+# - set-s: builds parity set S (generated, harmless files), runs the Python reference over it
+#   and prints which rows of the scoring table the set exercises, and the set's manifest.
 # - vuln-check: the pinned third-party libraries against the OSV database.
 # No release, no tag, no installer, no artefact is published by this workflow.
 # No EICAR file and no malware is used here.
@@ -187,6 +189,33 @@ jobs:
         run: python engine/tools/parity/run_reference.py --describe
       - name: Tests of the parity harness
         run: python -m pytest -q -rs engine/tools/parity
+
+  set-s:
+    # Parity set S: harmless generated files that make the Python reference use its scoring
+    # table. Builds the set, runs the reference over it, prints what every file triggers and
+    # the coverage of the table, and prints the manifest. No malware, no EICAR file.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install the reference's engine deps (pinned)
+        run: python -m pip install $ENGINE_DEPS
+      - name: Generate set S
+        run: python engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/set_s"
+      - name: Run the Python reference over set S (with the set's own reputation list)
+        run: >
+          python engine/tools/parity/run_reference.py --corpus "$RUNNER_TEMP/set_s/files"
+          --out "$RUNNER_TEMP/set_s/reference.jsonl" --details "$RUNNER_TEMP/set_s/reference.details.jsonl"
+          --reputation "$RUNNER_TEMP/set_s/set_s.reputation.json"
+      - name: Coverage of the scoring table, and the manifest
+        run: >
+          python engine/tools/parity/set_s_coverage.py --results "$RUNNER_TEMP/set_s/reference.jsonl"
+          --details "$RUNNER_TEMP/set_s/reference.details.jsonl" --intent "$RUNNER_TEMP/set_s/set_s.intent.json"
 
   vuln-check:
     runs-on: ubuntu-latest
