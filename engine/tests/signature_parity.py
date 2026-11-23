@@ -253,7 +253,7 @@ def page_hash_entries(pe, pairs):
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
                       wrong_stamp_digest=False, page_hashes=None, nested=None, leaf_last=False,
-                      stamp_before=(), stamp_after=()):
+                      stamp_before=(), stamp_after=(), stamp_digest='sha256'):
     """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`."""
     spc = spc_indirect(pe, digest, page_hashes)
     spc_contents = spc[len(spc) - len(seq_contents(spc)):]
@@ -262,7 +262,7 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
              attribute(OID_MESSAGE_DIGEST, der(0x04, content_digest))]
     signature, fields = signer_info(leaf, digest, attrs)
     certs = [c.der for c in extra_certs] + [leaf.der] if leaf_last else [leaf.der] + [c.der for c in extra_certs]
-    stamped = hashlib.sha256(b'wrong' if wrong_stamp_digest else signature).digest()
+    stamped = hashlib.new(stamp_digest, b'wrong' if wrong_stamp_digest else signature).digest()
     unsigned = []
     if nested:
         unsigned.append(attribute(OID_NESTED_SIGNATURE, *nested))
@@ -271,18 +271,18 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
         counter_attrs = [attribute(OID_CONTENT_TYPE, oid(OID_DATA)),
                          attribute(OID_SIGNING_TIME, der(0x17, when)),
                          attribute(OID_MESSAGE_DIGEST, der(0x04, stamped))]
-        _, counter_fields = signer_info(tsa, 'sha256', counter_attrs)
+        _, counter_fields = signer_info(tsa, stamp_digest, counter_attrs)
         unsigned.append(attribute(OID_COUNTER_SIGNATURE, seq(*counter_fields)))
         certs.extend(c.der for c in (*stamp_before, tsa, *stamp_after))
     elif timestamp == 'rfc3161':
         when = stamp_time.strftime('%Y%m%d%H%M%SZ').encode()
-        tst = seq(der_int(1), oid('1.2.3.4'), seq(alg_id('sha256'), der(0x04, stamped)), der_int(7),
+        tst = seq(der_int(1), oid('1.2.3.4'), seq(alg_id(stamp_digest), der(0x04, stamped)), der_int(7),
                   der(0x18, when))
         token_attrs = [attribute(OID_CONTENT_TYPE, oid(OID_TST_INFO)),
-                       attribute(OID_MESSAGE_DIGEST, der(0x04, hashlib.sha256(tst).digest()))]
-        _, token_fields = signer_info(tsa, 'sha256', token_attrs)
+                       attribute(OID_MESSAGE_DIGEST, der(0x04, hashlib.new(stamp_digest, tst).digest()))]
+        _, token_fields = signer_info(tsa, stamp_digest, token_attrs)
         token = seq(oid(OID_SIGNED_DATA), der(0xA0, seq(
-            der_int(3), der(0x31, alg_id('sha256')), seq(oid(OID_TST_INFO), der(0xA0, der(0x04, tst))),
+            der_int(3), der(0x31, alg_id(stamp_digest)), seq(oid(OID_TST_INFO), der(0xA0, der(0x04, tst))),
             der(0xA0, b''.join(c.der for c in (*stamp_before, tsa, *stamp_after))), der(0x31, seq(*token_fields)))))
         unsigned.append(attribute(OID_MS_TIMESTAMP, token))
     if unsigned:
@@ -511,6 +511,11 @@ def build_cases():
     extra('signer_ecdsa_p256', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP256R1())), [inter]))
     extra('signer_ecdsa_p384', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP384R1())), [inter]))
     extra('digest_md5', lambda: signed(pe, leaf, [inter], digest='md5'))
+    # an MD5 time-stamp over an expired leaf: the reference trusts it; the shipped setting must not (D-21)
+    extra('stamp_md5_rfc3161', lambda: signed(pe, expired, [inter], timestamp='rfc3161', tsa=tsa, stamp_time=mid,
+                                              stamp_digest='md5'))
+    extra('stamp_md5_authenticode', lambda: signed(pe, expired, [inter], timestamp='authenticode', tsa=tsa,
+                                                   stamp_time=mid, stamp_digest='md5'))
     inner = authenticode_blob(pe, leaf, [inter], digest='sha1')
     extra('nested_one_level', lambda: signed(pe, leaf, [inter], nested=[inner]))
     extra('nested_two_levels', lambda: signed(
@@ -989,9 +994,10 @@ def main():
             return cap and (not with_second_check or line.get('second_check') is True)
 
         shipped = probe_mode('shipped')
-        single = {d: probe_mode('strict-' + d) for d in ('d13', 'd17', 'd19', 'd20')}
+        single = {d: probe_mode('strict-' + d) for d in ('d13', 'd17', 'd19', 'd20', 'd21', 'd22')}
         names_of = {'d13': 'D-13 every entry verified', 'd17': 'D-17 strict fields', 'd19': 'D-19 verified certificate',
-                    'd20': 'D-20 strict lengths'}
+                    'd20': 'D-20 strict lengths', 'd21': 'D-21 MD5 refused',
+                    'd22': 'D-22 well-formed page hashes only'}
         print('--- every named case in the shipped setting (strict switches, second check on) ---')
         kept, lost = 0, {}
         for name in sorted(named):
@@ -1056,6 +1062,39 @@ def main():
                   f"timestamp {r.get('timestamp')!r} ({r['detail'][:100]!r})")
             if not safe:
                 hard.append(f'{name}: the shipped setting accepts the timestamp of a certificate that did not make it: {c!r}')
+        # SG-2 (D-21) and SG-3 (D-22): the shipped setting gives no cap and says why
+        for name, word in (('digest_md5', 'MD5'), ('page_hashes_cut', 'page-hash'),
+                           ('page_hashes_offset_repeated', 'page-hash'), ('page_hashes_two_tables', 'page-hash')):
+            c = shipped.get(name)
+            if name not in named:
+                print(f'NOT RUN  shipped setting, {name}: the case could not be built here')
+                continue
+            refused = c is not None and c['status'] == 'invalid' and word in c['detail']
+            print(f"{'PASS' if refused else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']} "
+                  f"({None if c is None else c['detail'][:110]!r}); parity {cpp[name]['status']} cap={cap_of(cpp[name])}")
+            if not refused:
+                hard.append(f'{name}: the shipped setting does not refuse it with the reason: {c!r}')
+        for name in ('stamp_md5_rfc3161', 'stamp_md5_authenticode'):   # expired leaf, MD5 time-stamp: time not trusted
+            if name in named:
+                c = shipped.get(name)
+                safe = c is not None and c['status'] != 'valid'
+                print(f"{'PASS' if safe else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']}; "
+                      f"parity {cpp[name]['status']} cap={cap_of(cpp[name])}")
+                if not safe:
+                    hard.append(f'{name}: the shipped setting trusts an MD5 time-stamp: {c!r}')
+        c = shipped.get('page_hashes_right')
+        still = c is not None and c['status'] == 'valid'
+        print(f"{'PASS' if still else 'FAIL'}  shipped setting, page_hashes_right: a well-formed table stays valid: "
+              f"{None if c is None else c['status']} ({None if c is None else c['detail'][:110]!r})")
+        if not still:
+            hard.append(f'page_hashes_right: the shipped setting refuses a well-formed page-hash table: {c!r}')
+        digests = {}
+        for name in sorted(named):
+            line = cpp.get(name) or {}
+            key = f"file {line.get('file_digest') or '-'} / signer {line.get('signer_digest') or '-'} / " \
+                  f"time-stamp {line.get('countersigner_digest') or '-'}"
+            digests[key] = digests.get(key, 0) + 1
+        print('digest algorithms over the named cases (parity run):', json.dumps(digests, sort_keys=True))
         for name in stamp_pairs:   # the certificate that verified the time-stamp is judged: the time is accepted
             c = shipped.get(name)
             r = reference_result(ref, dict(inputs)[name], roots_path, pinned, loaded_policy)

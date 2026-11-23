@@ -91,7 +91,7 @@ std::string read_text(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc != 5 && argc != 6) {
-        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped|shipped-pause|strict-d13|strict-d17|strict-d19|strict-d20]\n", stderr);
+        std::fputs("usage: mie-signature-probe ROOTS.pem PINNED_SHA256 POLICY.json DIR [parity|shipped|shipped-pause|strict-d13|strict-d17|strict-d19|strict-d20|strict-d21|strict-d22]\n", stderr);
         return 2;
     }
     mie::signature::Options options;
@@ -110,6 +110,8 @@ int main(int argc, char** argv) {
     options.accept_unread_fields = !(shipped || mode == "strict-d17");
     options.signer_by_second_lookup = !(shipped || mode == "strict-d19");
     options.accept_long_lengths = !(shipped || mode == "strict-d20");
+    options.accept_md5 = !(shipped || mode == "strict-d21");
+    options.accept_malformed_page_hashes = !(shipped || mode == "strict-d22");
     options.require_second_check = shipped;
     mie::signature::load_roots_file(argv[1], options);
     const std::string pinned = argv[2];
@@ -127,6 +129,8 @@ int main(int argc, char** argv) {
             {"D-17 accept_unread_fields", options.accept_unread_fields},
             {"D-19 signer_by_second_lookup", options.signer_by_second_lookup},
             {"D-20 accept_long_lengths", options.accept_long_lengths},
+            {"D-21 accept_md5", options.accept_md5},
+            {"D-22 accept_malformed_page_hashes", options.accept_malformed_page_hashes},
             {"require_second_check", options.require_second_check},
             {"second_check_called_by_probe_when_walker_valid", options.require_second_check},
             {"file_handle_passed_to_second_check", true},
@@ -215,6 +219,9 @@ int main(int argc, char** argv) {
             {"certificate_table_verified", result.certificate_table_verified},
             {"second_check", second_asked ? json(second.agree) : json(nullptr)},
             {"second_check_reason", second.reason},
+            {"file_digest", result.file_digest},
+            {"signer_digest", result.signer_digest},
+            {"countersigner_digest", result.countersigner_digest},
             {"opened", file != nullptr},
             {"cap_handle_opened", cap_opened},
             {"cap_handle_bytes_equal", cap_bytes_equal},

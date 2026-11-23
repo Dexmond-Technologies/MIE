@@ -81,6 +81,14 @@ struct Options {
     // D-20 (proposed): ON accepts a DER length written longer than needed, as the
     // reference's ASN.1 library does. OFF: shortest form only.
     bool accept_long_lengths = false;
+    // D-21: the reference accepts MD5 as a signature's digest (the file's digest, the signer's,
+    // the time-stamp's). ON: the same. OFF: a signature that uses MD5 gets no cap ("invalid"),
+    // and a time-stamp that uses MD5 is not trusted.
+    bool accept_md5 = false;
+    // D-22: the reference accepts page-hash tables that are not well formed (several tables for
+    // one digest, offsets that do not grow, a cut last entry). ON: the same. OFF: such a
+    // signature gets no cap ("invalid").
+    bool accept_malformed_page_hashes = false;
 
     // ---- shipped profile only, OFF in the parity profile ---------------------------------
     // The walker alone never grants the cap: a second, independent check (second_check)
@@ -108,6 +116,12 @@ struct Result {
     // "valid" only: the moment (seconds since 1970) at which the chain was checked: the
     // trusted countersignature time, or now.
     std::int64_t checked_at_unix = 0;
+    // The digest algorithms the signature uses ("md5", "sha1", "sha256", "sha384", "sha512";
+    // empty where none was read): the file's digest, the signer's, the time-stamp's (the
+    // weakest it relies on). For counting SHA-1 and MD5 over a corpus.
+    std::string file_digest;
+    std::string signer_digest;
+    std::string countersigner_digest;
 };
 
 // signature.py verify_portable with data given and no file to re-stat. No timeout here:

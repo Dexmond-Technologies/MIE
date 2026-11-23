@@ -51,7 +51,7 @@ def main():
     allowlist = tuple(policy['publishers'])
 
     names = sorted(n for n in os.listdir(args.folder) if os.path.isfile(os.path.join(args.folder, n)))
-    different, counts = 0, {}
+    different, counts, digest_counts = 0, {}, {}
     with tempfile.TemporaryDirectory(prefix='mie-sigcorpus-') as tmp:
         for index, name in enumerate(names):
             source = os.path.join(args.folder, name)
@@ -96,13 +96,19 @@ def main():
                 same = 'NO ANSWER' not in (r.get('status'), c.get('status'))
             different += 0 if same else 1
             counts[r.get('status')] = counts.get(r.get('status'), 0) + 1
+            for part in ('file_digest', 'signer_digest', 'countersigner_digest'):
+                key = f"{part} {c.get(part) or '-'}"
+                digest_counts[key] = digest_counts.get(key, 0) + 1
             print(f'{name}: sha256 {digest} size {size}')
             print(f"    reference: {r.get('status')} cap={r_cap} publisher={r.get('publisher')!r} {r.get('detail', '')!r}")
             print(f"    C++:       {c.get('status')} cap={c_cap} publisher={c.get('publisher')!r} {c.get('detail', '')!r}")
+            print(f"    digests:   file {c.get('file_digest') or '-'}, signer {c.get('signer_digest') or '-'}, "
+                  f"time-stamp {c.get('countersigner_digest') or '-'}")
             if args.profile == 'shipped':
                 print(f"    second check: {c.get('second_check')} {c.get('second_check_reason', '')!r}")
             print(f"    {'same' if same else 'DIFFERENT'}")
     print(f'files: {len(names)}; reference statuses: {json.dumps(counts, sort_keys=True)}; different: {different}')
+    print(f'digest algorithms the C++ check read (D-21: md5; sha1 counted): {json.dumps(digest_counts, sort_keys=True)}')
     print('signature_corpus_check:', 'FAIL' if different else 'PASS')
     return 1 if different else 0
 

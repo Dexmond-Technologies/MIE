@@ -1055,7 +1055,24 @@ IndirectData parse_indirect_data(const SignedData& signed_data) {
 }
 
 // signify SignedPEFile.verify_additional_hashes: the page hashes inside SpcPeImageData.
-void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& layout) {
+// D-22: what a well-formed page-hash table is (shipped profile): a whole number of entries of
+// 4 + digest bytes, at least two; offsets strictly increasing, the first 0; the last entry
+// closes the table: an all-zero digest and an offset not behind the certificate table.
+void require_well_formed_page_hashes(Bytes table, std::size_t digest_size, const Layout& layout) {
+    const std::size_t entry = 4 + digest_size;
+    const Fail bad{"MalformedPageHashes", "the page-hash table is not well formed"};
+    if (table.size() < 2 * entry || table.size() % entry != 0) throw bad;
+    std::uint32_t previous = 0;
+    for (std::size_t at = 0; at < table.size(); at += entry) {
+        std::uint32_t offset = 0;
+        rd32(table, at, offset);
+        if (at == 0 ? offset != 0 : offset <= previous) throw bad;
+        previous = offset;
+    }
+    if (previous > layout.table.start || !all_zero(table.last(digest_size))) throw bad;
+}
+
+void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& layout, bool well_formed_only) {
     if (!indirect.is_pe_image || !indirect.has_value) return;
     std::uint64_t budget = kPageHashBudgetFactor * data.size() + kPageHashBudgetSlack;
     if (indirect.value.tag != 0x30) throw Fail{"ValueError", "SpcPeImageData is not a SEQUENCE"};
@@ -1083,6 +1100,8 @@ void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& 
     Bytes set = serialized.content;
     Bytes pairs = expect(set, 0x31, "page hash attributes").content;
     std::size_t entries = 0;
+    bool seen_sha1 = false;
+    bool seen_sha256 = false;
     while (!pairs.empty()) {
         Bytes pair = expect(pairs, 0x30, "page hash attribute").content;
         const Tlv type = expect(pair, 0x06, "page hash attribute type");
@@ -1095,9 +1114,16 @@ void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& 
             throw Fail{"AuthenticodeParseError", "Unknown content type for page hashes"};
         }
         const std::size_t digest_size = static_cast<std::size_t>(EVP_MD_get_size(md));
+        const Fail several{"MalformedPageHashes", "more than one page-hash table for one digest"};
+        bool& seen = is_oid(type.content, kOidPageHashesV1) ? seen_sha1 : seen_sha256;
+        if (well_formed_only && seen) throw several;
+        seen = true;
+        std::size_t tables = 0;
         Bytes values = expect(pair, 0x31, "page hash attribute values").content;
         while (!values.empty()) {
             const Bytes table = expect(values, 0x04, "page hash table").content;
+            if (well_formed_only && ++tables > 1) throw several;
+            if (well_formed_only) require_well_formed_page_hashes(table, digest_size, layout);
             std::size_t position = 0;
             bool have_previous = false;
             std::uint32_t previous_offset = 0;
@@ -1147,8 +1173,24 @@ void parse_nested(const Signer& signer, int depth, std::size_t& total) {
 struct VerifiedBy {
     std::ptrdiff_t signer = -1;
     std::ptrdiff_t countersigner = -1;
+    std::string file_digest, signer_digest, countersigner_digest;  // algorithm names (D-21, counting)
 };
-VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots, std::int64_t now) {
+
+// The weakest digest a time-stamp relies on: its signer's and, for RFC 3161, also the token's
+// own and the message imprint's. "md5" if any of them is MD5.
+std::string countersigner_digest(const Countersignature& counter) {
+    std::string name = digest_algorithm(counter.signer.digest_alg, "SignerInfo.digestAlgorithm").name;
+    if (counter.rfc3161) {
+        if (counter.imprint_alg.name == "md5") name = "md5";
+        for (const Tlv& algorithm : counter.token.digest_algs) {
+            if (digest_algorithm(algorithm, "SignedData.digestAlgorithm").name == "md5") name = "md5";
+        }
+    }
+    return name;
+}
+
+VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots,
+                          std::int64_t now, bool well_formed_page_hashes) {
     std::size_t nested_total = 0;
     parse_nested(signed_data.signer, 0, nested_total);
 
@@ -1173,7 +1215,7 @@ VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layou
     if (!same_bytes(expected, indirect.digest)) {
         throw Fail{"AuthenticodeInvalidDigestError", "The expected hash does not match the digest in the indirect data."};
     }
-    verify_page_hashes(indirect, data, layout);
+    verify_page_hashes(indirect, data, layout, well_formed_page_hashes);
 
     // the content's digest: the bytes INSIDE the SpcIndirectDataContent SEQUENCE
     if (!same_bytes(digest_of(data_alg.md, signed_data.content.content), message_digest_of(signed_data.signer))) {
@@ -1190,7 +1232,10 @@ VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layou
     if (counter.present) {
         signing_time = signify_countersignature(counter, signed_data.signer, pool, roots, token_certificates,
                                                 verified_by.countersigner);
+        verified_by.countersigner_digest = countersigner_digest(counter);
     }
+    verified_by.file_digest = indirect_alg.name;
+    verified_by.signer_digest = signer_alg.name;
 
     // AuthenticodeSignerInfo._verify_issuer: a signer certificate with the "lifetime signing"
     // extended key usage is checked at the present time even when there is a timestamp.
@@ -1329,10 +1374,18 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     // VERIFY: the first entry only (signify).
     VerifiedBy verified_by;
     try {
-        verified_by = signify_verify(primary, data, layout, roots, now);
+        verified_by = signify_verify(primary, data, layout, roots, now, !options.accept_malformed_page_hashes);
     } catch (const Fail& failure) {
         Result out = make_result("invalid", "signify: " + failure.cls + ": " + failure.text);
         out.error_class = failure.cls;
+        return out;
+    }
+
+    // D-21 (SG-2): MD5 as the file's or the signer's digest: no cap in the shipped profile.
+    if (!options.accept_md5 && (verified_by.file_digest == "md5" || verified_by.signer_digest == "md5")) {
+        Result out = make_result("invalid", "the signature uses the MD5 digest, which is not accepted");
+        out.file_digest = verified_by.file_digest;
+        out.signer_digest = verified_by.signer_digest;
         return out;
     }
 
@@ -1355,8 +1408,11 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
         leaf = pool[static_cast<std::size_t>(verified_by.signer)];
     }
     if (leaf == nullptr) throw Fail{"ValueError", "signer certificate not in the signature certificate set"};
+    // a time-stamp that relies on MD5 is not trusted (D-21): the signer is judged at the present time
+    const bool stamp_md5 = !options.accept_md5 && verified_by.countersigner_digest == "md5";
     const std::optional<std::int64_t> signing_time =
-        trusted_signing_time(primary, pool, roots, options.signer_by_second_lookup, verified_by.countersigner);
+        stamp_md5 ? std::optional<std::int64_t>()
+                  : trusted_signing_time(primary, pool, roots, options.signer_by_second_lookup, verified_by.countersigner);
 
     // _leaf_checks
     bool eku_present = false;
@@ -1391,7 +1447,7 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
         }
         for (std::size_t i = 1; i < signatures.size(); ++i) {
             try {
-                signify_verify(signatures[i], data, layout, roots, now);
+                signify_verify(signatures[i], data, layout, roots, now, !options.accept_malformed_page_hashes);
             } catch (const Fail& failure) {
                 Result out = make_result("invalid", "certificate table entry " + std::to_string(i + 1) +
                                                         " does not verify (" + failure.cls + ": " + failure.text + ")");
@@ -1413,6 +1469,9 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     out.timestamp = signing_time ? iso_utc(*signing_time) : std::string();
     out.certificate_table_verified = true;
     out.checked_at_unix = when;
+    out.file_digest = verified_by.file_digest;
+    out.signer_digest = verified_by.signer_digest;
+    out.countersigner_digest = verified_by.countersigner_digest;
     out.cert_offset = checked.cert_offset;
     out.cert_size = checked.cert_size;
     return out;
