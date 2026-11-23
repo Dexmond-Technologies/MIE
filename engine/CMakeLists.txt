@@ -46,7 +46,7 @@ if(MIE_FUZZ_ONLY)
   target_compile_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
   target_link_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined)
 
-  add_executable(fuzz_signature fuzz/fuzz_signature.cpp src/signature/authenticode.cpp src/signature/second_check.cpp)
+  add_executable(fuzz_signature fuzz/fuzz_signature.cpp src/signature/authenticode.cpp src/signature/second_check.cpp src/signature/policy.cpp)
   target_include_directories(fuzz_signature PRIVATE include)
   target_link_libraries(fuzz_signature PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
   target_compile_options(fuzz_signature PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
@@ -206,7 +206,7 @@ add_executable(mie-pe-probe src/probe/pe_probe.cpp)
 target_link_libraries(mie-pe-probe PRIVATE mie_pe nlohmann_json::nlohmann_json)
 
 # ---- Authenticode signature check (own code on OpenSSL; copies the reference's portable path) ----
-add_library(mie_signature STATIC src/signature/authenticode.cpp src/signature/second_check.cpp)
+add_library(mie_signature STATIC src/signature/authenticode.cpp src/signature/second_check.cpp src/signature/policy.cpp)
 target_include_directories(mie_signature PUBLIC include)
 target_link_libraries(mie_signature PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
 if(WIN32)

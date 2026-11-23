@@ -52,27 +52,7 @@ struct Fail {
     std::string text;
 };
 
-// ---- limits of our own (the Python libraries have none) --------------------------------
-constexpr std::size_t kMaxCertificates = 64;    // certificates in one SignedData
-constexpr std::size_t kMaxSignerInfos = 8;
-constexpr std::size_t kMaxAttributes = 64;      // attributes in one set, values in one attribute
-constexpr int kMaxNestedDepth = 4;              // nested signatures inside nested signatures
-constexpr std::size_t kMaxNestedTotal = 16;
-constexpr std::size_t kMaxPageHashEntries = 1u << 16;
-constexpr int kMaxChainDepth = 10;
-// Page hashes: the total number of bytes hashed for ONE signature's page hashes (file bytes
-// plus zero padding) may not pass kPageHashBudgetFactor times the file size plus
-// kPageHashBudgetSlack. A well-formed table covers the file once per table; a signature
-// carries at most two (SHA-1 and SHA-256), so the honest total is about two file sizes.
-// Four leaves a factor of two; the slack covers the padding of small files, where one
-// page of padding per entry outweighs the file itself. signify has no such limit: it
-// accepts any number of tables and repeated or overlapping ranges
-// (indirect_data.py:157-170 and 194-217); the reference only has its 2-second timeout.
-constexpr std::uint64_t kPageHashBudgetFactor = 4;
-constexpr std::uint64_t kPageHashBudgetSlack = 1024 * 1024;
-// D-13 on (every entry verified): at most this many certificate-table entries. Each
-// verified entry costs one image digest and one page-hash budget.
-constexpr std::size_t kMaxEntriesWhenAllVerified = 4;
+#include "tables.inc"  // limits and object identifiers (constants only)
 
 // The page-hash budget ran out. Not a Fail: it must pass through the handlers that turn a
 // verification failure into "invalid" and end as "unavailable", which is what the
@@ -205,31 +185,6 @@ template <std::size_t N>
 bool is_oid(Bytes content, const std::array<std::uint8_t, N>& oid) {
     return content.size() == N && std::equal(content.begin(), content.end(), oid.begin());
 }
-constexpr std::array<std::uint8_t, 9> kOidSignedData{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02};
-constexpr std::array<std::uint8_t, 9> kOidContentType{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03};
-constexpr std::array<std::uint8_t, 9> kOidMessageDigest{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04};
-constexpr std::array<std::uint8_t, 9> kOidSigningTime{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05};
-constexpr std::array<std::uint8_t, 9> kOidCounterSignature{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x06};
-constexpr std::array<std::uint8_t, 11> kOidTstInfo{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04};
-constexpr std::array<std::uint8_t, 10> kOidSpcIndirectData{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04};
-constexpr std::array<std::uint8_t, 10> kOidSpcPeImageData{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x0F};
-constexpr std::array<std::uint8_t, 10> kOidSpcStatementType{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x0B};
-constexpr std::array<std::uint8_t, 10> kOidSpcOpusInfo{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x0C};
-constexpr std::array<std::uint8_t, 10> kOidNestedSignature{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x04, 0x01};
-constexpr std::array<std::uint8_t, 10> kOidMsTimeStampToken{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x03, 0x03, 0x01};
-constexpr std::array<std::uint8_t, 10> kOidPageHashesV1{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x03, 0x01};
-constexpr std::array<std::uint8_t, 10> kOidPageHashesV2{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x03, 0x02};
-constexpr std::array<std::uint8_t, 8> kOidMd5{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05};
-constexpr std::array<std::uint8_t, 5> kOidSha1{0x2B, 0x0E, 0x03, 0x02, 0x1A};
-constexpr std::array<std::uint8_t, 9> kOidSha256{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01};
-constexpr std::array<std::uint8_t, 9> kOidSha384{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02};
-constexpr std::array<std::uint8_t, 9> kOidSha512{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03};
-// SpcSerializedObject class id a6b586d5-b4a1-2466-ae05-a217da8e60d6 (page hashes)
-constexpr std::array<std::uint8_t, 16> kPageHashClassId{0xA6, 0xB5, 0x86, 0xD5, 0xB4, 0xA1, 0x24, 0x66,
-                                                        0xAE, 0x05, 0xA2, 0x17, 0xDA, 0x8E, 0x60, 0xD6};
-constexpr const char* kEkuCodeSigning = "1.3.6.1.5.5.7.3.3";
-constexpr const char* kEkuTimeStamping = "1.3.6.1.5.5.7.3.8";
-constexpr const char* kEkuLifetimeSigning = "1.3.6.1.4.1.311.10.3.13";
 
 // ---- digests ---------------------------------------------------------------------------
 struct DigestAlg {
@@ -1463,12 +1418,6 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     return out;
 }
 
-std::string lower(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(),
-                   [](unsigned char c) { return static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c); });
-    return text;
-}
-
 }  // namespace
 
 std::string sha256_hex(std::span<const std::uint8_t> data) {
@@ -1476,47 +1425,6 @@ std::string sha256_hex(std::span<const std::uint8_t> data) {
     unsigned int length = 0;
     if (EVP_Digest(data.data(), data.size(), out.data(), &length, EVP_sha256(), nullptr) != 1) return std::string();
     return hex(Bytes(out.data(), length));
-}
-
-Policy load_policy(std::string_view json_text) {
-    Policy policy;
-    const nlohmann::json parsed = nlohmann::json::parse(json_text.begin(), json_text.end(), nullptr, false);
-    if (!parsed.is_object()) return policy;
-    const auto list = [&parsed](const char* key) -> const nlohmann::json* {
-        const auto found = parsed.find(key);
-        return found != parsed.end() && found->is_array() ? &*found : nullptr;
-    };
-    if (const nlohmann::json* publishers = list("publishers")) {
-        std::vector<std::string> names;
-        for (const nlohmann::json& entry : *publishers) {
-            if (!entry.is_string()) continue;
-            const std::string name = entry.get<std::string>();
-            if (name.find_first_not_of(" \t\r\n\v\f") != std::string::npos) names.push_back(name);
-        }
-        if (!names.empty()) policy.publishers = std::move(names);
-    }
-    if (const nlohmann::json* intermediates = list("issuing_intermediates")) {
-        for (const nlohmann::json& entry : *intermediates) {
-            if (!entry.is_object()) continue;
-            const auto cn = entry.find("cn");
-            if (cn == entry.end() || !cn->is_string()) continue;
-            Intermediate out;
-            out.cn = cn->get<std::string>();
-            const auto spki = entry.find("spki_sha256");
-            if (spki != entry.end() && spki->is_string()) out.spki_sha256 = lower(spki->get<std::string>());
-            policy.issuing_intermediates.push_back(std::move(out));
-        }
-    }
-    const auto strings = [&list](const char* key, std::vector<std::string>& into) {
-        if (const nlohmann::json* values = list(key)) {
-            for (const nlohmann::json& entry : *values) {
-                if (entry.is_string()) into.push_back(entry.get<std::string>());
-            }
-        }
-    };
-    strings("rejected_issuers", policy.rejected_issuers);
-    strings("rejected_leaf_cns", policy.rejected_leaf_cns);
-    return policy;
 }
 
 Precheck precheck(std::span<const std::uint8_t> data) {

@@ -6,6 +6,11 @@
 #include <string>
 #include <vector>
 
+namespace mie::signature {
+// ASCII lower case (policy.cpp).
+std::string lower(std::string text);
+}  // namespace mie::signature
+
 namespace mie::signature::detail {
 
 // What the walker read from the FIRST certificate-table entry, parsed strictly (D-17 off),
