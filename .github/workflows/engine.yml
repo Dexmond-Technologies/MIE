@@ -227,26 +227,43 @@ jobs:
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_frame -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus
       - name: Fuzz the reader for Windows executables
+        if: ${{ !cancelled() }}
         run: |
           set -eu
           mkdir -p fuzz-corpus-pe
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe
       - name: Fuzz the zip reader
+        if: ${{ !cancelled() }}
         run: |
           set -eu
           mkdir -p fuzz-corpus-zip
           ./build/fuzz_zip -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-zip
       - name: Fuzz the signature check
+        if: ${{ !cancelled() }}
         run: |
           set -eu
           mkdir -p fuzz-corpus-signature
           ./build/fuzz_signature -max_total_time="$FUZZ_SECONDS" -timeout=20 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-signature
       - name: Fuzz the tar reader
+        if: ${{ !cancelled() }}
         run: |
           set -eu
           mkdir -p fuzz-corpus-tar
           ./build/fuzz_tar -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-tar
+      # A crashing input is harmless bytes made by the fuzzer; it is kept so the crash can be read.
+      - name: Keep the inputs that crashed a target
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+            leak-*
+          if-no-files-found: warn
+          retention-days: 14
 
   parity-tools:
     runs-on: ubuntu-latest

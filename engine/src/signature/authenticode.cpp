@@ -759,8 +759,13 @@ void verify_attribute_signature(X509* certificate, const Signer& signer, const D
     if (type != EVP_PKEY_RSA && type != EVP_PKEY_DSA && type != EVP_PKEY_EC) {
         throw Fail{"SignerInfoVerificationError", "Signature algorithm is unsupported"};
     }
-    std::vector<std::uint8_t> signed_bytes = der_header(0x31, signer.signed_attrs.size());
-    signed_bytes.insert(signed_bytes.end(), signer.signed_attrs.begin(), signer.signed_attrs.end());
+    // (Built by size and copy, not by insert: GCC 15 reports a false out-of-bounds copy there.)
+    const std::vector<std::uint8_t> set_header = der_header(0x31, signer.signed_attrs.size());
+    std::vector<std::uint8_t> signed_bytes(set_header.size() + signer.signed_attrs.size());
+    std::memcpy(signed_bytes.data(), set_header.data(), set_header.size());
+    if (!signer.signed_attrs.empty()) {
+        std::memcpy(signed_bytes.data() + set_header.size(), signer.signed_attrs.data(), signer.signed_attrs.size());
+    }
     std::unique_ptr<EVP_MD_CTX, MdCtxFree> ctx(EVP_MD_CTX_new());
     const bool ok = ctx && EVP_DigestVerifyInit(ctx.get(), nullptr, algorithm.md, nullptr, key) == 1 &&
                     EVP_DigestVerify(ctx.get(), signer.signature.data(), signer.signature.size(), signed_bytes.data(),
