@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <iterator>
 #include <new>
@@ -29,6 +30,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <io.h>
 #include <sddl.h>
 #include <userenv.h>
 
@@ -351,6 +353,12 @@ void empty_directory(const std::wstring& path, int depth, EmptyState& state) {
     }
 }
 
+// True if the sentence of empty_container_folder() says that the folder is now empty.
+bool folder_is_empty_now(const std::string& sentence) {
+    return sentence.rfind("emptied before the start", 0) == 0 && sentence.find("COULD NOT") == std::string::npos &&
+           sentence.find("LEFT ALONE") == std::string::npos && sentence.find("STOPPED") == std::string::npos;
+}
+
 // Empties the container's folder; returns the sentence for ChildResult::confinement.
 std::string empty_container_folder() {
     const std::wstring folder = container_folder();
@@ -390,6 +398,18 @@ std::string empty_container_folder() {
     }
     return text;
 }
+
+// The one message of a hand-over (ruling M-13): fixed size, written whole to the worker's
+// standard input. `handle_value` is the value, inside the worker, of the file's handle.
+constexpr std::uint32_t kFrameMagic = 0x3145494Du;  // the bytes "MIE1"
+struct HandOverFrame {
+    std::uint32_t magic;
+    std::uint32_t version;
+    std::uint64_t handle_value;
+    std::uint32_t job_length;
+    std::uint32_t reserved;
+    std::uint8_t job[kMaxJobBytes];
+};
 
 struct PipeReader {
     HANDLE handle = nullptr;
@@ -490,9 +510,35 @@ std::unique_ptr<io::File> inherited_file() {
     return inherited_file(ignored);
 }
 
+// What a waiting start keeps of a child that run_or_start created (ruling M-13).
+struct StartedChild {
+    HANDLE process = nullptr;
+    HANDLE thread = nullptr;
+    HANDLE job = nullptr;
+    HANDLE port = nullptr;  // the job's completion port (may be null)
+    HANDLE in = nullptr;    // the parent's end of the child's standard input
+    HANDLE out = nullptr;   // ... of its standard output
+    HANDLE err = nullptr;   // ... of its standard error
+    std::string confinement;
+    std::string folder_note;
+};
+
+static ChildResult run_or_start(const std::filesystem::path& program, const std::vector<std::string>& arguments,
+                                const io::File* inherited, std::span<const std::uint8_t> input, const Limits& limits,
+                                std::size_t max_output_bytes, const RunOptions& options, StartedChild* keep);
+
 ChildResult run_confined(const std::filesystem::path& program, const std::vector<std::string>& arguments,
                          const io::File* inherited, std::span<const std::uint8_t> input, const Limits& limits,
                          std::size_t max_output_bytes, const RunOptions& options) {
+    return run_or_start(program, arguments, inherited, input, limits, max_output_bytes, options, nullptr);
+}
+
+// Creates a child and, for run_confined (keep == nullptr), runs it to its end. With `keep` (a
+// waiting start, ruling M-13) it returns as soon as the child runs, handing the process, the
+// job and the parent's ends of the pipes to *keep.
+static ChildResult run_or_start(const std::filesystem::path& program, const std::vector<std::string>& arguments,
+                                const io::File* inherited, std::span<const std::uint8_t> input, const Limits& limits,
+                                std::size_t max_output_bytes, const RunOptions& options, StartedChild* keep) {
     ChildResult result;
     const auto started = std::chrono::steady_clock::now();
     const auto elapsed = [&] {
@@ -571,15 +617,21 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
 
     // ---- the container's own folder is emptied before the worker starts (item SW-1) --------
     std::string folder_text = "not used (no container)";
+    std::string folder_note;  // for ChildResult::container_folder_note: only when NOT emptied
     if (in_container) {
         folder_text = empty_container_folder();
+        if (!folder_is_empty_now(folder_text)) {
+            folder_note = "the worker's own folder could not be emptied before this scan: " + folder_text;
+        }
     }
 
     // ---- pipes: the child's ends are inheritable, the parent's are not ---------------------
     SECURITY_ATTRIBUTES inheritable{};
     inheritable.nLength = sizeof inheritable;
     inheritable.bInheritHandle = TRUE;
-    if (!::CreatePipe(&child_in, &parent_in, &inheritable, 0) ||
+    // A waiting start gets a larger pipe to the child: its preparation (rules, tables) is
+    // megabytes, written without ever waiting inside the system.
+    if (!::CreatePipe(&child_in, &parent_in, &inheritable, keep != nullptr ? 1024 * 1024 : 0) ||
         !::CreatePipe(&parent_out, &child_out, &inheritable, 0) ||
         !::CreatePipe(&parent_err, &child_err, &inheritable, 0)) {
         return fail_start(win_error("CreatePipe", ::GetLastError()));
@@ -841,6 +893,33 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         return fail_start(win_error("ResumeThread", code));
     }
 
+    if (keep != nullptr) {
+        // A waiting start ends here: the caller owns the process, the job and the pipes now.
+        keep->process = process.hProcess;
+        keep->thread = process.hThread;
+        keep->job = job;
+        keep->port = port;
+        keep->in = parent_in;
+        keep->out = parent_out;
+        keep->err = parent_err;
+        keep->confinement = container_text + (with_policies ? "+mitigations (" + mitigation_text + " )" : "") +
+                            "+job (memory limit " + std::to_string(limits.memory_bytes) +
+                            " bytes, one process, kill on close, UI restrictions)+handle list (three pipes, no"
+                            " file); environment (names): " +
+                            variable_names + "; container folder: " + folder_text;
+        keep->folder_note = folder_note;
+        process.hProcess = nullptr;
+        process.hThread = nullptr;
+        job = nullptr;
+        port = nullptr;
+        parent_in = nullptr;
+        parent_out = nullptr;
+        parent_err = nullptr;
+        cleanup();  // every handle was moved: this frees the attribute list and the SID only
+        result.end = ChildResult::End::Exited;
+        return result;
+    }
+
     // ---- run: three threads move the bytes, this thread watches the clock ------------------
     PipeReader out_reader;
     out_reader.handle = parent_out;
@@ -928,6 +1007,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
                          "+job (memory limit " + std::to_string(limits.memory_bytes) +
                          " bytes, one process, kill on close, UI restrictions)+handle list; environment (names): " +
                          variable_names + "; container folder: " + folder_text;
+    result.container_folder_note = folder_note;
     if (!err_reader.text.empty()) {
         result.detail = "standard error: " + err_reader.text;
     }
@@ -963,6 +1043,481 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     }
     return result;
 }
+
+// ================== pre-started one-shot workers (ruling M-13): the parent ==================
+//
+// The worker is created by the same code as a one-shot child (run_or_start), without a file
+// in its handle list. It is in its AppContainer and its job from its first instruction. The
+// file reaches it later: the parent duplicates the file's handle INTO the worker process,
+// read-only and not inheritable, and sends the handle's value in one fixed-size message on
+// the worker's standard input, which the parent then closes.
+//
+// No thread is used: the pipes from the worker are read with PeekNamedPipe (never waits), and
+// the pipe to the worker is put in no-wait mode. UNSURE (not run): the exact behaviour of a
+// no-wait write on an anonymous pipe; the code treats "nothing written" as "try again".
+
+struct WaitingChild::Impl {
+    StartedChild child;
+    WaitingState state = WaitingState::Ended;
+    std::string failure;
+    bool confine = true;
+    bool finished = false;  // the process is gone and every handle closed
+    std::uint64_t memory_bytes = 0;
+    std::size_t max_output = 0;
+    std::chrono::steady_clock::time_point started{};
+    std::chrono::steady_clock::time_point handed_over{};
+    std::string output;
+    std::size_t output_total = 0;
+    std::size_t out_received = 0;
+    std::size_t err_received = 0;
+    std::string error_text;
+    bool killed_output = false;
+    bool killed_time = false;
+    bool ended = false;          // the process has ended; exit_code is valid
+    DWORD exit_code = 0;
+    bool memory_message = false; // the job said that the memory limit was reached
+    std::uint64_t peak_memory = 0;
+    std::string at_limit;        // what the worker looked like at the time limit
+};
+
+namespace {
+
+// Reads what is in a pipe NOW, without waiting, and gives it to `sink`. A broken pipe (the
+// worker closed its end or is gone) is closed here.
+template <typename Sink>
+void read_available(HANDLE& pipe, Sink sink) {
+    while (pipe != nullptr) {
+        DWORD available = 0;
+        if (!::PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            close_handle(pipe);
+            return;
+        }
+        if (available == 0) {
+            return;
+        }
+        char buffer[64 * 1024];
+        const DWORD want = available < sizeof buffer ? available : static_cast<DWORD>(sizeof buffer);
+        DWORD got = 0;
+        if (!::ReadFile(pipe, buffer, want, &got, nullptr) || got == 0) {
+            close_handle(pipe);
+            return;
+        }
+        sink(buffer, got);
+    }
+}
+
+// One round: read what the worker wrote, notice its end. Never waits.
+void pump(WaitingChild::Impl& c) {
+    if (c.finished || c.child.process == nullptr) {
+        return;
+    }
+    read_available(c.child.out, [&](const char* data, DWORD size) {
+        c.out_received += size;
+        const std::size_t room = c.output_total < c.max_output ? c.max_output - c.output_total : 0;
+        const std::size_t take = size < room ? size : room;
+        c.output.append(data, take);
+        c.output_total += take;
+        if (take < size && !c.killed_output) {
+            c.killed_output = true;  // more output than allowed: the worker is stopped
+            ::TerminateJobObject(c.child.job, 1);
+        }
+    });
+    read_available(c.child.err, [&](const char* data, DWORD size) {
+        c.err_received += size;
+        if (c.error_text.size() < 16 * 1024) {
+            c.error_text.append(data, size);
+        }
+    });
+    if (!c.ended && ::WaitForSingleObject(c.child.process, 0) == WAIT_OBJECT_0) {
+        c.ended = true;
+        ::GetExitCodeProcess(c.child.process, &c.exit_code);
+    }
+}
+
+// Ends whatever is left of the worker, takes the job's measurements, closes every handle.
+void finish_child(WaitingChild::Impl& c) {
+    if (c.finished) {
+        return;
+    }
+    if (c.child.process != nullptr) {
+        ::TerminateJobObject(c.child.job, 1);  // kills every process of the job; harmless if none is left
+        ::WaitForSingleObject(c.child.process, 5000);
+        if (!c.ended) {
+            c.ended = true;
+            ::GetExitCodeProcess(c.child.process, &c.exit_code);
+        }
+        pump(c);  // what was still in the pipes
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION measured{};
+        if (::QueryInformationJobObject(c.child.job, JobObjectExtendedLimitInformation, &measured, sizeof measured,
+                                        nullptr)) {
+            c.peak_memory = static_cast<std::uint64_t>(
+                measured.PeakProcessMemoryUsed > measured.PeakJobMemoryUsed ? measured.PeakProcessMemoryUsed
+                                                                           : measured.PeakJobMemoryUsed);
+        }
+        while (c.child.port != nullptr) {
+            DWORD message = 0;
+            ULONG_PTR key = 0;
+            LPOVERLAPPED extra = nullptr;
+            if (!::GetQueuedCompletionStatus(c.child.port, &message, &key, &extra, 0)) {
+                break;
+            }
+            if (message == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT || message == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) {
+                c.memory_message = true;
+            }
+        }
+    }
+    for (HANDLE* handle : {&c.child.in, &c.child.out, &c.child.err, &c.child.port, &c.child.thread,
+                           &c.child.process, &c.child.job}) {
+        close_handle(*handle);  // closing the job's last handle kills anything still in it
+    }
+    c.finished = true;
+}
+
+void update_state(WaitingChild::Impl& c) {
+    if (c.state == WaitingState::Waiting && (c.ended || c.killed_output)) {
+        finish_child(c);
+        c.failure = (c.killed_output ? std::string("ended by the parent: more output than allowed while waiting")
+                                     : std::string("the worker ended while waiting")) +
+                    " (exit code " + hex_code(c.exit_code) + ")";
+        if (!c.error_text.empty()) {
+            c.failure += "; standard error: " + c.error_text;
+        }
+        c.state = WaitingState::Ended;
+    }
+}
+
+// Writes `size` bytes to the worker's standard input without ever waiting inside the system:
+// the pipe is in no-wait mode, so a full pipe gives "nothing written" and this loop looks at
+// the worker and the clock in between. False if the pipe broke or the time ran out.
+bool write_to_worker(WaitingChild::Impl& c, const void* data, std::size_t size, int timeout_seconds,
+                     std::string& error) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::size_t written = 0;
+    while (written < size) {
+        if (c.child.in == nullptr) {
+            error = "the worker's standard input is closed";
+            return false;
+        }
+        const std::size_t part = std::min<std::size_t>(size - written, 16 * 1024);
+        DWORD done = 0;
+        if (!::WriteFile(c.child.in, bytes + written, static_cast<DWORD>(part), &done, nullptr)) {
+            error = win_error("writing to the worker", ::GetLastError());
+            return false;
+        }
+        written += done;
+        pump(c);
+        if (c.ended) {
+            error = "the worker ended (exit code " + hex_code(c.exit_code) + ")";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "not written within " + std::to_string(timeout_seconds) + " seconds";
+            return false;
+        }
+        if (done == 0) {
+            ::WaitForSingleObject(c.child.process, 2);  // the pipe is full: a short pause
+        }
+    }
+    return true;
+}
+
+const char* state_in_words(WaitingState state) {
+    switch (state) {
+        case WaitingState::Starting: return "the worker has not yet started";
+        case WaitingState::Waiting: return "the worker waits";
+        case WaitingState::HandedOver: return "this worker was already given its one file";
+        case WaitingState::Ended: return "the worker has ended";
+    }
+    return "the worker has ended";
+}
+
+// After the one message: standard input is closed (the worker reads one job, then the end),
+// and the clock of collect() starts.
+void after_hand_over(WaitingChild::Impl& c) {
+    close_handle(c.child.in);
+    c.handed_over = std::chrono::steady_clock::now();
+    c.state = WaitingState::HandedOver;
+}
+
+}  // namespace
+
+WaitingChild::WaitingChild(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+WaitingChild::~WaitingChild() {
+    if (impl_) {
+        finish_child(*impl_);
+    }
+}
+
+std::unique_ptr<WaitingChild> start_waiting(const std::filesystem::path& program,
+                                            const std::vector<std::string>& arguments,
+                                            const WaitingOptions& options) {
+    auto impl = std::make_unique<WaitingChild::Impl>();
+    impl->started = std::chrono::steady_clock::now();
+    impl->confine = options.run.confine;
+    impl->memory_bytes = options.memory_bytes;
+    impl->max_output = options.max_output_bytes;
+    Limits limits;
+    limits.memory_bytes = options.memory_bytes;
+    const ChildResult created = run_or_start(program, arguments, nullptr, {}, limits, 0, options.run, &impl->child);
+    if (impl->child.process == nullptr) {
+        impl->state = WaitingState::Ended;
+        impl->failure = created.detail.empty() ? "the worker could not be started" : created.detail;
+        impl->finished = true;
+        return std::make_unique<WaitingChild>(std::move(impl));
+    }
+    // The pipe to the worker never makes the parent wait.
+    DWORD mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+    if (!::SetNamedPipeHandleState(impl->child.in, &mode, nullptr, nullptr)) {
+        const DWORD code = ::GetLastError();
+        finish_child(*impl);
+        impl->state = WaitingState::Ended;
+        impl->failure = win_error("the pipe to the worker could not be put in no-wait mode", code);
+        return std::make_unique<WaitingChild>(std::move(impl));
+    }
+    // The confinement was applied by this process when it created the worker: there is no
+    // "stage 1" to wait for on Windows.
+    impl->state = WaitingState::Waiting;
+    return std::make_unique<WaitingChild>(std::move(impl));
+}
+
+WaitingState poll(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    pump(c);
+    update_state(c);
+    return c.state;
+}
+
+bool send_preparation(WaitingChild& child, std::span<const std::uint8_t> bytes, int timeout_seconds,
+                      std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    pump(c);
+    update_state(c);
+    if (c.state != WaitingState::Waiting) {
+        error = std::string("the preparation was not sent: ") + state_in_words(c.state) +
+                (c.failure.empty() ? "" : ": " + c.failure);
+        return false;
+    }
+    if (!write_to_worker(c, bytes.data(), bytes.size(), timeout_seconds, error)) {
+        error = "the preparation was not sent: " + error;
+        update_state(c);
+        return false;
+    }
+    return true;
+}
+
+std::string take_output(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    pump(c);
+    update_state(c);
+    std::string taken;
+    taken.swap(c.output);
+    return taken;
+}
+
+bool hand_over_file(WaitingChild& child, const io::File& file, std::span<const std::uint8_t> job,
+                    std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    pump(c);
+    update_state(c);
+    if (c.state != WaitingState::Waiting) {
+        error = std::string("the file was not handed over: ") + state_in_words(c.state) +
+                (c.failure.empty() ? "" : ": " + c.failure);
+        return false;
+    }
+    if (job.size() > kMaxJobBytes) {
+        error = "the file was not handed over: the job is longer than " + std::to_string(kMaxJobBytes) + " bytes";
+        return false;
+    }
+    // A copy of the file's handle INSIDE the worker process, with read rights only
+    // (FILE_GENERIC_READ: read data, attributes and extended attributes, read the access
+    // list, synchronize; no write, append, delete or change right), NOT inheritable. A handle
+    // carries its own rights: the worker can read this one file although its token could not
+    // open it by path.
+    const HANDLE original = reinterpret_cast<HANDLE>(file.native_handle());
+    HANDLE in_worker = nullptr;
+    if (!::DuplicateHandle(::GetCurrentProcess(), original, c.child.process, &in_worker, FILE_GENERIC_READ, FALSE,
+                           0)) {
+        error = win_error("the file was not handed over: DuplicateHandle into the worker", ::GetLastError());
+        return false;
+    }
+    HandOverFrame frame{};
+    frame.magic = kFrameMagic;
+    frame.version = 1;
+    frame.handle_value = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(in_worker));
+    frame.job_length = static_cast<std::uint32_t>(job.size());
+    if (!job.empty()) {
+        std::memcpy(frame.job, job.data(), job.size());
+    }
+    if (!write_to_worker(c, &frame, sizeof frame, 5, error)) {
+        // Half a message may be in the pipe: this worker cannot be used any more.
+        error = "the file was not handed over: " + error;
+        finish_child(c);
+        c.failure = error;
+        c.state = WaitingState::Ended;
+        return false;
+    }
+    after_hand_over(c);
+    return true;
+}
+
+ChildResult collect(WaitingChild& child, const Limits& limits) {
+    WaitingChild::Impl& c = child.impl();
+    ChildResult result;
+    result.confinement = c.child.confinement;
+    result.container_folder_note = c.child.folder_note;
+    if (c.state != WaitingState::HandedOver) {
+        const std::string why = c.state == WaitingState::Ended
+                                    ? "the worker had ended before it was given a file: " + c.failure
+                                    : std::string("collect() was called on a worker that was given no file");
+        end_waiting(child);
+        result.end = ChildResult::End::StartFailed;
+        result.detail = why;
+        return result;
+    }
+    const auto deadline = c.handed_over + std::chrono::seconds(limits.wall_seconds > 0 ? limits.wall_seconds : 0);
+    for (;;) {
+        pump(c);
+        if (c.ended) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            c.killed_time = true;
+            FILETIME created{}, ended{}, kernel{}, user{};
+            unsigned long long cpu_ms = 0;
+            if (::GetProcessTimes(c.child.process, &created, &ended, &kernel, &user)) {
+                cpu_ms = ((((static_cast<unsigned long long>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime) +
+                           ((static_cast<unsigned long long>(user.dwHighDateTime) << 32) | user.dwLowDateTime))) /
+                         10000;
+            }
+            c.at_limit = "at the limit: processor time used " + std::to_string(cpu_ms) + " ms; ";
+            break;  // finish_child ends the job
+        }
+        ::WaitForSingleObject(c.child.process, 10);  // the pause between two looks
+    }
+    finish_child(c);
+    c.state = WaitingState::Ended;
+
+    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.handed_over).count();
+    result.peak_memory_bytes = c.peak_memory;
+    result.exit_code = static_cast<int>(c.exit_code);
+    if (!c.error_text.empty()) {
+        result.detail = "standard error: " + c.error_text;
+    }
+    const auto with_detail = [&](const std::string& text) {
+        result.detail = result.detail.empty() ? text : text + "; " + result.detail;
+    };
+    const std::string diagnosis = c.at_limit + "exit code " + hex_code(c.exit_code) +
+                                  "; bytes received from standard output " + std::to_string(c.out_received) +
+                                  ", from standard error " + std::to_string(c.err_received);
+    if (!c.killed_time && c.exit_code == static_cast<DWORD>(kHandOverRefusedExitCode)) {
+        // The worker refused the hand-over (not exactly one read-only disk file): no answer.
+        result.end = ChildResult::End::StartFailed;
+        with_detail("the worker refused the hand-over; nothing it wrote is used");
+        return result;
+    }
+    result.output = std::move(c.output);
+    if (c.killed_time) {
+        result.end = ChildResult::End::KilledByTimeLimit;
+        with_detail("killed at the time limit of " + std::to_string(limits.wall_seconds) +
+                    " seconds after the hand-over; " + diagnosis);
+    } else if (c.killed_output) {
+        result.end = ChildResult::End::Crashed;
+        with_detail("killed: more output than the allowed " + std::to_string(c.max_output) + " bytes");
+    } else if (c.memory_message || c.exit_code == static_cast<DWORD>(kOutOfMemoryExitCode)) {
+        result.end = ChildResult::End::KilledByMemoryLimit;
+        with_detail(c.memory_message ? "the job reported that the memory limit was reached"
+                                     : "the child ran out of its memory limit (an allocation was refused)");
+    } else if ((c.exit_code & 0xC0000000u) == 0xC0000000u) {
+        result.end = ChildResult::End::Crashed;
+        with_detail("ended by an unhandled exception; " + diagnosis);
+    } else {
+        result.end = ChildResult::End::Exited;
+    }
+    return result;
+}
+
+void end_waiting(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    finish_child(c);
+    if (c.failure.empty()) {
+        c.failure = "ended by the parent without having been used";
+    }
+    c.state = WaitingState::Ended;
+}
+
+std::string confinement_at_start(const WaitingChild& child) { return child.impl().child.confinement; }
+
+std::string failure(const WaitingChild& child) { return child.impl().failure; }
+
+double seconds_since_start(const WaitingChild& child) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - child.impl().started).count();
+}
+
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+// Tests only: a hand-over that is not as required. The worker must refuse it.
+bool hand_over_malformed(WaitingChild& child, MalformedHandOver kind, const std::filesystem::path& file,
+                         std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    pump(c);
+    update_state(c);
+    if (c.state != WaitingState::Waiting) {
+        error = std::string("not sent: ") + state_in_words(c.state);
+        return false;
+    }
+    HandOverFrame frame{};
+    frame.magic = kFrameMagic;
+    frame.version = 1;
+    std::size_t size = sizeof frame;
+    HANDLE local = nullptr;
+    HANDLE in_worker = nullptr;
+    switch (kind) {
+        case MalformedHandOver::NoDescriptor:
+            break;  // handle value 0
+        case MalformedHandOver::TwoDescriptors:
+            error = "not applicable on Windows: the message names one handle value";
+            return false;
+        case MalformedHandOver::NotARegularFile:
+            local = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            break;
+        case MalformedHandOver::Writable:
+        case MalformedHandOver::ShortMessage:
+            local = ::CreateFileW(file.wstring().c_str(),
+                                  kind == MalformedHandOver::Writable ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (local == INVALID_HANDLE_VALUE) {
+                local = nullptr;
+            }
+            if (kind == MalformedHandOver::ShortMessage) {
+                size = 8;
+            }
+            break;
+    }
+    if (kind != MalformedHandOver::NoDescriptor) {
+        if (local == nullptr ||
+            !::DuplicateHandle(::GetCurrentProcess(), local, c.child.process, &in_worker, 0, FALSE,
+                               DUPLICATE_SAME_ACCESS)) {
+            error = win_error("test set-up: the object could not be made or duplicated", ::GetLastError());
+            close_handle(local);
+            return false;
+        }
+        close_handle(local);
+        frame.handle_value = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(in_worker));
+    }
+    if (!write_to_worker(c, &frame, size, 5, error)) {
+        finish_child(c);
+        c.state = WaitingState::Ended;
+        return false;
+    }
+    after_hand_over(c);
+    return true;
+}
+#endif
 
 // =============================== the child's side ===============================
 
@@ -1035,6 +1590,108 @@ bool enter_confinement(std::string& what_applied, std::string& error) {
     }
 #endif
     return false;
+}
+
+// ================== pre-started one-shot workers (ruling M-13): the worker ==================
+//
+// On Windows the worker is in its AppContainer and its job from its first instruction; there
+// is nothing to apply later. So:
+//   enter_confinement_stage1()  = the same check as enter_confinement();
+//   receive_file_and_seal()     = read ONE job message of fixed size from standard input,
+//     close standard input (no second job), check the handle the message names (it must not
+//     be inheritable, must hold no write right, must be a disk file), take it over as an
+//     io::File. Nothing of the file is read before those checks. A message that is not as
+//     required ends the worker with kHandOverRefusedExitCode and no answer; the end of
+//     standard input without a message, with kNoJobExitCode.
+// The preparation that precedes the job on the same pipe must have been read with
+// exact-length, unbuffered reads.
+
+namespace {
+
+[[noreturn]] void refuse_hand_over(const std::string& why) {
+    const std::string line = "mie sandbox: hand-over refused: " + why + "\n";
+    DWORD written = 0;
+    ::WriteFile(::GetStdHandle(STD_ERROR_HANDLE), line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    ::ExitProcess(static_cast<UINT>(kHandOverRefusedExitCode));
+}
+
+// The first fields of what NtQueryObject(ObjectBasicInformation = 0) answers.
+struct ObjectBasics {
+    ULONG attributes;      // OBJ_INHERIT = 0x2
+    ACCESS_MASK granted;   // the rights this handle carries
+    ULONG handle_count;
+    ULONG pointer_count;
+    ULONG reserved[10];
+};
+static_assert(sizeof(ObjectBasics) == 56, "object basic information layout");
+using QueryObjectFunction = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+}  // namespace
+
+bool enter_confinement_stage1(std::string& what_applied, std::string& error) {
+    return enter_confinement(what_applied, error);
+}
+
+std::unique_ptr<io::File> receive_file_and_seal(std::vector<std::uint8_t>& job, std::string& what_applied) {
+    job.clear();
+    what_applied.clear();
+    const HANDLE input = ::GetStdHandle(STD_INPUT_HANDLE);
+    HandOverFrame frame{};
+    std::size_t have = 0;
+    while (have < sizeof frame) {
+        DWORD got = 0;
+        if (!::ReadFile(input, reinterpret_cast<unsigned char*>(&frame) + have, static_cast<DWORD>(sizeof frame - have),
+                        &got, nullptr) ||
+            got == 0) {
+            break;  // the end of standard input
+        }
+        have += got;
+    }
+    if (have == 0) {
+        ::ExitProcess(static_cast<UINT>(kNoJobExitCode));  // the parent closed the pipe: never used
+    }
+    // One job per worker: standard input is closed, whatever follows.
+    ::_close(0);
+    if (have != sizeof frame) {
+        refuse_hand_over("the job message is incomplete");
+    }
+    if (frame.magic != kFrameMagic || frame.version != 1 || frame.job_length > kMaxJobBytes) {
+        refuse_hand_over("the job message is not in the expected form");
+    }
+    if (frame.handle_value == 0) {
+        refuse_hand_over("the job message names no file");
+    }
+    const HANDLE file_handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(frame.handle_value));
+
+    // What the handle is and what it may do, asked of the system; nothing is read from it.
+    // (A value that is no handle at all ends an AppContainer process at this call: no answer.)
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    const QueryObjectFunction query =
+        ntdll != nullptr ? reinterpret_cast<QueryObjectFunction>(::GetProcAddress(ntdll, "NtQueryObject")) : nullptr;
+    ObjectBasics basics{};
+    ULONG needed = 0;
+    if (query == nullptr || query(file_handle, 0, &basics, static_cast<ULONG>(sizeof basics), &needed) != 0) {
+        refuse_hand_over("the handed-over handle cannot be asked what it may do");
+    }
+    constexpr ACCESS_MASK kChangeRights = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                                          FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+    if ((basics.granted & kChangeRights) != 0) {
+        refuse_hand_over("the handed-over handle is not read-only");
+    }
+    if ((basics.attributes & 0x2u) != 0) {
+        refuse_hand_over("the handed-over handle is inheritable");
+    }
+    if (::GetFileType(file_handle) != FILE_TYPE_DISK) {
+        refuse_hand_over("the handed-over handle is not a disk file");
+    }
+    io::IoError io_error;
+    std::unique_ptr<io::File> file = io::adopt_native_handle(static_cast<std::intptr_t>(frame.handle_value), io_error);
+    if (!file) {
+        refuse_hand_over(std::string("the handed-over file cannot be used: ") + io::to_string(io_error.code));
+    }
+    what_applied = describe_self();
+    job.assign(frame.job, frame.job + frame.job_length);
+    return file;
 }
 
 std::string describe_self() {

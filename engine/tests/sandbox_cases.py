@@ -40,7 +40,23 @@ P5A = "r-01 point 5: the handed-over file is readable through its handle (hash e
 P5B = "r-01 point 5: the handed-over file is read-only (writing through the handle fails)"
 P5C = "r-01 point 5: the handed-over file is the only thing inherited besides the three standard streams"
 MEMORY = "memory: the limit ends the child, the parent carries on"
-MUST_RUN = (P1, P1B, P2, P3, P4, P5A, P5B, P5C, MEMORY, SHIPPED)
+# The waiting shape (ruling M-13): the same things shown with a worker that is started first
+# and handed its file while it runs.
+W = "M-13 (waiting worker) "
+W_START = W + "start: the worker reports stage 1, reads its preparation, waits, is handed a file, answers"
+W_P1 = W + "r-01 point 1: a network connection fails"
+W_P1B = W + "r-01 point 1 (not the local loop): a connection to the machine's own network address fails"
+W_P2 = W + "r-01 point 2: reading a file in the user's profile that was not handed over fails"
+W_P3 = W + "r-01 point 3: starting another process fails"
+W_P4 = W + "r-01 point 4: writing a file outside what was handed over fails"
+W_P5A = W + "r-01 point 5: the handed-over file is readable through its handle (hash equals the file's)"
+W_P5B = W + "r-01 point 5: the handed-over file is read-only"
+W_P5C = W + "r-01 point 5: before the hand-over only the standard streams (and the channel); after it " \
+    "exactly one more handle; enumerated before the first read"
+W_ONE = W + "one file per worker: a second hand-over is refused and nothing more is served"
+W_SHIPPED = W + "SB-1: a worker built with the shipped library ignores the test switches"
+MUST_RUN = (P1, P1B, P2, P3, P4, P5A, P5B, P5C, MEMORY, SHIPPED,
+            W_START, W_P1, W_P1B, W_P2, W_P3, W_P4, W_P5A, W_P5B, W_P5C, W_ONE, W_SHIPPED)
 SANITIZER = {"seen": False}  # set when the test parent says it is a sanitizer build
 
 results = []  # (status, name, text)
@@ -477,6 +493,278 @@ def run_cases(parent, child, shipped_child, windows, linux, work):
         return ("PASS" if good else "FAIL"), brief(result, inner)
     case("refusal: with allow_weaker (tests only) the run goes on and SAYS it is weaker",
          weaker_only_when_asked)
+
+    # =========================================================================================
+    # The waiting shape (ruling M-13): start_waiting, preparation, hand_over_file, collect.
+    # =========================================================================================
+    waiting = ["--waiting", "--file", sample]
+
+    def lines_of(text):
+        found = []
+        for line in (text or "").split("\n"):
+            if line.strip().startswith("{"):
+                try:
+                    found.append(json.loads(line))
+                except ValueError:
+                    pass
+        return found
+
+    def phases(result):
+        """The worker's "before" line (taken by the parent as the ready message) and its
+        "after" line (first line after the seal)."""
+        before = next((line for line in lines_of(result.get("first_output")) if line.get("phase") == "before"), {})
+        after = next((line for line in lines_of(result.get("output")) if line.get("phase") == "after"), {})
+        return before, after
+
+    def waiting_start():
+        preparation = "our own rules: " + "r" * 5000
+        result, inner = run_parent(parent, child, waiting + ["--prep", preparation, "--job", "the job"], ["whoami"])
+        before, after = phases(result)
+        good = result.get("state_after_start") == "waiting" and result.get("hand_over_ok") is True \
+            and result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
+            and before.get("preparation_sha256") == hashlib.sha256(preparation.encode("ascii")).hexdigest() \
+            and after.get("job") == "the job"
+        if linux:
+            good = good and "seccomp=2" in inner.get("self", "") and "stage 1" in result.get("confinement_at_start", "")
+        return ("PASS" if good else "FAIL"), "tried: start a waiting worker, send %d bytes of preparation, wait " \
+            "for its first line, hand over a file with a job, collect. At start: %r; stage 1 said: %r; after the " \
+            "seal: %r; %s" % (len(preparation), result.get("confinement_at_start"), before.get("stage1"),
+                              after.get("what_applied"), brief(result, inner))
+    if case(W_START, waiting_start) != "PASS":
+        print("STOPPED the waiting shape: the worker cannot be started that way; its other cases would only "
+              "fail the same way.", flush=True)
+        waiting = None
+
+    if waiting:
+        loop = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        loop.bind(("127.0.0.1", 0))
+        loop.listen(8)
+        case(W_P1, refused("TCP connection to a listener of this test on 127.0.0.1, 5 s bound, from a waiting "
+                           "worker after its seal", ["connect", "127.0.0.1", str(loop.getsockname()[1])],
+                           "connected", options=waiting))
+        loop.close()
+        if address is None:
+            record("NOT RUN", W_P1B, "this machine has no IPv4 address other than the local loop")
+        else:
+            try:
+                outside = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                outside.bind((address, 0))
+                outside.listen(8)
+            except OSError as error:
+                record("FAIL", W_P1B, "could not listen on the machine's own address %s: %s" % (address, error))
+            else:
+                case(W_P1B, refused("TCP connection to a listener of this test on %s, 5 s bound, from a waiting "
+                                    "worker after its seal" % address,
+                                    ["connect", address, str(outside.getsockname()[1])], "connected",
+                                    options=waiting))
+                outside.close()
+        case(W_P2, refused("open and read %s by its path, from a waiting worker after its seal" % private,
+                           ["open-path", private], "opened", options=waiting))
+        if linux:
+            case(W_P3, refused("fork(), and execve(/bin/true) when fork is refused", ["spawn"], "spawned",
+                               options=waiting))
+        else:
+            case(W_P3, refused("CreateProcessW(cmd.exe /c exit 0)", ["spawn"], "spawned", control_needed=False,
+                               options=waiting, no_control_why="the job's one-process limit binds the "
+                               "unconfined test child too"))
+        case(W_P4, refused("create and write %s" % target, ["write-path", target], "opened", options=waiting))
+
+        def waiting_read():
+            result, inner = run_parent(parent, child, waiting, ["read-handle"])
+            good = result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
+                and inner.get("read") is True and inner.get("sha256") == sample_hash
+            return ("PASS" if good else "FAIL"), "tried: the waiting worker reads the whole handed-over file " \
+                "after its seal and hashes it; expected %s; %s" % (sample_hash, brief(result, inner))
+        case(W_P5A, waiting_read)
+
+        def waiting_write():
+            result, inner = run_parent(parent, child, waiting, ["write-handle"])
+            good = result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
+                and inner.get("handle_present") is True and inner.get("wrote") is False
+            if good and linux:
+                good = inner.get("error") == 9  # the descriptor's own refusal, not the filter's
+            with open(sample, "rb") as handle:
+                unchanged = hashlib.sha256(handle.read()).hexdigest() == sample_hash
+            return ("PASS" if good and unchanged else "FAIL"), "tried: write one byte through the handed-over " \
+                "handle; file unchanged=%s; %s" % (unchanged, brief(result, inner))
+        case(W_P5B, waiting_write)
+
+        def waiting_handles():
+            result, inner = run_parent(parent, child, waiting, ["whoami"])
+            before, after = phases(result)
+            if not before or not after:
+                return "FAIL", "the worker did not print both enumerations; " + brief(result, inner)
+            if linux:
+                had = before.get("open_descriptors")
+                has = after.get("open_descriptors")
+                file_number = after.get("file_descriptor")
+                good = had == [0, 1, 2, 3, 4] and has == [0, 1, 2, file_number] and file_number not in had
+                tried = "every descriptor number below %s asked with fstat. BEFORE the hand-over: %s (0, 1, 2 the " \
+                    "standard streams, 3 the channel, 4 the write-only status pipe to the parent: NOTE two " \
+                    "besides the standard streams, not one). AFTER the seal and before any read: %s (the " \
+                    "channel and the status pipe are closed; %s is the file). Read-only was checked by the " \
+                    "worker with fcntl before the filter (it refuses otherwise) and is shown by the case " \
+                    "before. NOT SHOWN: numbers at or above the bound" % (
+                        after.get("scanned"), had, has, file_number)
+            else:
+                def table(phase):
+                    entries = {}
+                    for entry in phase.get("all_handles", []):
+                        value, kind, mark, access = entry.split(":")
+                        entries[int(value)] = (kind, mark, int(access, 16))
+                    return entries
+                had, has = table(before), table(after)
+                file_handle = after.get("file_handle")
+                new = sorted(set(has) - set(had))
+                new_files = [value for value in new if has[value][0] == "File"]
+                change_rights = 0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 | 0x80000
+                inherited_before = sorted(value for value, entry in had.items() if entry[1] == "I")
+                inherited_after = sorted(value for value, entry in has.items() if entry[1] == "I")
+                good = bool(had) and inherited_before == sorted(before.get("standard_handles", [])) \
+                    and set(inherited_after) <= set(inherited_before) and new_files == [file_handle] \
+                    and has[file_handle][1] == "N" and (has[file_handle][2] & change_rights) == 0
+                tried = "the system's own list of the worker's handles, taken BEFORE the hand-over and AFTER it " \
+                    "(before any read). Before: %d handles, inherited from the parent exactly the three " \
+                    "standard handles %s. After: %d handles; inherited ones %s (standard input was closed after " \
+                    "the one job); new handles since before: %s, of which files: %s (expected exactly the " \
+                    "handed-over file %s, not inheritable, access 0x%x without any write right). NOT SHOWN: " \
+                    "new handles that are not files are listed here by type, not examined: %s" % (
+                        len(had), inherited_before, len(has), inherited_after, new, new_files, file_handle,
+                        has.get(file_handle, ("", "", 0))[2],
+                        [(value, has[value][0]) for value in new if has[value][0] != "File"])
+            return ("PASS" if good and result.get("end") == "exited" else "FAIL"), "tried: " + tried + "; " \
+                + brief(result, inner)
+        case(W_P5C, waiting_handles)
+
+        def one_file_only():
+            result, inner = run_parent(parent, child, waiting + ["--second-hand-over"], ["whoami"])
+            answers = [line for line in lines_of(result.get("output")) if "action" in line]
+            good = result.get("hand_over_ok") is True and result.get("second_hand_over_ok") is False \
+                and result.get("end") == "exited" and len(answers) == 1
+            return ("PASS" if good else "FAIL"), "tried: hand a second file to the same worker; the call said: " \
+                "%r; answers the worker gave: %d (expected 1); %s" % (
+                    result.get("second_hand_over_error"), len(answers), brief(result, inner))
+        case(W_ONE, one_file_only)
+
+        def malformed(kind, words):
+            def run():
+                result, inner = run_parent(parent, child, waiting + ["--malformed", kind], ["whoami"])
+                answers = [line for line in lines_of(result.get("output")) if "action" in line]
+                good = result.get("end") == "start_failed" and not answers and result.get("exit_code") == 87
+                return ("PASS" if good else "FAIL"), "tried: hand over %s; expected: the worker ends with exit " \
+                    "code 87 and no answer, the parent reports start_failed; %s" % (words, brief(result, inner))
+            return run
+        for kind, words, linux_only_kind in (("none", "a job message without a file", False),
+                                             ("two", "two descriptors in one message", True),
+                                             ("notfile", "something that is not a regular file", False),
+                                             ("writable", "the file opened for reading and writing", False),
+                                             ("short", "a message shorter than the fixed size", False)):
+            name = W + "hand-over refused by the worker: " + words
+            if linux_only_kind and not linux:
+                record("NOT RUN", name, "Linux only: on Windows the message names one handle value")
+            else:
+                case(name, malformed(kind, words))
+
+        def unsealed_answer():
+            result, inner = run_parent(parent, child, waiting, ["skip-seal"])
+            good = result.get("end") == "start_failed" and result.get("output", "") == ""
+            return ("PASS" if good else "FAIL"), "tried: a worker that answers without having reported its " \
+                "full confinement; expected: the parent discards the answer (empty output, start_failed); " \
+                + brief(result, inner)
+        if linux:
+            case(W + "the answer of a worker that did not report its full confinement is discarded (Linux)",
+                 unsealed_answer)
+        else:
+            record("NOT RUN", W + "the answer of a worker that did not report its full confinement is "
+                   "discarded (Linux)", "Linux only: on Windows the parent applies the whole confinement when "
+                   "it creates the worker; there is no later report to miss")
+
+        def ended_unused():
+            result, inner = run_parent(parent, child, waiting + ["--end-unused"], ["whoami"])
+            good = result.get("state_after_end") == "ended" and result.get("hand_over_ok") is False \
+                and result.get("end") == "start_failed"
+            return ("PASS" if good else "FAIL"), "tried: end a waiting worker that was never used, then try to " \
+                "hand it a file; the call said: %r; %s" % (result.get("hand_over_error"), brief(result, inner))
+        case(W + "a worker ended unused cannot be handed a file", ended_unused)
+
+        def died_waiting():
+            result, inner = run_parent(parent, child, waiting + ["--delay-hand-over", "1"], ["die-waiting"])
+            good = result.get("hand_over_ok") is False and result.get("end") == "start_failed"
+            return ("PASS" if good else "FAIL"), "tried: a worker that dies while it waits (exit code 9), then a " \
+                "hand-over one second later; the call said: %r; the parent's record: %r; %s" % (
+                    result.get("hand_over_error"), result.get("failure_text"), brief(result, inner))
+        case(W + "a worker that dies while waiting is noticed; no file is handed to it", died_waiting)
+
+        def parent_gone():
+            command = [parent, child, "--wall", "20"] + waiting + ["--abandon", "--", "whoami"]
+            done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            answer = lines_of(done.stdout.decode("ascii", "replace"))
+            before = lines_of(answer[-1].get("first_output") if answer else "")
+            pid = before[0].get("pid") if before else None
+            if not pid:
+                return "FAIL", "the worker's process number was not learnt: %r" % (done.stdout[:300],)
+            import time
+            gone = False
+            for _ in range(50):
+                if windows:
+                    listed = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"], stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=30).stdout.decode("ascii", "replace")
+                    gone = str(pid) not in listed
+                else:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        gone = True
+                    except PermissionError:
+                        gone = False
+                if gone:
+                    break
+                time.sleep(0.1)
+            return ("PASS" if gone else "FAIL"), "tried: the parent leaves at once while worker %d waits; " \
+                "expected: the worker is gone within 5 s; gone=%s" % (pid, gone)
+        case(W + "a waiting worker ends when its parent goes away", parent_gone)
+
+        def waiting_time():
+            result, inner = run_parent(parent, child, waiting + ["--delay-hand-over", "2"], ["spin"], wall="3")
+            seconds = result.get("seconds", 1e9)
+            good = result.get("end") == "killed_by_time_limit" and 2.5 <= seconds <= 3 + 1.5
+            return ("PASS" if good else "FAIL"), "tried: wait 2 s, hand over, the worker never ends, 3 s limit; " \
+                "expected: killed about 3 s after the HAND-OVER (not after the start); seconds=%s; %s" % (
+                    seconds, brief(result, inner))
+        case(W + "time: the limit runs from the hand-over", waiting_time)
+
+        def waiting_memory():
+            result, inner = run_parent(parent, child, waiting + ["--memory", str(GIB)], ["allocate"], wall="60")
+            peak = result.get("peak_memory_bytes", 0)
+            good = result.get("end") == "killed_by_memory_limit"
+            if good and not SANITIZER["seen"]:
+                good = 0 < peak <= GIB
+            return ("PASS" if good else "FAIL"), "peak_memory_bytes=%s (limit %d) %s" % (peak, GIB,
+                                                                                         brief(result, inner))
+        case(W + "memory: the limit ends the worker", waiting_memory)
+
+        def waiting_shipped():
+            hooked, hooked_inner = run_parent(parent, child, waiting + ["--break", "--allow-weaker"], ["whoami"])
+            if "WEAKER" not in hooked.get("confinement", "") + hooked.get("confinement_at_start", ""):
+                return "FAIL", "the control (test-build worker with the switches) did not run WEAKER, so " \
+                    "nothing is shown: " + brief(hooked, hooked_inner)
+            result, inner = run_parent(parent, shipped_child, waiting + ["--break", "--allow-weaker"], ["whoami"])
+            inner = inner or {}
+            if linux:
+                good = result.get("end") == "exited" and "WEAKER" not in result.get("confinement", "") \
+                    and "seccomp=2" in inner.get("self", "")
+                expected = "the worker applies stage 1 and the seal in full (seccomp=2, no WEAKER text)"
+            else:
+                good = result.get("end") == "start_failed" and result.get("hand_over_ok") is False \
+                    and "self" not in inner
+                expected = "the worker, started outside a container, refuses at stage 1 and is given no file"
+            return ("PASS" if good else "FAIL"), "tried: the waiting shape with %s and the test switches in its " \
+                "environment; control: the test-build worker ran WEAKER; expected: %s; %s" % (
+                    os.path.basename(shipped_child), expected, brief(result, inner))
+        if shipped_child:
+            case(W_SHIPPED, waiting_shipped)
+        else:
+            record("NOT RUN", W_SHIPPED, "the test was not given the third program (mie-sandbox-shippedchild)")
 
     # ---- SW-1: the container's own folder (Windows) -------------------------------------------
     def own_folder():

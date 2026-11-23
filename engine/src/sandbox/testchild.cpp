@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -239,11 +240,40 @@ void try_spawn(Line& line) {
 
 // The raw number of the handed-over file (descriptor or handle value), -1 if there is none.
 // Used by the actions that try to misuse it; the sandbox library keeps owning it.
+// The file a WAITING test child received (ruling M-13); null in the one-shot shape.
+std::unique_ptr<mie::io::File> g_waiting_file;
+
 long long inherited_number() {
+    if (g_waiting_file) {
+        return static_cast<long long>(g_waiting_file->native_handle());
+    }
     const char* value = std::getenv("MIE_INHERITED_FILE");
     if (value == nullptr || *value == '\0') {
         return -1;
     }
+    return std::strtoll(value, nullptr, 10);
+}
+
+// Reads exactly `count` bytes from standard input WITHOUT a buffer of the C library in
+// between, as a waiting worker must read its preparation: on Windows the job message follows
+// on the same pipe and must not be swallowed.
+std::vector<std::uint8_t> read_exactly(std::size_t count) {
+    std::vector<std::uint8_t> data(count);
+    std::size_t have = 0;
+    while (have < count) {
+#if defined(_WIN32)
+        const int got = ::_read(0, data.data() + have, static_cast<unsigned>(count - have));
+#else
+        const ssize_t got = ::read(0, data.data() + have, count - have);
+#endif
+        if (got <= 0) {
+            break;
+        }
+        have += static_cast<std::size_t>(got);
+    }
+    data.resize(have);
+    return data;
+}
     return std::strtoll(value, nullptr, 10);
 }
 
@@ -429,6 +459,7 @@ void list_inherited(Line& line) {
         reinterpret_cast<QueryObjectFunction>(::GetProcAddress(ntdll, "NtQueryObject"));
     std::map<std::string, int> types;
     std::string names;
+    std::string all;  // every handle: "value:type:I or N (inheritable or not):access"
     long long file_access = -1;
     int types_refused = 0;
     int names_skipped = 0;
@@ -445,6 +476,12 @@ void list_inherited(Line& line) {
         }
         bool ok = false;
         const std::string type = object_text(query_object, entry.value, 2 /* type */, ok);
+        {
+            char access_text[32];
+            std::snprintf(access_text, sizeof access_text, "0x%lx", static_cast<unsigned long>(entry.granted_access));
+            all += (all.empty() ? "" : ",") + json_text(std::to_string(value) + ":" + (ok ? type : std::string("?")) +
+                                                        ":" + (inheritable ? "I" : "N") + ":" + access_text);
+        }
         if (!ok) {
             ++types_refused;
             ++types["(type not given by the system)"];
@@ -475,6 +512,7 @@ void list_inherited(Line& line) {
     for (const auto& [type, count] : types) {
         type_table += (type_table.empty() ? "" : ",") + json_text(type) + ":" + std::to_string(count);
     }
+    line.raw("all_handles", "[" + all + "]");
     line.raw("handle_types", "{" + type_table + "}");
     line.raw("file_and_key_handles", "[" + names + "]");
     line.number("types_refused", types_refused);
@@ -538,7 +576,16 @@ int main(int argc, char** argv) {
     // else knows whether main() was reached at all.
     std::fputs("mie-sandbox-testchild: main reached\n", stderr);
     std::fflush(stderr);
-    const std::string action = argc > 1 ? argv[1] : "";
+    std::string action = argc > 1 ? argv[1] : "";
+    // The waiting shape (ruling M-13): "waiting <preparation bytes> ACTION [arguments]".
+    const bool waiting = action == "waiting";
+    const int base = waiting ? 3 : 1;  // where ACTION stands in the arguments
+    if (waiting) {
+        action = argc > 3 ? argv[3] : "";
+    }
+    const auto argument = [&](int number, const char* otherwise) {
+        return argc > base + number ? argv[base + number] : otherwise;
+    };
     Line line;
     line.text("action", action);
 
@@ -550,7 +597,59 @@ int main(int argc, char** argv) {
 
     const bool confine = std::getenv("MIE_SANDBOX") != nullptr;
     line.flag("confinement_requested", confine);
-    if (confine) {
+    if (waiting) {
+        // Stage 1 first, as the real worker does.
+        Line before;
+        before.text("phase", "before");
+#if defined(_WIN32)
+        before.number("pid", static_cast<long long>(::GetCurrentProcessId()));
+#else
+        before.number("pid", static_cast<long long>(::getpid()));
+#endif
+        if (confine) {
+            std::string what;
+            std::string error;
+            if (!mie::sandbox::enter_confinement_stage1(what, error)) {
+                before.flag("confined", false);
+                before.text("error", error);
+                before.print();
+                return 3;
+            }
+            before.text("stage1", what);
+        }
+        if (action == "die-waiting") {
+            return 9;  // a worker that dies while it waits
+        }
+        if (action == "skip-seal") {
+            // A worker that answers WITHOUT sealing: the parent must discard this.
+            Line fake;
+            fake.text("action", "skip-seal");
+            fake.text("answer", "this answer must be discarded by the parent");
+            fake.print();
+            return 0;
+        }
+        // The preparation: OUR bytes from the parent, read before the seal.
+        const std::vector<std::uint8_t> preparation =
+            read_exactly(static_cast<std::size_t>(std::strtoull(argc > 2 ? argv[2] : "0", nullptr, 10)));
+        before.number("preparation_bytes", static_cast<long long>(preparation.size()));
+        before.text("preparation_sha256", mie::sha256_hex(preparation));
+        // What this process holds BEFORE the hand-over.
+        list_inherited(before);
+        before.print();  // also the "ready" line the parent waits for
+
+        std::vector<std::uint8_t> job;
+        std::string what;
+        g_waiting_file = mie::sandbox::receive_file_and_seal(job, what);
+        // What it holds AFTER the seal, before one byte of the file is read.
+        Line after;
+        after.text("phase", "after");
+        after.text("what_applied", what);
+        after.text("job", std::string(job.begin(), job.end()));
+        list_inherited(after);
+        after.print();
+        line.flag("confined", confine);
+        line.text("what_applied", what);
+    } else if (confine) {
         std::string what;
         std::string error;
         if (!mie::sandbox::enter_confinement(what, error)) {
@@ -569,7 +668,8 @@ int main(int argc, char** argv) {
         line.text("sha256", mie::sha256_hex(data));
     } else if (action == "read-handle") {
         std::string error;
-        const auto file = mie::sandbox::inherited_file(error);
+        const std::unique_ptr<mie::io::File> file =
+            g_waiting_file ? std::move(g_waiting_file) : mie::sandbox::inherited_file(error);
         if (!file) {
             line.flag("read", false);
             line.text("error", error);
@@ -582,7 +682,7 @@ int main(int argc, char** argv) {
             line.text("sha256", mie::sha256_hex(data));
         }
     } else if (action == "open-path" || action == "write-path") {
-        const char* path = argc > 2 ? argv[2] : "";
+        const char* path = argument(1, "");
         errno = 0;
         std::FILE* file = std::fopen(path, action == "open-path" ? "rb" : "wb");
         line.flag("opened", file != nullptr);
@@ -595,7 +695,7 @@ int main(int argc, char** argv) {
             std::fclose(file);
         }
     } else if (action == "connect") {
-        try_network(line, false, argc > 2 ? argv[2] : "127.0.0.1", argc > 3 ? argv[3] : "0");
+        try_network(line, false, argument(1, "127.0.0.1"), argument(2, "0"));
     } else if (action == "socket") {
         try_network(line, true, "", "");
     } else if (action == "allocate") {

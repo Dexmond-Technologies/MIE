@@ -33,9 +33,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -193,6 +195,18 @@ void close_descriptors_from(int first, long highest) {
     }
 }
 
+// The one message of a hand-over (ruling M-13): fixed size, sent whole. On Linux it travels
+// over the channel together with the file's descriptor; `handle_value` is used on Windows only.
+constexpr std::uint32_t kFrameMagic = 0x3145494Du;  // the bytes "MIE1"
+struct HandOverFrame {
+    std::uint32_t magic;
+    std::uint32_t version;
+    std::uint64_t handle_value;
+    std::uint32_t job_length;
+    std::uint32_t reserved;
+    std::uint8_t job[kMaxJobBytes];
+};
+
 const char* stage_text(int stage) {
     switch (stage) {
         case 1: return "moving the descriptors into place";
@@ -244,9 +258,36 @@ std::unique_ptr<io::File> inherited_file() {
     return inherited_file(ignored);
 }
 
+// What a waiting start keeps of a child that run_or_start created (ruling M-13).
+struct StartedChild {
+    pid_t pid = -1;
+    int in = -1;       // the parent's end of the child's standard input
+    int out = -1;      // ... of its standard output
+    int err = -1;      // ... of its standard error
+    int status = -1;   // ... of the status pipe (-1 without confinement)
+    int channel = -1;  // the parent's end of the channel for the one file
+    bool address_space_limited = false;
+};
+
+static ChildResult run_or_start(const std::filesystem::path& program, const std::vector<std::string>& arguments,
+                                const io::File* inherited, std::span<const std::uint8_t> input,
+                                const Limits& limits, std::size_t max_output_bytes, const RunOptions& options,
+                                StartedChild* keep);
+
 ChildResult run_confined(const std::filesystem::path& program, const std::vector<std::string>& arguments,
                          const io::File* inherited, std::span<const std::uint8_t> input,
                          const Limits& limits, std::size_t max_output_bytes, const RunOptions& options) {
+    return run_or_start(program, arguments, inherited, input, limits, max_output_bytes, options, nullptr);
+}
+
+// Starts a child and, for run_confined (keep == nullptr), runs it to its end. With `keep` (a
+// waiting start, ruling M-13) it returns as soon as the child is created, handing the child's
+// descriptors to *keep; the child then has, in place of a file on descriptor 3, one end of a
+// socket pair: the channel on which it will be sent its one file.
+static ChildResult run_or_start(const std::filesystem::path& program, const std::vector<std::string>& arguments,
+                                const io::File* inherited, std::span<const std::uint8_t> input,
+                                const Limits& limits, std::size_t max_output_bytes, const RunOptions& options,
+                                StartedChild* keep) {
     ChildResult result;
     const auto started = std::chrono::steady_clock::now();
     const auto fail_start = [&](const std::string& why) {
@@ -286,6 +327,9 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     if (inherited != nullptr) {
         environment_store.push_back("MIE_INHERITED_FILE=" + std::to_string(kChildFileFd));
     }
+    if (keep != nullptr) {
+        environment_store.push_back("MIE_SANDBOX_CHANNEL_FD=" + std::to_string(kChildFileFd));
+    }
     if (MIE_SANITIZER_BUILD) {
         // A sanitizer build only (never shipped): keep the sanitizer's own options, and turn
         // the leak check off: it stops the process with a tracer thread and reads /proc, both
@@ -310,8 +354,9 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     int err_pipe[2] = {-1, -1};     // child's standard error
     int status_pipe[2] = {-1, -1};  // child confirms its confinement
     int exec_pipe[2] = {-1, -1};    // carries the reason if the child cannot be started
+    int channel[2] = {-1, -1};      // waiting start only: [0] the parent's end, [1] the child's
     const auto close_all = [&] {
-        for (int* ends : {in_pipe, out_pipe, err_pipe, status_pipe, exec_pipe}) {
+        for (int* ends : {in_pipe, out_pipe, err_pipe, status_pipe, exec_pipe, channel}) {
             close_fd(ends[0]);
             close_fd(ends[1]);
         }
@@ -323,7 +368,17 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         return fail_start(errno_text("pipe", err));
     }
 
-    const int file_fd = inherited != nullptr ? static_cast<int>(inherited->native_handle()) : -1;
+    // Waiting start: a socket pair that keeps message boundaries (SOCK_SEQPACKET): the one
+    // hand-over message arrives whole or not at all, and the worker sees the end of the
+    // channel if the parent goes away.
+    if (keep != nullptr && ::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, channel) != 0) {
+        const int err = errno;
+        close_all();
+        return fail_start(errno_text("socketpair", err));
+    }
+    // What goes on the child's descriptor 3: the file (one-shot) or the channel (waiting start).
+    const int file_fd = keep != nullptr ? channel[1]
+                                        : (inherited != nullptr ? static_cast<int>(inherited->native_handle()) : -1);
     // The hard limit on open descriptors, for the kernels without close_range (see
     // close_descriptors_from). No cap: "unlimited" or an unreadable limit means every number.
     // (Linux never reports "unlimited" here: the kernel bounds the limit by fs.nr_open.)
@@ -441,6 +496,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     close_fd(err_pipe[1]);
     close_fd(status_pipe[1]);
     close_fd(exec_pipe[1]);
+    close_fd(channel[1]);  // the child's end is the child's only
 
     // If exec failed the child wrote why; if it succeeded the pipe just closes.
     int report[2] = {0, 0};
@@ -462,6 +518,20 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     set_nonblocking(err_pipe[0]);
     if (status_pipe[0] >= 0) {
         set_nonblocking(status_pipe[0]);
+    }
+
+    if (keep != nullptr) {
+        // A waiting start ends here: the caller owns the child and its descriptors from now.
+        keep->pid = pid;
+        keep->in = in_pipe[1];
+        keep->out = out_pipe[0];
+        keep->err = err_pipe[0];
+        keep->status = status_pipe[0];
+        keep->channel = channel[0];
+        keep->address_space_limited = limit_address_space;
+        in_pipe[1] = out_pipe[0] = err_pipe[0] = status_pipe[0] = channel[0] = -1;
+        result.end = ChildResult::End::Exited;
+        return result;
     }
 
     // Writing to a child that has died raises SIGPIPE, which would end the PARENT. The signal
@@ -725,6 +795,612 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     }
     return result;
 }
+
+// ================== pre-started one-shot workers (ruling M-13): the parent ==================
+//
+// The worker is created by the same code as a one-shot child (run_or_start), with one
+// difference: instead of a file, descriptor 3 of the child is one end of a socket pair, the
+// CHANNEL over which the parent later sends the one file. Everything below is new code; no
+// thread is used; every function moves the pipes along itself.
+
+struct WaitingChild::Impl {
+    StartedChild child;
+    WaitingState state = WaitingState::Ended;
+    std::string failure;
+    bool confine = true;
+    bool finished = false;  // the process is reaped and every descriptor closed
+    std::uint64_t memory_bytes = 0;
+    std::size_t max_output = 0;
+    std::chrono::steady_clock::time_point started{};
+    std::chrono::steady_clock::time_point handed_over{};
+    std::chrono::steady_clock::time_point reaped_at{};
+    std::string status_text;      // what came on the status pipe, not yet a whole line
+    bool stage1 = false;          // the worker reported stage 1
+    std::string stage1_text;
+    bool sealed = false;          // the worker reported its full confinement
+    std::string seal_text;
+    std::string seal_failure;     // the worker's "fail" line
+    std::string output;
+    std::size_t output_total = 0;
+    std::string error_text;
+    bool killed = false;
+    bool killed_memory = false;
+    bool killed_output = false;
+    bool killed_time = false;
+    bool reaped = false;
+    int wait_status = 0;
+    struct rusage usage {};
+    std::uint64_t highest_resident = 0;
+};
+
+namespace {
+
+// Blocks SIGPIPE for the calling thread while it writes to a worker that may have died, and
+// takes away one that the write raised (the same as run_or_start does for its whole run).
+class PipeSignalBlocked {
+public:
+    PipeSignalBlocked() {
+        sigemptyset(&set_);
+        sigaddset(&set_, SIGPIPE);
+        sigset_t pending;
+        sigemptyset(&pending);
+        ::sigpending(&pending);
+        was_pending_ = sigismember(&pending, SIGPIPE) == 1;
+        ::pthread_sigmask(SIG_BLOCK, &set_, &old_);
+    }
+    ~PipeSignalBlocked() {
+        sigset_t pending;
+        sigemptyset(&pending);
+        ::sigpending(&pending);
+        if (sigismember(&pending, SIGPIPE) == 1 && !was_pending_) {
+            int taken = 0;
+            ::sigwait(&set_, &taken);
+        }
+        ::pthread_sigmask(SIG_SETMASK, &old_, nullptr);
+    }
+    PipeSignalBlocked(const PipeSignalBlocked&) = delete;
+    PipeSignalBlocked& operator=(const PipeSignalBlocked&) = delete;
+
+private:
+    sigset_t set_;
+    sigset_t old_;
+    bool was_pending_ = false;
+};
+
+void kill_waiting(WaitingChild::Impl& c) {
+    if (!c.killed && !c.reaped && c.child.pid > 0) {
+        kill_child(c.child.pid);
+        c.killed = true;
+    }
+}
+
+// The status pipe carries whole lines: "stage1 <what>", then "ok <what>" or "fail <why>".
+void take_status_lines(WaitingChild::Impl& c) {
+    for (;;) {
+        const std::size_t end = c.status_text.find('\n');
+        if (end == std::string::npos) {
+            if (c.status_text.size() > 8192) {
+                c.seal_failure = "the worker's status report is too long";
+                kill_waiting(c);
+                c.status_text.clear();
+            }
+            return;
+        }
+        const std::string line = c.status_text.substr(0, end);
+        c.status_text.erase(0, end + 1);
+        if (line.rfind("stage1 ", 0) == 0 && !c.stage1) {
+            c.stage1 = true;
+            c.stage1_text = line.substr(7);
+        } else if (line.rfind("ok ", 0) == 0 && c.stage1 && !c.sealed && c.seal_failure.empty()) {
+            c.sealed = true;
+            c.seal_text = line.substr(3);
+        } else if (line.rfind("fail ", 0) == 0) {
+            c.seal_failure = line.substr(5);
+        } else {
+            c.seal_failure = "unexpected status line from the worker: " + line.substr(0, 200);
+        }
+    }
+}
+
+// One round: notice the worker's end, watch its resident memory, read what it wrote, and
+// write `input` from *written on if there is any. Waits at most timeout_ms.
+void pump(WaitingChild::Impl& c, int timeout_ms, std::span<const std::uint8_t> input, std::size_t* written) {
+    if (c.child.pid <= 0 || c.finished) {
+        return;
+    }
+    if (!c.reaped && ::wait4(c.child.pid, &c.wait_status, WNOHANG, &c.usage) == c.child.pid) {
+        c.reaped = true;
+        c.reaped_at = std::chrono::steady_clock::now();
+    }
+    if (!c.reaped) {
+        const std::uint64_t resident = resident_bytes(c.child.pid);
+        if (resident > c.highest_resident) {
+            c.highest_resident = resident;
+        }
+        if (c.memory_bytes > 0 && resident > c.memory_bytes && !c.killed) {
+            c.killed_memory = true;  // also while it waits: a waiting worker over the limit is ended
+            kill_waiting(c);
+        }
+    }
+
+    struct pollfd fds[4];
+    int count = 0;
+    int out_index = -1;
+    int err_index = -1;
+    int status_index = -1;
+    int in_index = -1;
+    if (c.child.out >= 0) {
+        out_index = count;
+        fds[count++] = {c.child.out, POLLIN, 0};
+    }
+    if (c.child.err >= 0) {
+        err_index = count;
+        fds[count++] = {c.child.err, POLLIN, 0};
+    }
+    if (c.child.status >= 0) {
+        status_index = count;
+        fds[count++] = {c.child.status, POLLIN, 0};
+    }
+    if (written != nullptr && *written < input.size() && c.child.in >= 0) {
+        in_index = count;
+        fds[count++] = {c.child.in, POLLOUT, 0};
+    }
+    if (count == 0) {
+        if (timeout_ms > 0) {
+            ::poll(nullptr, 0, timeout_ms);
+        }
+        return;
+    }
+    if (::poll(fds, static_cast<nfds_t>(count), timeout_ms) <= 0) {
+        return;
+    }
+
+    char buffer[64 * 1024];
+    if (status_index >= 0 && fds[status_index].revents != 0) {
+        const ssize_t n = ::read(c.child.status, buffer, sizeof buffer);
+        if (n > 0) {
+            c.status_text.append(buffer, static_cast<std::size_t>(n));
+            take_status_lines(c);
+        } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
+            close_fd(c.child.status);
+        }
+    }
+    if (out_index >= 0 && fds[out_index].revents != 0) {
+        const ssize_t n = ::read(c.child.out, buffer, sizeof buffer);
+        if (n > 0) {
+            const std::size_t room = c.output_total < c.max_output ? c.max_output - c.output_total : 0;
+            const std::size_t take = static_cast<std::size_t>(n) < room ? static_cast<std::size_t>(n) : room;
+            c.output.append(buffer, take);
+            c.output_total += take;
+            if (take < static_cast<std::size_t>(n) && !c.killed_output) {
+                c.killed_output = true;  // more output than allowed: the worker is stopped
+                kill_waiting(c);
+            }
+        } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
+            close_fd(c.child.out);
+        }
+    }
+    if (err_index >= 0 && fds[err_index].revents != 0) {
+        const ssize_t n = ::read(c.child.err, buffer, sizeof buffer);
+        if (n > 0) {
+            if (c.error_text.size() < 16 * 1024) {
+                c.error_text.append(buffer, static_cast<std::size_t>(n));
+            }
+        } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
+            close_fd(c.child.err);
+        }
+    }
+    if (in_index >= 0 && fds[in_index].revents != 0 && c.child.in >= 0) {
+        const ssize_t n = ::write(c.child.in, input.data() + *written, input.size() - *written);
+        if (n > 0) {
+            *written += static_cast<std::size_t>(n);
+        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            close_fd(c.child.in);  // the worker no longer reads
+        }
+    }
+}
+
+std::string end_in_words(const WaitingChild::Impl& c) {
+    if (WIFEXITED(c.wait_status)) {
+        return "exit code " + std::to_string(WEXITSTATUS(c.wait_status));
+    }
+    if (WIFSIGNALED(c.wait_status)) {
+        return "signal " + std::to_string(WTERMSIG(c.wait_status));
+    }
+    return "an unknown end";
+}
+
+// Closes everything and makes sure the process is gone and reaped.
+void finish_child(WaitingChild::Impl& c) {
+    if (c.finished) {
+        return;
+    }
+    close_fd(c.child.in);
+    close_fd(c.child.out);
+    close_fd(c.child.err);
+    close_fd(c.child.status);
+    close_fd(c.child.channel);
+    if (c.child.pid > 0) {
+        if (!c.reaped) {
+            kill_child(c.child.pid);
+            ::wait4(c.child.pid, &c.wait_status, 0, &c.usage);
+            c.reaped = true;
+        }
+        ::kill(-c.child.pid, SIGKILL);  // nothing of the worker's group may be left behind
+    }
+    c.finished = true;
+}
+
+void update_state(WaitingChild::Impl& c) {
+    if (c.state == WaitingState::Starting && (c.stage1 || !c.confine)) {
+        c.state = WaitingState::Waiting;
+    }
+    if ((c.state == WaitingState::Starting || c.state == WaitingState::Waiting) && (c.reaped || c.killed)) {
+        c.failure = c.killed_memory        ? "ended by the parent: over the memory limit while waiting"
+                    : c.killed_output      ? "ended by the parent: more output than allowed while waiting"
+                    : !c.seal_failure.empty() ? "the worker could not confine itself: " + c.seal_failure
+                                              : std::string("the worker ended while waiting");
+        finish_child(c);
+        c.failure += " (" + end_in_words(c) + ")";
+        if (!c.error_text.empty()) {
+            c.failure += "; standard error: " + c.error_text;
+        }
+        c.state = WaitingState::Ended;
+    }
+}
+
+std::string parent_part_of(const WaitingChild::Impl& c) {
+    std::string text = "parent: own process group, no-new-privileges, no core file, no other descriptors";
+    if (c.child.address_space_limited) {
+        text += ", address-space limit " + std::to_string(c.memory_bytes) + " bytes";
+    } else if (c.memory_bytes > 0) {
+        text += ", NO address-space limit (sanitizer build), resident memory watched by the parent";
+    }
+    return text;
+}
+
+// Sends one message on the channel, with `fd_count` descriptors attached.
+bool send_on_channel(WaitingChild::Impl& c, const void* data, std::size_t size, const int* descriptors,
+                     std::size_t fd_count, std::string& error) {
+    struct iovec part {};
+    part.iov_base = const_cast<void*>(data);
+    part.iov_len = size;
+    alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int) * 4)];
+    std::memset(control, 0, sizeof control);
+    struct msghdr message {};
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    if (fd_count > 0) {
+        message.msg_control = control;
+        message.msg_controllen = CMSG_SPACE(sizeof(int) * fd_count);
+        struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int) * fd_count);
+        std::memcpy(CMSG_DATA(header), descriptors, sizeof(int) * fd_count);
+    }
+    ssize_t sent = 0;
+    do {
+        // MSG_NOSIGNAL: a worker that has died gives an error here, not a signal to the parent.
+        sent = ::sendmsg(c.child.channel, &message, MSG_NOSIGNAL | MSG_DONTWAIT);
+    } while (sent < 0 && errno == EINTR);
+    if (sent < 0) {
+        error = errno_text("sending the file to the worker", errno);
+        return false;
+    }
+    if (static_cast<std::size_t>(sent) != size) {
+        error = "the hand-over message was not sent whole";
+        return false;
+    }
+    return true;
+}
+
+// After the one message: the channel is closed on the parent's side (the worker closes its
+// own end before it seals), standard input is closed, and the clock of collect() starts.
+void after_hand_over(WaitingChild::Impl& c) {
+    close_fd(c.child.channel);
+    close_fd(c.child.in);
+    c.handed_over = std::chrono::steady_clock::now();
+    c.state = WaitingState::HandedOver;
+}
+
+const char* state_in_words(WaitingState state) {
+    switch (state) {
+        case WaitingState::Starting: return "the worker has not yet reported stage 1 of its confinement";
+        case WaitingState::Waiting: return "the worker waits";
+        case WaitingState::HandedOver: return "this worker was already given its one file";
+        case WaitingState::Ended: return "the worker has ended";
+    }
+    return "the worker has ended";
+}
+
+}  // namespace
+
+WaitingChild::WaitingChild(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+WaitingChild::~WaitingChild() {
+    if (impl_) {
+        kill_waiting(*impl_);
+        finish_child(*impl_);
+    }
+}
+
+std::unique_ptr<WaitingChild> start_waiting(const std::filesystem::path& program,
+                                            const std::vector<std::string>& arguments,
+                                            const WaitingOptions& options) {
+    auto impl = std::make_unique<WaitingChild::Impl>();
+    impl->started = std::chrono::steady_clock::now();
+    impl->confine = options.run.confine;
+    impl->memory_bytes = options.memory_bytes;
+    impl->max_output = options.max_output_bytes;
+    Limits limits;
+    limits.memory_bytes = options.memory_bytes;
+    const ChildResult created = run_or_start(program, arguments, nullptr, {}, limits, 0, options.run, &impl->child);
+    if (impl->child.pid <= 0) {
+        impl->state = WaitingState::Ended;
+        impl->failure = created.detail.empty() ? "the worker could not be started" : created.detail;
+        impl->finished = true;
+    } else {
+        // Without confinement (tests only) there is no stage-1 report to wait for.
+        impl->state = options.run.confine ? WaitingState::Starting : WaitingState::Waiting;
+    }
+    return std::make_unique<WaitingChild>(std::move(impl));
+}
+
+WaitingState poll(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    pump(c, 0, {}, nullptr);
+    update_state(c);
+    return c.state;
+}
+
+bool send_preparation(WaitingChild& child, std::span<const std::uint8_t> bytes, int timeout_seconds,
+                      std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    const PipeSignalBlocked no_signal;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+    std::size_t written = 0;
+    while (written < bytes.size()) {
+        pump(c, 20, bytes, &written);
+        update_state(c);
+        if (c.state == WaitingState::Ended || c.state == WaitingState::HandedOver) {
+            error = std::string("the preparation was not sent: ") + state_in_words(c.state) +
+                    (c.failure.empty() ? "" : ": " + c.failure);
+            return false;
+        }
+        if (c.child.in < 0) {
+            error = "the preparation was not sent: the worker closed its standard input";
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "the preparation was not sent within " + std::to_string(timeout_seconds) + " seconds";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string take_output(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    pump(c, 0, {}, nullptr);
+    update_state(c);
+    std::string taken;
+    taken.swap(c.output);
+    return taken;
+}
+
+bool hand_over_file(WaitingChild& child, const io::File& file, std::span<const std::uint8_t> job,
+                    std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    pump(c, 0, {}, nullptr);
+    update_state(c);
+    if (c.state != WaitingState::Waiting) {
+        // Starting: no file before the worker reported stage 1. HandedOver: one file per worker.
+        error = std::string("the file was not handed over: ") + state_in_words(c.state) +
+                (c.failure.empty() ? "" : ": " + c.failure);
+        return false;
+    }
+    if (job.size() > kMaxJobBytes) {
+        error = "the file was not handed over: the job is longer than " + std::to_string(kMaxJobBytes) + " bytes";
+        return false;
+    }
+    HandOverFrame frame{};
+    frame.magic = kFrameMagic;
+    frame.version = 1;
+    frame.job_length = static_cast<std::uint32_t>(job.size());
+    if (!job.empty()) {
+        std::memcpy(frame.job, job.data(), job.size());
+    }
+    // The descriptor of the parent's file: opened read-only by mie::io. The worker gets a
+    // descriptor of the same open file, so it is read-only there too; the worker checks it.
+    const int descriptor = static_cast<int>(file.native_handle());
+    if (!send_on_channel(c, &frame, sizeof frame, &descriptor, 1, error)) {
+        kill_waiting(c);
+        update_state(c);
+        return false;
+    }
+    after_hand_over(c);
+    return true;
+}
+
+ChildResult collect(WaitingChild& child, const Limits& limits) {
+    WaitingChild::Impl& c = child.impl();
+    ChildResult result;
+    if (c.state != WaitingState::HandedOver) {
+        const std::string why = c.state == WaitingState::Ended
+                                    ? "the worker had ended before it was given a file: " + c.failure
+                                    : std::string("collect() was called on a worker that was given no file");
+        end_waiting(child);
+        result.end = ChildResult::End::StartFailed;
+        result.detail = why;
+        result.confinement = parent_part_of(c) + "; child: " + (c.stage1 ? "stage 1 only: " + c.stage1_text : "not confirmed");
+        return result;
+    }
+    const auto deadline = c.handed_over + std::chrono::seconds(limits.wall_seconds > 0 ? limits.wall_seconds : 0);
+    while (!c.finished) {
+        pump(c, 20, {}, nullptr);
+        const bool streams_open = c.child.out >= 0 || c.child.err >= 0 || c.child.status >= 0;
+        if (c.reaped && !streams_open) {
+            break;
+        }
+        if (c.reaped && std::chrono::steady_clock::now() - c.reaped_at > std::chrono::milliseconds(500)) {
+            break;
+        }
+        if (!c.reaped && std::chrono::steady_clock::now() >= deadline && !c.killed) {
+            c.killed_time = true;
+            kill_waiting(c);
+        }
+    }
+    finish_child(c);
+    c.state = WaitingState::Ended;
+
+    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.handed_over).count();
+#if defined(__APPLE__)
+    result.peak_memory_bytes = static_cast<std::uint64_t>(c.usage.ru_maxrss);
+#else
+    result.peak_memory_bytes = static_cast<std::uint64_t>(c.usage.ru_maxrss) * 1024;
+#endif
+    if (result.peak_memory_bytes == 0) {
+        result.peak_memory_bytes = c.highest_resident;
+    }
+    result.confinement =
+        parent_part_of(c) + "; child: " +
+        (!c.confine ? std::string("none (confinement not requested)")
+                    : c.sealed ? c.seal_text
+                               : c.stage1 ? "stage 1 only, NOT sealed: " + c.stage1_text : std::string("not confirmed"));
+    if (!c.error_text.empty()) {
+        result.detail = "standard error: " + c.error_text;
+    }
+    const auto with_detail = [&](const std::string& text) {
+        result.detail = result.detail.empty() ? text : text + "; " + result.detail;
+    };
+    if (WIFEXITED(c.wait_status)) {
+        result.exit_code = WEXITSTATUS(c.wait_status);
+    } else if (WIFSIGNALED(c.wait_status)) {
+        result.exit_code = 128 + WTERMSIG(c.wait_status);
+    }
+
+    if (c.confine && !c.sealed) {
+        // Reviewer's condition: the answer of a worker that did not report its full
+        // confinement is discarded, whatever it wrote and however it ended.
+        result.end = c.killed_time ? ChildResult::End::KilledByTimeLimit : ChildResult::End::StartFailed;
+        with_detail(!c.seal_failure.empty()
+                        ? "the worker refused the hand-over or could not seal: " + c.seal_failure + " (" +
+                              end_in_words(c) + "); nothing it wrote is used"
+                        : "the worker did not report its full confinement (" + end_in_words(c) +
+                              "); its answer is discarded");
+        return result;
+    }
+    result.output = std::move(c.output);
+    if (c.killed_time) {
+        result.end = ChildResult::End::KilledByTimeLimit;
+        with_detail("killed at the time limit of " + std::to_string(limits.wall_seconds) +
+                    " seconds after the hand-over");
+    } else if (c.killed_memory) {
+        result.end = ChildResult::End::KilledByMemoryLimit;
+        with_detail("killed: resident memory went over " + std::to_string(c.memory_bytes) + " bytes");
+    } else if (c.killed_output) {
+        result.end = ChildResult::End::Crashed;
+        with_detail("killed: more output than the allowed " + std::to_string(c.max_output) + " bytes");
+    } else if (WIFEXITED(c.wait_status)) {
+        if (result.exit_code == kOutOfMemoryExitCode) {
+            result.end = ChildResult::End::KilledByMemoryLimit;
+            with_detail("the child ran out of its memory limit (an allocation was refused)");
+        } else {
+            result.end = ChildResult::End::Exited;
+        }
+    } else {
+        result.end = ChildResult::End::Crashed;
+        with_detail("ended by " + end_in_words(c));
+    }
+    return result;
+}
+
+void end_waiting(WaitingChild& child) {
+    WaitingChild::Impl& c = child.impl();
+    if (c.finished) {
+        c.state = WaitingState::Ended;
+        return;
+    }
+    // Closing the channel is the polite way (the worker ends by itself with kNoJobExitCode);
+    // the kill makes sure.
+    kill_waiting(c);
+    finish_child(c);
+    if (c.failure.empty()) {
+        c.failure = "ended by the parent without having been used";
+    }
+    c.state = WaitingState::Ended;
+}
+
+std::string confinement_at_start(const WaitingChild& child) {
+    const WaitingChild::Impl& c = child.impl();
+    return parent_part_of(c) + "; child: " +
+           (!c.confine ? std::string("none (confinement not requested)")
+                       : c.stage1 ? "stage 1: " + c.stage1_text : std::string("not yet reported"));
+}
+
+std::string failure(const WaitingChild& child) { return child.impl().failure; }
+
+double seconds_since_start(const WaitingChild& child) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - child.impl().started).count();
+}
+
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+// Tests only: a hand-over that is not as required. The worker must refuse it.
+bool hand_over_malformed(WaitingChild& child, MalformedHandOver kind, const std::filesystem::path& file,
+                         std::string& error) {
+    WaitingChild::Impl& c = child.impl();
+    error.clear();
+    pump(c, 0, {}, nullptr);
+    update_state(c);
+    if (c.state != WaitingState::Waiting) {
+        error = std::string("not sent: ") + state_in_words(c.state);
+        return false;
+    }
+    HandOverFrame frame{};
+    frame.magic = kFrameMagic;
+    frame.version = 1;
+    int descriptors[2] = {-1, -1};
+    std::size_t count = 0;
+    std::size_t size = sizeof frame;
+    switch (kind) {
+        case MalformedHandOver::NoDescriptor:
+            break;
+        case MalformedHandOver::TwoDescriptors:
+            descriptors[0] = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+            descriptors[1] = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+            count = 2;
+            break;
+        case MalformedHandOver::NotARegularFile:
+            descriptors[0] = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            count = 1;
+            break;
+        case MalformedHandOver::Writable:
+            descriptors[0] = ::open(file.c_str(), O_RDWR | O_CLOEXEC);
+            count = 1;
+            break;
+        case MalformedHandOver::ShortMessage:
+            descriptors[0] = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+            count = 1;
+            size = 8;
+            break;
+    }
+    bool sent = false;
+    if ((count >= 1 && descriptors[0] < 0) || (count == 2 && descriptors[1] < 0)) {
+        error = errno_text("test set-up: opening the file", errno);
+    } else {
+        sent = send_on_channel(c, &frame, size, descriptors, count, error);
+    }
+    close_fd(descriptors[0]);
+    close_fd(descriptors[1]);
+    if (sent) {
+        after_hand_over(c);
+    }
+    return sent;
+}
+#endif
 
 // =============================== the child's side ===============================
 
@@ -1154,6 +1830,259 @@ bool enter_confinement(std::string& what_applied, std::string& error) {
     return true;
 }
 
+// ================== pre-started one-shot workers (ruling M-13): the worker ==================
+//
+// The exact order, and why it is in this order:
+//
+//   BEFORE exec, by the parent (as for every child): own process group, die-with-parent
+//     signal, no-new-privileges, no core file, address-space limit, descriptors 0, 1, 2, the
+//     channel on 3, the status pipe on 4, everything else closed, minimal environment.
+//
+//   enter_confinement_stage1(), first thing in main():
+//     1. no-new-privileges (again), not dumpable;
+//     2. Landlock: no file by path, no TCP (where the kernel has it);
+//     3. one line "stage1 <what>" on the status pipe. The parent hands no file to a worker
+//        that has not sent this line.
+//     The system-call filter is NOT installed yet.
+//
+//   The worker PREPARES: it reads its rules and tables from standard input and compiles
+//     them. Those bytes come from the parent and are the product's own shipped files; nobody
+//     who can choose the file to be scanned can choose them. In this window system calls are
+//     not filtered; what holds is Landlock (no path, no TCP), no-new-privileges and the
+//     limits. The remaining risk in one sentence: a defect in compiling OUR OWN rule files
+//     would run without the filter.
+//
+//   receive_file_and_seal():
+//     4. recvmsg on the channel: ONE message of fixed size with exactly ONE descriptor.
+//        (recvmsg is not on the filter's list and need not be: the filter is not yet there.)
+//        End of channel instead (the parent closed it or died): exit kNoJobExitCode.
+//     5. the message and the descriptor are CHECKED, nothing of the file is read: whole
+//        message, right size, one descriptor, a regular file (fstat), opened read-only
+//        (fcntl F_GETFL; asked here because fcntl is not on the list afterwards). Anything
+//        else: every received descriptor is closed, "fail <why>" on the status pipe, exit
+//        kHandOverRefusedExitCode, no answer.
+//     6. the channel is closed (no second job can arrive);
+//     7. the file is taken over as an io::File (asks its size: fstat);
+//     8. the system-call filter is installed (the same list as for a one-shot child);
+//     9. one line "ok <what>" on the status pipe, which is then closed. The parent discards
+//        the answer of a worker from which this line did not come;
+//    10. the file and the job bytes are returned to the caller. The job bytes were copied in
+//        step 4 and are not looked at by this code beyond their length.
+//   From here on the worker reads the file: the first hostile byte, under the full confinement.
+//   Open descriptors at that point: 0, 1, 2 and the file.
+
+namespace {
+
+std::string g_stage1_text;  // what stage 1 applied, repeated in the final report
+
+// One line on the status pipe. `close_after`: the pipe is closed (the last line).
+void status_line(const char* prefix, const std::string& text, bool close_after) {
+    const char* value = std::getenv("MIE_SANDBOX_STATUS_FD");
+    const int fd = value != nullptr ? std::atoi(value) : -1;
+    if (fd <= 2) {
+        return;  // started without confinement: nobody reads a status
+    }
+    std::string line = std::string(prefix) + " " + text;
+    for (char& c : line) {
+        if (c == '\n' || c == '\r') {
+            c = ' ';
+        }
+    }
+    line.push_back('\n');
+    std::size_t done = 0;
+    while (done < line.size()) {
+        const ssize_t n = ::write(fd, line.data() + done, line.size() - done);
+        if (n <= 0) {
+            break;
+        }
+        done += static_cast<std::size_t>(n);
+    }
+    if (close_after) {
+        ::close(fd);
+    }
+}
+
+[[noreturn]] void refuse_hand_over(const std::string& why) {
+    status_line("fail", why, true);
+    ::_exit(kHandOverRefusedExitCode);
+}
+
+}  // namespace
+
+bool enter_confinement_stage1(std::string& what_applied, std::string& error) {
+    what_applied.clear();
+    error.clear();
+    if (std::getenv("MIE_SANDBOX") == nullptr) {
+        // The parent started this worker without confinement (RunOptions::confine = false).
+        what_applied = "none (the parent did not ask for confinement)";
+        g_stage1_text = what_applied;
+        return true;
+    }
+    bool allow_weaker = false;
+    bool test_break = false;
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+    allow_weaker = flag_set("MIE_SANDBOX_ALLOW_WEAKER");
+    test_break = flag_set("MIE_SANDBOX_TEST_BREAK");
+#endif
+    std::vector<std::string> applied;
+    std::vector<std::string> missing;
+    if (test_break) {
+        missing.push_back("test hook: the confinement was deliberately not applied");
+    } else {
+        if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+            applied.push_back("no-new-privileges");
+        } else {
+            missing.push_back(errno_text("no-new-privileges", errno));
+        }
+        if (::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0) {
+            applied.push_back("not dumpable");
+        }
+        std::string what;
+        std::string why_not;
+        if (apply_landlock(what, why_not)) {
+            applied.push_back(what);
+        } else {
+            applied.push_back(why_not);  // "no Landlock on this kernel": said, not a failure
+        }
+    }
+    for (const std::string& part : applied) {
+        what_applied += (what_applied.empty() ? "" : ", ") + part;
+    }
+    if (!missing.empty()) {
+        for (const std::string& part : missing) {
+            error += (error.empty() ? "" : ", ") + part;
+        }
+        if (!allow_weaker) {
+            status_line("fail", error, true);
+            return false;
+        }
+        what_applied += (what_applied.empty() ? "" : "; ") + std::string("WEAKER: ") + error;
+    }
+    g_stage1_text = what_applied;
+    status_line("stage1", what_applied.empty() ? "nothing" : what_applied, false);
+    return true;
+}
+
+std::unique_ptr<io::File> receive_file_and_seal(std::vector<std::uint8_t>& job, std::string& what_applied) {
+    job.clear();
+    what_applied.clear();
+    const bool confine = std::getenv("MIE_SANDBOX") != nullptr;
+    const char* channel_text = std::getenv("MIE_SANDBOX_CHANNEL_FD");
+    const int channel = channel_text != nullptr ? std::atoi(channel_text) : -1;
+    if (channel < 3) {
+        refuse_hand_over("this worker has no channel on which a file could arrive");
+    }
+
+    // Step 4: one message. Room for four descriptors, so that "more than one" is seen and
+    // every one of them can be closed.
+    HandOverFrame frame{};
+    struct iovec part {};
+    part.iov_base = &frame;
+    part.iov_len = sizeof frame;
+    alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof(int) * 4)];
+    std::memset(control, 0, sizeof control);
+    struct msghdr message {};
+    message.msg_iov = &part;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof control;
+    ssize_t got = 0;
+    do {
+        got = ::recvmsg(channel, &message, MSG_CMSG_CLOEXEC);
+    } while (got < 0 && errno == EINTR);
+    if (got == 0) {
+        ::close(channel);
+        ::_exit(kNoJobExitCode);  // the parent closed the channel or is gone: never used
+    }
+    if (got < 0) {
+        refuse_hand_over(errno_text("receiving the hand-over", errno));
+    }
+
+    // Step 5: checks. The descriptors that came are collected first, so that they can all be
+    // closed if anything is wrong.
+    int received[4] = {-1, -1, -1, -1};
+    std::size_t count = 0;
+    bool other_control = false;
+    if (message.msg_controllen >= sizeof(struct cmsghdr)) {
+        const struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+        if (header != nullptr && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS) {
+            count = (static_cast<std::size_t>(header->cmsg_len) - CMSG_LEN(0)) / sizeof(int);
+            if (count > 4) {
+                count = 4;
+            }
+            std::memcpy(received, CMSG_DATA(header), count * sizeof(int));
+            other_control = static_cast<std::size_t>(message.msg_controllen) > CMSG_SPACE(count * sizeof(int));
+        } else {
+            other_control = true;
+        }
+    }
+    std::string why;
+    if ((message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+        why = "the hand-over message was cut: it is too long or carries too many descriptors";
+    } else if (static_cast<std::size_t>(got) != sizeof frame) {
+        why = "the hand-over message has the wrong size";
+    } else if (other_control) {
+        why = "the hand-over message carries something other than one descriptor";
+    } else if (count == 0) {
+        why = "the hand-over message carries no file";
+    } else if (count != 1) {
+        why = "the hand-over message carries more than one descriptor";
+    } else if (frame.magic != kFrameMagic || frame.version != 1 || frame.job_length > kMaxJobBytes) {
+        why = "the hand-over message is not in the expected form";
+    } else {
+        struct stat status {};
+        const int flags = ::fcntl(received[0], F_GETFL);
+        if (::fstat(received[0], &status) != 0) {
+            why = errno_text("the handed-over descriptor cannot be asked what it is", errno);
+        } else if (!S_ISREG(status.st_mode)) {
+            why = "the handed-over descriptor is not a regular file";
+        } else if (flags == -1 || (flags & O_ACCMODE) != O_RDONLY) {
+            why = "the handed-over file is not opened read-only";
+        }
+    }
+    if (!why.empty()) {
+        for (std::size_t i = 0; i < count; ++i) {
+            ::close(received[i]);
+        }
+        ::close(channel);
+        refuse_hand_over(why);
+    }
+
+    // Step 6: no second job can arrive.
+    ::close(channel);
+
+    // Step 7: the file as the rest of the engine knows it (asks its size; reads no content).
+    io::IoError io_error;
+    std::unique_ptr<io::File> file = io::adopt_native_handle(static_cast<std::intptr_t>(received[0]), io_error);
+    if (!file) {
+        refuse_hand_over(std::string("the handed-over file cannot be used: ") + io::to_string(io_error.code));
+    }
+
+    // Step 8: the system-call filter.
+    std::string filter_text = "no system-call filter (the parent did not ask for confinement)";
+    if (confine) {
+        bool allow_weaker = false;
+        bool test_break = false;
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+        allow_weaker = flag_set("MIE_SANDBOX_ALLOW_WEAKER");
+        test_break = flag_set("MIE_SANDBOX_TEST_BREAK");
+#endif
+        std::string why_not = "test hook: the system-call filter was deliberately not installed";
+        if (test_break || !apply_seccomp(filter_text, why_not)) {
+            if (!allow_weaker) {
+                refuse_hand_over("the worker could not seal itself: " + why_not);
+            }
+            filter_text = "WEAKER: " + why_not;
+        }
+    }
+
+    // Step 9: the report. Step 10: the file goes to the caller.
+    what_applied = g_stage1_text + (g_stage1_text.empty() ? "" : ", ") + filter_text;
+    status_line("ok", what_applied, true);
+    job.assign(frame.job, frame.job + frame.job_length);
+    return file;
+}
+
 std::string describe_self() {
     const int no_new_privs = ::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
     const int seccomp = ::prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
@@ -1175,6 +2104,16 @@ bool enter_confinement(std::string& what_applied, std::string& error) {
         ::close(std::atoi(value));
     }
     return false;
+}
+
+bool enter_confinement_stage1(std::string& what_applied, std::string& error) {
+    return enter_confinement(what_applied, error);  // refuses: no confinement on this system
+}
+
+std::unique_ptr<io::File> receive_file_and_seal(std::vector<std::uint8_t>& job, std::string& what_applied) {
+    job.clear();
+    what_applied.clear();
+    ::_exit(kHandOverRefusedExitCode);  // no confinement is written for this system
 }
 
 std::string describe_self() { return "no confinement on this system"; }
