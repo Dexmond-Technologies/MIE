@@ -31,6 +31,8 @@ std::uint64_t File::size() const { return impl_->size; }
 
 const FileIdentity& File::identity() const { return impl_->identity; }
 
+std::intptr_t File::native_handle() const { return static_cast<std::intptr_t>(impl_->fd); }
+
 std::int64_t File::read_at(std::uint64_t offset, std::span<std::uint8_t> buffer, IoError& error) {
     std::size_t done = 0;
     while (done < buffer.size()) {
@@ -129,6 +131,33 @@ std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& e
     impl->identity.volume = static_cast<std::uint64_t>(after.st_dev);
     impl->identity.index_high = 0;
     impl->identity.index_low = static_cast<std::uint64_t>(after.st_ino);
+    return std::make_unique<File>(std::move(impl));
+}
+
+std::unique_ptr<File> adopt_native_handle(std::intptr_t handle, IoError& error) {
+    error = IoError{};
+    const int fd = static_cast<int>(handle);
+    struct stat st {};
+    if (fd < 0 || ::fstat(fd, &st) != 0) {
+        error.code = IoErrorCode::Other;
+        error.detail = "handed-over handle is not usable";
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        return nullptr;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        error.code = IoErrorCode::NotRegular;
+        error.detail = "handed-over handle is not a regular file";
+        ::close(fd);
+        return nullptr;
+    }
+    auto impl = std::make_unique<File::Impl>();
+    impl->fd = fd;
+    impl->size = static_cast<std::uint64_t>(st.st_size);
+    impl->identity.volume = static_cast<std::uint64_t>(st.st_dev);
+    impl->identity.index_high = 0;
+    impl->identity.index_low = static_cast<std::uint64_t>(st.st_ino);
     return std::make_unique<File>(std::move(impl));
 }
 

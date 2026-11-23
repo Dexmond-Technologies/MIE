@@ -62,6 +62,25 @@ endif()
 target_include_directories(mie_core PUBLIC include)
 target_link_libraries(mie_core PUBLIC nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto)
 
+# ---- worker confinement ---------------------------------------------------------------
+if(WIN32)
+  add_library(mie_sandbox STATIC src/sandbox/sandbox_win.cpp)
+  target_link_libraries(mie_sandbox PUBLIC mie_core PRIVATE userenv advapi32 Threads::Threads)
+else()
+  add_library(mie_sandbox STATIC src/sandbox/sandbox_posix.cpp)
+  target_link_libraries(mie_sandbox PUBLIC mie_core PRIVATE Threads::Threads)
+endif()
+target_include_directories(mie_sandbox PUBLIC include)
+
+# Test programs of the confinement: never installed, never packaged.
+add_executable(mie-sandbox-testchild src/sandbox/testchild.cpp)
+target_link_libraries(mie-sandbox-testchild PRIVATE mie_sandbox mie_core)
+if(WIN32)
+  target_link_libraries(mie-sandbox-testchild PRIVATE ws2_32)
+endif()
+add_executable(mie-sandbox-testparent src/sandbox/testparent.cpp)
+target_link_libraries(mie-sandbox-testparent PRIVATE mie_sandbox mie_core)
+
 # ---- reader for Windows executables (own code, standard library only) --------------
 add_library(mie_pe STATIC src/pe/pe_reader.cpp)
 target_include_directories(mie_pe PUBLIC include)
@@ -147,6 +166,10 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/strings_parity.py
                    $<TARGET_FILE:mie-probe> ${MIE_REPO_ROOT})
   set_tests_properties(strings_parity PROPERTIES TIMEOUT 600)
+  add_test(NAME sandbox_cases
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/sandbox_cases.py
+                   $<TARGET_FILE:mie-sandbox-testparent> $<TARGET_FILE:mie-sandbox-testchild>)
+  set_tests_properties(sandbox_cases PROPERTIES TIMEOUT 600)
   add_test(NAME pe_parity
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_parity.py
                    $<TARGET_FILE:mie-pe-probe> ${MIE_REPO_ROOT})

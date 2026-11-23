@@ -26,6 +26,8 @@ std::uint64_t File::size() const { return impl_->size; }
 
 const FileIdentity& File::identity() const { return impl_->identity; }
 
+std::intptr_t File::native_handle() const { return reinterpret_cast<std::intptr_t>(impl_->handle); }
+
 std::int64_t File::read_at(std::uint64_t offset, std::span<std::uint8_t> buffer, IoError& error) {
     std::size_t done = 0;
     while (done < buffer.size()) {
@@ -200,6 +202,29 @@ std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& e
         return nullptr;
     }
 
+    auto impl = std::make_unique<File::Impl>();
+    impl->handle = handle;
+    impl->size = facts.size;
+    impl->identity = facts.identity;
+    return std::make_unique<File>(std::move(impl));
+}
+
+std::unique_ptr<File> adopt_native_handle(std::intptr_t handle_value, IoError& error) {
+    error = IoError{};
+    const HANDLE handle = reinterpret_cast<HANDLE>(handle_value);
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        error.code = IoErrorCode::Other;
+        error.detail = "handed-over handle is not usable";
+        return nullptr;
+    }
+    Facts facts;
+    if (::GetFileType(handle) != FILE_TYPE_DISK || !read_facts(handle, facts) ||
+        (facts.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        ::CloseHandle(handle);
+        error.code = IoErrorCode::NotRegular;
+        error.detail = "handed-over handle is not a regular file";
+        return nullptr;
+    }
     auto impl = std::make_unique<File::Impl>();
     impl->handle = handle;
     impl->size = facts.size;

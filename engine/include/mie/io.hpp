@@ -52,6 +52,10 @@ public:
     // bytes read (0 at end of file), or -1 with `error` set.
     std::int64_t read_at(std::uint64_t offset, std::span<std::uint8_t> buffer, IoError& error);
 
+    // The native handle (POSIX file descriptor, Windows HANDLE value). Still owned by the
+    // File. Used to hand the one open file to the confined worker process.
+    std::intptr_t native_handle() const;
+
     struct Impl;
     explicit File(std::unique_ptr<Impl> impl);
 
@@ -77,5 +81,10 @@ struct OpenOptions {
 // and file systems with 128-bit file ids (ReFS) are compared on 64 bits only.
 std::unique_ptr<File> open_regular(const std::filesystem::path& path, IoError& error,
                                    const OpenOptions& options = OpenOptions{});
+
+// Takes ownership of an already-open handle (the one a parent handed to a worker). Refuses
+// anything that is not a regular file; fills size and identity as open_regular does. On
+// refusal the handle is closed and nullptr is returned with `error` set.
+std::unique_ptr<File> adopt_native_handle(std::intptr_t handle, IoError& error);
 
 }  // namespace mie::io
