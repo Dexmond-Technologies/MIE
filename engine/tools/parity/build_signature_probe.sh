@@ -15,7 +15,8 @@
 # pkg-config, python3 with the venv module; network access to github.com (vcpkg and its source
 # downloads) and to the Python package index. It writes only under WORK_DIR and never opens,
 # prints or copies trust/*.pem, keys or corpus files.
-# At the end it prints the probe's path and SHA-256 and the venv's Python.
+# At the end it prints the probe's path and SHA-256, the venv's Python, and the shared OpenSSL
+# libraries for the reference (path and SHA-256).
 set -euo pipefail
 WORK="${1:?usage: build_signature_probe.sh WORK_DIR}"
 REPO="$(pwd)"
@@ -37,6 +38,13 @@ cmake -S "$REPO/engine" -B "$WORK/build" -DCMAKE_BUILD_TYPE=Release -DMIE_BUILD_
       "-DCMAKE_TOOLCHAIN_FILE=$WORK/vcpkg/scripts/buildsystems/vcpkg.cmake"
 cmake --build "$WORK/build" --parallel "$(nproc)" --target mie-signature-probe
 
+# A SHARED build of the OpenSSL the engine uses (3.6.5, same vcpkg commit) for the reference's
+# oscrypto (reviewer's ruling, option b): see reference_with_openssl.py.
+"$WORK/vcpkg/vcpkg" install openssl --classic --triplet x64-linux-dynamic \
+    --x-install-root="$WORK/openssl-shared" --disable-metrics
+LIBCRYPTO="$(ls "$WORK"/openssl-shared/x64-linux-dynamic/lib/libcrypto.so.3)"
+LIBSSL="$(ls "$WORK"/openssl-shared/x64-linux-dynamic/lib/libssl.so.3)"
+
 PY="${PYTHON:-python3}"
 version="$("$PY" -c 'import platform; print(platform.python_version())')"
 if [ "$version" != "3.12.16" ]; then
@@ -56,3 +64,6 @@ echo "compiler: $(c++ --version | head -1)"
 echo "python:  $("$WORK/venv/bin/python" --version)"
 echo "probe:   $WORK/build/mie-signature-probe"
 echo "sha256:  $(sha256sum "$WORK/build/mie-signature-probe" | cut -d' ' -f1)"
+echo "libcrypto: $LIBCRYPTO sha256 $(sha256sum "$LIBCRYPTO" | cut -d' ' -f1)"
+echo "libssl:    $LIBSSL sha256 $(sha256sum "$LIBSSL" | cut -d' ' -f1)"
+echo "openssl port in vcpkg: $(grep -m1 '"version' "$WORK/vcpkg/ports/openssl/vcpkg.json")"

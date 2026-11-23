@@ -425,6 +425,29 @@ jobs:
           /usr/bin/python3 --version; c++ --version | head -1; cmake --version | head -1
           PYTHON="${{ steps.py31216.outputs.python-path }}" \
             engine/tools/parity/build_signature_probe.sh "$RUNNER_TEMP/sig" | tee "$RUNNER_TEMP/recipe.txt"
+      # The reviewer's proof for the gate-3 reference environment (option b): on this system
+      # (OpenSSL 3.0.13), the locked oscrypto 1.3.0 cannot load the system OpenSSL; pointed at the
+      # shared OpenSSL 3.6.5 built by the recipe it must, and signature_parity must stay at 0 hard
+      # differences with the reference answering "valid" on the generated valid cases.
+      - name: The reference's signature check without and with the shared OpenSSL 3.6.5
+        run: |
+          set -u
+          VPY="$RUNNER_TEMP/sig/venv/bin/python"
+          openssl version
+          echo "--- without (the system OpenSSL, as the corpus machine had it):"
+          "$VPY" -c "import certvalidator, oscrypto; print('oscrypto loads:', oscrypto.backend())" 2>&1 | tail -1 || true
+          LIBCRYPTO=$(ls "$RUNNER_TEMP"/sig/openssl-shared/x64-linux-dynamic/lib/libcrypto.so.3)
+          LIBSSL=$(ls "$RUNNER_TEMP"/sig/openssl-shared/x64-linux-dynamic/lib/libssl.so.3)
+          echo "LIBCRYPTO=$LIBCRYPTO" >> "$GITHUB_ENV"; echo "LIBSSL=$LIBSSL" >> "$GITHUB_ENV"
+          echo "--- with the shared OpenSSL 3.6.5 (test-only packages added for signature_parity):"
+          "$VPY" -m pip install --quiet --disable-pip-version-check cryptography==50.0.2 yara-python==4.5.1 pefile==2024.8.26
+          "$VPY" engine/tools/parity/reference_with_openssl.py --libcrypto "$LIBCRYPTO" --libssl "$LIBSSL" \
+            engine/tests/signature_parity.py "$RUNNER_TEMP/sig/build/mie-signature-probe" "$GITHUB_WORKSPACE" \
+            > "$RUNNER_TEMP/signature-parity-2404.txt" 2>&1
+          code=$?
+          grep -E "^reference OpenSSL|^PASS  valid_sha256|hard differences|signature_parity:" "$RUNNER_TEMP/signature-parity-2404.txt"
+          sha256sum "$RUNNER_TEMP/signature-parity-2404.txt"
+          [ "$code" = 0 ] || { tail -40 "$RUNNER_TEMP/signature-parity-2404.txt"; exit 1; }
       - name: Selection and comparison on set S (both profiles)
         run: |
           set -u
@@ -433,7 +456,8 @@ jobs:
           cat "$RUNNER_TEMP/chosen.selection.tsv"
           code=0
           for profile in parity shipped; do
-            "$RUNNER_TEMP/sig/venv/bin/python" engine/tools/parity/signature_corpus_check.py \
+            "$RUNNER_TEMP/sig/venv/bin/python" engine/tools/parity/reference_with_openssl.py \
+              --libcrypto "$LIBCRYPTO" --libssl "$LIBSSL" engine/tools/parity/signature_corpus_check.py \
               --folder "$RUNNER_TEMP/chosen" --probe "$RUNNER_TEMP/sig/build/mie-signature-probe" \
               --repo "$GITHUB_WORKSPACE" --profile $profile | tee "$RUNNER_TEMP/corpus-check-$profile.txt" || code=1
             sha256sum "$RUNNER_TEMP/corpus-check-$profile.txt"
