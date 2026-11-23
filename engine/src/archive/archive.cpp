@@ -30,7 +30,7 @@ bool is_os_error(const PyError& error) {
 // that climbs out and comes back in by the folder's random name cannot be told here; it is
 // taken as outside: ARCHIVE_SPEC.md quirk Q-17.)
 std::optional<std::string> FakeDisk::target(std::string_view name) const {
-    if (name.find('\0') != std::string_view::npos) throw PyError{"ValueError", "embedded null byte"};
+    if (name.find('\0') != std::string_view::npos) throw PyError{"ValueError", "lstat: embedded null character in path"};
     if (!name.empty() && name.front() == '/') return std::nullopt;
     std::vector<std::string_view> parts;
     std::size_t start = 0;

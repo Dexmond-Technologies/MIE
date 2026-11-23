@@ -20,7 +20,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <climits>
 #include <cstring>
+#include <initializer_list>
 #include <new>
 #include <string>
 #include <utility>
@@ -132,6 +134,65 @@ void kill_child(pid_t pid) {
     ::kill(pid, SIGKILL);
 }
 
+// The handed-over file is taken over ONCE, and on Linux inside enter_confinement() BEFORE the
+// system-call filter is installed: taking it over asks the kernel for the file's size and
+// kind, and depending on the C library version that question is the call "fstat" (allowed by
+// the filter) or "newfstatat" (takes a path, so not allowed). Only the descriptor's metadata
+// is read at that point, none of the file's bytes.
+struct InheritedFile {
+    bool tried = false;
+    std::unique_ptr<io::File> file;
+    std::string error;
+};
+InheritedFile g_inherited;
+
+void adopt_inherited_file() {
+    if (g_inherited.tried) {
+        if (!g_inherited.file && g_inherited.error.empty()) {
+            g_inherited.error = "the handed-over file was already taken";
+        }
+        return;
+    }
+    g_inherited.tried = true;
+    const char* value = std::getenv("MIE_INHERITED_FILE");
+    if (value == nullptr || *value == '\0') {
+        g_inherited.error = "no file was handed over";
+        return;
+    }
+    char* end = nullptr;
+    const long fd = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || fd < 0 || fd > 1024) {
+        g_inherited.error = "the handed-over file's number is not valid";
+        return;
+    }
+    io::IoError io_error;
+    g_inherited.file = io::adopt_native_handle(static_cast<std::intptr_t>(fd), io_error);
+    if (!g_inherited.file) {
+        g_inherited.error = std::string("the handed-over file cannot be used: ") + io::to_string(io_error.code);
+    }
+}
+
+// Closes every descriptor from `first` upwards. Used between fork and exec: only system
+// calls, no allocation, no library state. close_range() does it in one call and has no upper
+// bound; where the kernel does not have it (before 5.9: "no such call") every number up to
+// `highest` is closed one by one. `highest` is the HARD limit on open descriptors, read by the
+// parent before fork: no descriptor can have a number at or above it.
+void close_descriptors_from(int first, long highest) {
+#if defined(__linux__)
+#ifdef SYS_close_range
+    const long close_range_number = SYS_close_range;
+#else
+    const long close_range_number = 436;  // the same number on every processor
+#endif
+    if (::syscall(close_range_number, static_cast<unsigned>(first), ~0u, 0u) == 0) {
+        return;
+    }
+#endif
+    for (long fd = first; fd < highest; ++fd) {
+        ::close(static_cast<int>(fd));
+    }
+}
+
 const char* stage_text(int stage) {
     switch (stage) {
         case 1: return "moving the descriptors into place";
@@ -168,23 +229,12 @@ void exit_on_out_of_memory() {
 
 std::unique_ptr<io::File> inherited_file(std::string& error) {
     error.clear();
-    const char* value = std::getenv("MIE_INHERITED_FILE");
-    if (value == nullptr || *value == '\0') {
-        error = "no file was handed over";
+    adopt_inherited_file();
+    if (!g_inherited.file) {
+        error = g_inherited.error;
         return nullptr;
     }
-    char* end = nullptr;
-    const long fd = std::strtol(value, &end, 10);
-    if (end == value || *end != '\0' || fd < 0 || fd > 1024) {
-        error = "the handed-over file's number is not valid";
-        return nullptr;
-    }
-    io::IoError io_error;
-    auto file = io::adopt_native_handle(static_cast<std::intptr_t>(fd), io_error);
-    if (!file) {
-        error = std::string("the handed-over file cannot be used: ") + io::to_string(io_error.code);
-    }
-    return file;
+    return std::move(g_inherited.file);
 }
 
 std::unique_ptr<io::File> inherited_file() {
@@ -268,9 +318,19 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     }
 
     const int file_fd = inherited != nullptr ? static_cast<int>(inherited->native_handle()) : -1;
-    long highest_fd = ::sysconf(_SC_OPEN_MAX);
-    if (highest_fd < 0 || highest_fd > 65536) {
-        highest_fd = 65536;
+    // The hard limit on open descriptors, for the kernels without close_range (see
+    // close_descriptors_from). No cap: "unlimited" or an unreadable limit means every number.
+    // (Linux never reports "unlimited" here: the kernel bounds the limit by fs.nr_open.)
+    long highest_fd = INT_MAX;
+#if !defined(__linux__)
+    if (const long open_max = ::sysconf(_SC_OPEN_MAX); open_max > 0) {
+        highest_fd = open_max;  // systems whose hard limit is "unlimited"
+    }
+#endif
+    struct rlimit descriptor_limit {};
+    if (::getrlimit(RLIMIT_NOFILE, &descriptor_limit) == 0 && descriptor_limit.rlim_max != RLIM_INFINITY &&
+        descriptor_limit.rlim_max < static_cast<rlim_t>(INT_MAX)) {
+        highest_fd = static_cast<long>(descriptor_limit.rlim_max);
     }
     [[maybe_unused]] const pid_t parent_pid = ::getpid();
     const bool limit_address_space = limits.memory_bytes > 0 && !MIE_SANITIZER_BUILD;
@@ -333,9 +393,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         }
         // Every other descriptor of the parent is closed: the child holds its three standard
         // streams, at most one file, and the two short-lived pipes. Nothing else.
-        for (long fd = kChildExecFd + 1; fd < highest_fd; ++fd) {
-            ::close(static_cast<int>(fd));
-        }
+        close_descriptors_from(kChildExecFd + 1, highest_fd);
 #if defined(__linux__)
         // no-new-privileges: exec can never raise rights (no set-user-id programs, no file
         // capabilities). Required by seccomp and Landlock for an ordinary user. It removes
@@ -737,140 +795,131 @@ bool apply_landlock(std::string& what, std::string& why_not) {
 
 #if MIE_SECCOMP_ARCH_KNOWN
 
-// The system calls the filter refuses with "operation not permitted". Everything else is
-// allowed: this is a deny list, not an allow list (see SANDBOX_NOTES.md for why, and for
-// what that leaves open). The groups:
-//   network: no socket can be created, connected, bound, listened on or accepted from;
-//   files by path: nothing can be opened, created, removed, renamed or changed by name;
-//   processes: no new program, no new process, no signal to another process, no tracing;
-//   kernel features that could get around the above or widen the attack surface.
-std::vector<long> denied_system_calls() {
-    std::vector<long> deny = {
-        // ---- network
-        SYS_socket, SYS_socketpair, SYS_connect, SYS_bind, SYS_listen, SYS_accept, SYS_accept4,
-        SYS_sendto, SYS_sendmsg, SYS_sendmmsg, SYS_recvfrom, SYS_recvmsg, SYS_recvmmsg, SYS_shutdown,
-        // ---- files by path
-        SYS_openat, SYS_open_by_handle_at, SYS_name_to_handle_at, SYS_unlinkat, SYS_renameat2,
-        SYS_mkdirat, SYS_linkat, SYS_symlinkat, SYS_fchmodat, SYS_fchownat, SYS_mknodat, SYS_truncate,
-        SYS_mount, SYS_umount2, SYS_chroot, SYS_pivot_root, SYS_swapon, SYS_swapoff, SYS_acct,
-        SYS_setxattr, SYS_lsetxattr, SYS_removexattr, SYS_lremovexattr, SYS_quotactl,
-        SYS_fanotify_init, SYS_inotify_init1,
-        // ---- processes
-        SYS_execve, SYS_execveat, SYS_ptrace, SYS_process_vm_readv, SYS_process_vm_writev, SYS_kill,
-        SYS_tkill, SYS_rt_sigqueueinfo, SYS_rt_tgsigqueueinfo, SYS_kcmp, SYS_setns, SYS_unshare,
-        // ---- kernel features
-        SYS_bpf, SYS_perf_event_open, SYS_userfaultfd, SYS_init_module, SYS_finit_module,
-        SYS_delete_module, SYS_kexec_load, SYS_reboot, SYS_keyctl, SYS_add_key, SYS_request_key,
-        SYS_personality, SYS_mq_open, SYS_msgget, SYS_semget, SYS_shmget, SYS_shmat,
-        SYS_settimeofday, SYS_clock_settime, SYS_adjtimex, SYS_sethostname, SYS_setdomainname,
-        SYS_vhangup, SYS_syslog,
-    };
-    // Calls that only some processors or only newer kernel headers have.
-#ifdef SYS_open
-    deny.push_back(SYS_open);
-#endif
-#ifdef SYS_creat
-    deny.push_back(SYS_creat);
-#endif
-#ifdef SYS_openat2
-    deny.push_back(SYS_openat2);
-#endif
-#ifdef SYS_unlink
-    deny.push_back(SYS_unlink);
-#endif
-#ifdef SYS_rmdir
-    deny.push_back(SYS_rmdir);
-#endif
-#ifdef SYS_rename
-    deny.push_back(SYS_rename);
-#endif
-#ifdef SYS_renameat
-    deny.push_back(SYS_renameat);
-#endif
-#ifdef SYS_mkdir
-    deny.push_back(SYS_mkdir);
-#endif
-#ifdef SYS_link
-    deny.push_back(SYS_link);
-#endif
-#ifdef SYS_symlink
-    deny.push_back(SYS_symlink);
-#endif
-#ifdef SYS_chmod
-    deny.push_back(SYS_chmod);
-#endif
-#ifdef SYS_fchmodat2
-    deny.push_back(SYS_fchmodat2);
-#endif
-#ifdef SYS_chown
-    deny.push_back(SYS_chown);
-#endif
-#ifdef SYS_lchown
-    deny.push_back(SYS_lchown);
-#endif
-#ifdef SYS_mknod
-    deny.push_back(SYS_mknod);
-#endif
-#ifdef SYS_inotify_init
-    deny.push_back(SYS_inotify_init);
-#endif
-#ifdef SYS_fork
-    deny.push_back(SYS_fork);
-#endif
-#ifdef SYS_vfork
-    deny.push_back(SYS_vfork);
-#endif
-#ifdef SYS_pidfd_open
-    deny.push_back(SYS_pidfd_open);
-#endif
-#ifdef SYS_pidfd_send_signal
-    deny.push_back(SYS_pidfd_send_signal);
-#endif
-#ifdef SYS_pidfd_getfd
-    deny.push_back(SYS_pidfd_getfd);
-#endif
-#ifdef SYS_process_madvise
-    deny.push_back(SYS_process_madvise);
-#endif
-#ifdef SYS_io_uring_setup
-    // io_uring can do network and file work without the calls this filter looks at.
-    deny.push_back(SYS_io_uring_setup);
-#endif
-#ifdef SYS_io_uring_enter
-    deny.push_back(SYS_io_uring_enter);
-#endif
-#ifdef SYS_io_uring_register
-    deny.push_back(SYS_io_uring_register);
-#endif
-#ifdef SYS_kexec_file_load
-    deny.push_back(SYS_kexec_file_load);
-#endif
-#ifdef SYS_open_tree
-    deny.push_back(SYS_open_tree);
-#endif
-#ifdef SYS_move_mount
-    deny.push_back(SYS_move_mount);
-#endif
-#ifdef SYS_fsopen
-    deny.push_back(SYS_fsopen);
-#endif
-#ifdef SYS_fsmount
-    deny.push_back(SYS_fsmount);
-#endif
-#ifdef SYS_mount_setattr
-    deny.push_back(SYS_mount_setattr);
-#endif
-#ifdef SYS_iopl
-    deny.push_back(SYS_iopl);
-#endif
-#ifdef SYS_ioperm
-    deny.push_back(SYS_ioperm);
-#endif
-    return deny;
+// ---- the seccomp filter: an ALLOW LIST ---------------------------------------------------
+//
+// Every system call that is not named below is REFUSED. The refusal is the error "operation
+// not permitted" (EPERM), not the death of the process, for this reason: the C library and
+// other libraries try optional calls and take another way when one fails (a refused call is
+// then harmless), and a refused call leaves a worker that can still report what happened.
+// The call is not carried out either way. Two exceptions: a call made through another
+// calling convention KILLS the process (nothing legitimate does that), and clone3 is answered
+// "no such call" because that is the answer on which the C library falls back to clone.
+//
+// What is allowed is what a worker needs AFTER it has loaded its libraries and its rules:
+// reading and writing descriptors that are already open, memory, its own threads, clocks, its
+// own signals, and ending. Nothing that takes a path, nothing that makes a descriptor,
+// nothing that changes a file through its descriptor, nothing aimed at another process.
+// SANDBOX_NOTES.md has the same list with one line per call.
+
+sock_filter stmt(unsigned code, std::uint32_t k) {
+    sock_filter instruction{};
+    instruction.code = static_cast<__u16>(code);
+    instruction.k = k;
+    return instruction;
 }
 
+sock_filter jump(unsigned code, std::uint32_t k, std::size_t if_true, std::size_t if_false) {
+    sock_filter instruction{};
+    instruction.code = static_cast<__u16>(code);
+    instruction.jt = static_cast<__u8>(if_true);
+    instruction.jf = static_cast<__u8>(if_false);
+    instruction.k = k;
+    return instruction;
+}
+
+constexpr unsigned kLoad = BPF_LD | BPF_W | BPF_ABS;
+constexpr unsigned kIfEqual = BPF_JMP | BPF_JEQ | BPF_K;
+constexpr unsigned kIfAtLeast = BPF_JMP | BPF_JGE | BPF_K;
+constexpr unsigned kIfAnyBit = BPF_JMP | BPF_JSET | BPF_K;
+constexpr unsigned kReturn = BPF_RET | BPF_K;
+
+// The low 32 bits of argument `index` (little-endian: checked in apply_seccomp), and the high.
+std::uint32_t argument_low(unsigned index) {
+    return static_cast<std::uint32_t>(offsetof(struct seccomp_data, args) + 8u * index);
+}
+std::uint32_t argument_high(unsigned index) { return argument_low(index) + 4u; }
+
+// Builds the filter. Every "allow" block starts with the call number in the accumulator and,
+// when the number is another one, jumps over itself with the number still there; when the
+// number matches, the block always returns.
+class Filter {
+public:
+    explicit Filter(std::uint32_t refuse) : refuse_(refuse) {}
+
+    void raw(sock_filter instruction) { code_.push_back(instruction); }
+
+    void answer(long number, std::uint32_t action) {
+        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 1));
+        raw(stmt(kReturn, action));
+    }
+
+    void allow(long number) {
+        answer(number, SECCOMP_RET_ALLOW);
+        ++allowed_;
+    }
+
+    // Allowed only if the low 32 bits of argument `index` are one of `values`.
+    void allow_if_argument_is(long number, unsigned index, std::initializer_list<std::uint32_t> values) {
+        const std::size_t count = values.size();
+        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, count + 3));
+        raw(stmt(kLoad, argument_low(index)));
+        std::size_t i = 0;
+        for (const std::uint32_t value : values) {
+            raw(jump(kIfEqual, value, count - i, 0));  // equal: over the rest and the refusal
+            ++i;
+        }
+        raw(stmt(kReturn, refuse_));
+        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
+        ++allowed_;
+    }
+
+    // Allowed only if argument `index` has at least one bit of `mask`.
+    void allow_if_bits(long number, unsigned index, std::uint32_t mask) {
+        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 4));
+        raw(stmt(kLoad, argument_low(index)));
+        raw(jump(kIfAnyBit, mask, 1, 0));
+        raw(stmt(kReturn, refuse_));
+        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
+        ++allowed_;
+    }
+
+    // Allowed only if argument `index` has no bit of `mask`.
+    void allow_unless_bits(long number, unsigned index, std::uint32_t mask) {
+        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 4));
+        raw(stmt(kLoad, argument_low(index)));
+        raw(jump(kIfAnyBit, mask, 0, 1));
+        raw(stmt(kReturn, refuse_));
+        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
+        ++allowed_;
+    }
+
+    // prlimit64(pid, resource, new_limit, old_limit): allowed only for the caller itself
+    // (pid 0 or its own number) and only to READ a limit (new_limit is a null pointer).
+    void allow_reading_own_limits(long number, std::uint32_t own_pid) {
+        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 9));
+        raw(stmt(kLoad, argument_low(0)));
+        raw(jump(kIfEqual, 0, 1, 0));        // pid 0: on to the pointer check
+        raw(jump(kIfEqual, own_pid, 0, 5));  // another process: refused
+        raw(stmt(kLoad, argument_low(2)));
+        raw(jump(kIfEqual, 0, 0, 3));
+        raw(stmt(kLoad, argument_high(2)));
+        raw(jump(kIfEqual, 0, 0, 1));
+        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
+        raw(stmt(kReturn, refuse_));
+        ++allowed_;
+    }
+
+    std::vector<sock_filter>& code() { return code_; }
+    std::size_t allowed() const { return allowed_; }
+
+private:
+    std::vector<sock_filter> code_;
+    std::uint32_t refuse_;
+    std::size_t allowed_ = 0;
+};
+
 // Installs the filter for the calling thread (the worker has one thread when it calls this).
-// It cannot be removed again and is inherited by anything the process could still start.
+// It cannot be removed again and is inherited by every thread the process starts later.
 bool apply_seccomp(std::string& what, std::string& why_not) {
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
     why_not = "the seccomp filter is written for little-endian processors only";
@@ -879,59 +928,141 @@ bool apply_seccomp(std::string& what, std::string& why_not) {
     const auto errno_return = [](int err) {
         return static_cast<std::uint32_t>(SECCOMP_RET_ERRNO | (static_cast<std::uint32_t>(err) & SECCOMP_RET_DATA));
     };
-    const std::uint32_t nr_offset = static_cast<std::uint32_t>(offsetof(struct seccomp_data, nr));
-    const std::uint32_t arch_offset = static_cast<std::uint32_t>(offsetof(struct seccomp_data, arch));
-    const std::uint32_t arg0_offset = static_cast<std::uint32_t>(offsetof(struct seccomp_data, args[0]));
-
-    std::vector<sock_filter> filter;
-    const auto add = [&](sock_filter instruction) { filter.push_back(instruction); };
+    const std::uint32_t own_pid = static_cast<std::uint32_t>(::getpid());
+    Filter filter(errno_return(EPERM));
 
     // A call made through another calling convention (32-bit on a 64-bit kernel) has other
-    // numbers and would slip past a filter written for this one: such a process is killed.
-    add(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, arch_offset));
-    add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kAuditArch, 1, 0));
-    add(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-    add(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, nr_offset));
+    // numbers and would be judged as the wrong call: such a process is killed.
+    filter.raw(stmt(kLoad, static_cast<std::uint32_t>(offsetof(struct seccomp_data, arch))));
+    filter.raw(jump(kIfEqual, kAuditArch, 1, 0));
+    filter.raw(stmt(kReturn, SECCOMP_RET_KILL_PROCESS));
+    filter.raw(stmt(kLoad, static_cast<std::uint32_t>(offsetof(struct seccomp_data, nr))));
 #if defined(__x86_64__)
     // The x32 calling convention shares the processor type but numbers its calls from 2^30.
-    add(BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000u, 0, 1));
-    add(BPF_STMT(BPF_RET | BPF_K, errno_return(EPERM)));
+    filter.raw(jump(kIfAtLeast, 0x40000000u, 0, 1));
+    filter.raw(stmt(kReturn, errno_return(EPERM)));
 #endif
-
-    // clone: a new THREAD is allowed, a new PROCESS is not (flags are the first argument).
-    add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(SYS_clone), 0, 4));
-    add(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, arg0_offset));
-    add(BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x00010000u /* CLONE_THREAD */, 1, 0));
-    add(BPF_STMT(BPF_RET | BPF_K, errno_return(EPERM)));
-    add(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 #ifdef SYS_clone3
     // clone3 hides its flags behind a pointer the filter cannot read: answered "no such
-    // call", and the C library falls back to clone, which is judged above.
-    add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(SYS_clone3), 0, 1));
-    add(BPF_STMT(BPF_RET | BPF_K, errno_return(ENOSYS)));
+    // call", and the C library falls back to clone, which is judged below.
+    filter.answer(SYS_clone3, errno_return(ENOSYS));
 #endif
-    // tgkill: a signal to a thread of THIS process is allowed (abort() uses it), to any
-    // other process it is not.
-    add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(SYS_tgkill), 0, 4));
-    add(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, arg0_offset));
-    add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(::getpid()), 1, 0));
-    add(BPF_STMT(BPF_RET | BPF_K, errno_return(EPERM)));
-    add(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
-    for (const long number : denied_system_calls()) {
-        add(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<std::uint32_t>(number), 0, 1));
-        add(BPF_STMT(BPF_RET | BPF_K, errno_return(EPERM)));
-    }
-    add(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    // ---- descriptors that are already open: read, write, position, close ------------------
+    filter.allow(SYS_read);    // standard input; the status pipe is write-only
+    filter.allow(SYS_readv);   // the same, several buffers (C library)
+    filter.allow(SYS_pread64); // the handed-over file at an offset (io::File::read_at)
+    filter.allow(SYS_write);   // standard output and error; fails by itself on the read-only file
+    filter.allow(SYS_writev);  // the same, several buffers (C library error messages)
+    filter.allow(SYS_lseek);   // position in an open descriptor (C library streams)
+    filter.allow(SYS_close);   // closing its own descriptors
+    filter.allow(SYS_fstat);   // size and kind of an OPEN descriptor; takes no path
+    // fcntl: only reading a descriptor's flags (F_GETFD = 1, F_GETFL = 3; the C library asks
+    // when it wraps a descriptor in a stream). No duplicating, no changing flags, no locks.
+    filter.allow_if_argument_is(SYS_fcntl, 1, {1u, 3u});
+    // ioctl: only "is this a terminal" (TCGETS = 0x5401), which the C library asks about its
+    // output stream. Every other device control is refused.
+    filter.allow_if_argument_is(SYS_ioctl, 1, {0x5401u});
+
+    // ---- memory ---------------------------------------------------------------------------
+    filter.allow(SYS_brk);     // the allocator's heap
+    filter.allow(SYS_munmap);  // giving memory back
+    filter.allow(SYS_mremap);  // growing an allocation (realloc)
+    filter.allow(SYS_madvise); // the allocator telling the kernel that pages are free
+#if MIE_SANITIZER_BUILD
+    filter.allow(SYS_mmap);
+    filter.allow(SYS_mprotect);
+#else
+    // New memory and changed protection, but never EXECUTABLE (PROT_EXEC = 4): no code can be
+    // made or loaded after the confinement.
+    filter.allow_unless_bits(SYS_mmap, 2, 0x4u);
+    filter.allow_unless_bits(SYS_mprotect, 2, 0x4u);
+#endif
+
+    // ---- its own threads ------------------------------------------------------------------
+    // clone: a new THREAD of this process (CLONE_THREAD = 0x10000) only, never a new process.
+    filter.allow_if_bits(SYS_clone, 0, 0x00010000u);
+    filter.allow(SYS_futex);            // locks and condition variables
+    filter.allow(SYS_set_robust_list);  // every new thread registers its lock list (C library)
+#ifdef SYS_rseq
+    filter.allow(SYS_rseq);             // every new thread registers this (C library)
+#endif
+    filter.allow(SYS_sched_yield);      // giving up the processor in a busy lock
+    // The set of processors this process may use (the allocator and
+    // std::thread::hardware_concurrency ask): only for itself.
+    filter.allow_if_argument_is(SYS_sched_getaffinity, 0, {0u, own_pid});
+    filter.allow(SYS_getpid);           // its own number (abort, raise)
+    filter.allow(SYS_gettid);           // its own thread number (abort, raise)
+
+    // ---- clocks and sleeping --------------------------------------------------------------
+    filter.allow(SYS_clock_gettime);
+    filter.allow(SYS_clock_getres);
+    filter.allow(SYS_gettimeofday);
+#ifdef SYS_time
+    filter.allow(SYS_time);
+#endif
+    filter.allow(SYS_nanosleep);
+    filter.allow(SYS_clock_nanosleep);
+    filter.allow(SYS_restart_syscall);  // the kernel's own way to resume an interrupted sleep
+
+    // ---- its own signals ------------------------------------------------------------------
+    filter.allow(SYS_rt_sigaction);     // setting its own handlers (abort resets one)
+    filter.allow(SYS_rt_sigprocmask);   // blocking signals in its own threads
+    filter.allow(SYS_rt_sigreturn);     // coming back from a handler
+    // tgkill: a signal to a thread of THIS process only (abort, raise). kill, tkill and the
+    // other signal calls are not allowed at all.
+    filter.allow_if_argument_is(SYS_tgkill, 0, {own_pid});
+
+    // ---- other --------------------------------------------------------------------------
+    filter.allow(SYS_getrandom);        // random bytes from the kernel, no file involved
+    filter.allow_reading_own_limits(SYS_prlimit64, own_pid);
+    // prctl: only the three questions describe_self() asks (PR_GET_DUMPABLE = 3,
+    // PR_GET_SECCOMP = 21, PR_GET_NO_NEW_PRIVS = 39). Nothing can be set.
+    filter.allow_if_argument_is(SYS_prctl, 0, {3u, 21u, 39u});
+    filter.allow(SYS_exit);             // a thread ends
+    filter.allow(SYS_exit_group);       // the process ends
+
+#if MIE_SANITIZER_BUILD
+    // ---- SANITIZER BUILD ONLY: never in a shipped program ----------------------------------
+    // The sanitizer runtime reads /proc, sets an alternate signal stack and asks about the
+    // machine while the program runs. This wider list exists so that the sanitizer job can
+    // run the same tests; the text in `what` says so, so no log can pass for the shipped one.
+    filter.allow(SYS_openat);
+    filter.allow(SYS_readlinkat);
+    filter.allow(SYS_newfstatat);
+    filter.allow(SYS_getdents64);
+    filter.allow(SYS_sigaltstack);
+    filter.allow(SYS_sysinfo);
+    filter.allow(SYS_uname);
+    filter.allow(SYS_getrusage);
+    filter.allow(SYS_mincore);
+    filter.allow(SYS_mlock);
+    filter.allow(SYS_munlock);
+#ifdef SYS_readlink
+    filter.allow(SYS_readlink);
+#endif
+#ifdef SYS_getrlimit
+    filter.allow(SYS_getrlimit);
+#endif
+#endif
+
+    // Everything else.
+    filter.raw(stmt(kReturn, errno_return(EPERM)));
 
     struct sock_fprog program {};
-    program.len = static_cast<unsigned short>(filter.size());
-    program.filter = filter.data();
+    program.len = static_cast<unsigned short>(filter.code().size());
+    program.filter = filter.code().data();
     if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0, 0) != 0) {
         why_not = errno_text("seccomp filter", errno);
         return false;
     }
-    what = "seccomp (no sockets, no files by path, no new process or program)";
+#if MIE_SANITIZER_BUILD
+    what = "seccomp SANITIZER-BUILD WIDER allow list, NOT the shipped filter (" +
+           std::to_string(filter.allowed()) + " calls allowed, the rest refused with EPERM)";
+#else
+    what = "seccomp allow list (" + std::to_string(filter.allowed()) +
+           " calls allowed, the rest refused with EPERM)";
+#endif
     return true;
 #endif
 }
@@ -1005,6 +1136,13 @@ bool enter_confinement(std::string& what_applied, std::string& error) {
         }
         std::string what;
         std::string why_not;
+        // The handed-over file is taken over before the filter (see adopt_inherited_file).
+        if (std::getenv("MIE_INHERITED_FILE") != nullptr) {
+            adopt_inherited_file();
+            if (!g_inherited.file) {
+                missing.push_back(g_inherited.error);
+            }
+        }
         // Landlock first (its own calls must still be allowed), then the filter.
         if (apply_landlock(what, why_not)) {
             applied.push_back(what);

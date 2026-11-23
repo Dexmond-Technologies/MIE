@@ -92,7 +92,9 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
 // confined as required; the worker must then exit without reading its input.
 bool enter_confinement(std::string& what_applied, std::string& error);
 
-// The file the parent handed over, or nullptr (with `error` set) if there is none.
+// The file the parent handed over, or nullptr (with `error` set) if there is none. The file
+// is given out ONCE: a second call returns nullptr. On Linux enter_confinement() has already
+// taken it over (its size and kind are read before the system-call filter is installed).
 std::unique_ptr<io::File> inherited_file(std::string& error);
 std::unique_ptr<io::File> inherited_file();
 

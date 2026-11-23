@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
 #include <iterator>
 #include <new>
 #include <string>
@@ -96,12 +97,64 @@ void append_quoted(std::wstring& line, const std::wstring& argument) {
 }
 
 std::wstring environment_value(const wchar_t* name) {
-    wchar_t buffer[1024];
-    const DWORD n = ::GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
-    if (n == 0 || n >= std::size(buffer)) {
+    std::vector<wchar_t> buffer(32768);  // the longest value Windows allows
+    const DWORD n = ::GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (n == 0 || n >= buffer.size()) {
         return {};
     }
-    return std::wstring(buffer, n);
+    return std::wstring(buffer.data(), n);
+}
+
+// The variables the child starts with (without the MIE_* ones, added by the caller).
+//
+// First CI run: CreateProcessW for the AppContainer failed with error 203 ("environment
+// variable not found") when the block held only SystemRoot, windir and SystemDrive, while the
+// same block started an ordinary process. Creating an AppContainer process makes Windows
+// rewrite some variables of the block for the container (the local application data and
+// temporary folders); a block without them is refused. So the child now gets the user's
+// DEFAULT environment, as Windows builds it at logon (CreateEnvironmentBlock, not inherited
+// from this process: nothing the service's own environment holds is passed on). If that
+// cannot be had, a fixed list of names is copied from this process instead. `source` says
+// which, and it is part of ChildResult::confinement.
+std::vector<std::wstring> base_environment(std::string& source) {
+    std::vector<std::wstring> variables;
+    HANDLE token = nullptr;
+    if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, &token)) {
+        LPVOID block = nullptr;
+        if (::CreateEnvironmentBlock(&block, token, FALSE) && block != nullptr) {
+            for (const wchar_t* entry = static_cast<const wchar_t*>(block); *entry != L'\0';) {
+                const std::wstring text(entry);
+                entry += text.size() + 1;
+                if (text[0] != L'=') {
+                    variables.push_back(text);
+                }
+            }
+            ::DestroyEnvironmentBlock(block);
+        }
+        ::CloseHandle(token);
+    }
+    if (!variables.empty()) {
+        source = "user default environment";
+        return variables;
+    }
+    for (const wchar_t* name :
+         {L"ALLUSERSPROFILE", L"APPDATA", L"CommonProgramFiles", L"COMPUTERNAME", L"HOMEDRIVE", L"HOMEPATH",
+          L"LOCALAPPDATA", L"NUMBER_OF_PROCESSORS", L"OS", L"PROCESSOR_ARCHITECTURE", L"ProgramData",
+          L"ProgramFiles", L"PUBLIC", L"SystemDrive", L"SystemRoot", L"TEMP", L"TMP", L"USERDOMAIN", L"USERNAME",
+          L"USERPROFILE", L"windir"}) {
+        const std::wstring value = environment_value(name);
+        if (!value.empty()) {
+            variables.push_back(std::wstring(name) + L"=" + value);
+        }
+    }
+    source = "fixed list of variables copied from the parent";
+    return variables;
+}
+
+bool starts_with_mie(const std::wstring& variable) {
+    return variable.size() >= 4 && (variable[0] == L'M' || variable[0] == L'm') &&
+           (variable[1] == L'I' || variable[1] == L'i') && (variable[2] == L'E' || variable[2] == L'e') &&
+           variable[3] == L'_';
 }
 
 void close_handle(HANDLE& handle) {
@@ -376,7 +429,53 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     capabilities.AppContainerSid = sid;
     capabilities.Capabilities = nullptr;  // NO capability: no internet, no private network,
     capabilities.CapabilityCount = 0;     // no documents / pictures / music library
-    const DWORD attribute_count = in_container ? 2u : 1u;
+    // Mitigation policies, fixed for the life of the process (the child cannot turn them off):
+    //   extension points off: no AppInit DLLs, no window hooks, no legacy input-method or
+    //     Winsock-provider DLLs are loaded INTO the worker by something else on the machine;
+    //   no images from remote devices: a DLL cannot be loaded from a network share;
+    //   no images with a Low integrity label: a DLL written by a low-rights process (the
+    //     worker's own package folder is such a place) cannot be loaded.
+    // And the child-process policy: the worker cannot create a process (the job's limit of
+    // one process says the same; this is the second lock).
+    // Not set, with the reason, in SANDBOX_NOTES.md: win32k lock-down, no dynamic code,
+    // strict handle checks, prefer System32, signed-only images.
+    DWORD64 mitigation = 0;
+    DWORD child_policy = 0;
+    std::string mitigation_text;
+    std::string not_built;
+#ifdef PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
+    mitigation |= PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON;
+    mitigation_text += " no-extension-points";
+#else
+    not_built += " extension-point policy";
+#endif
+#ifdef PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON
+    mitigation |= PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON;
+    mitigation_text += " no-remote-images";
+#else
+    not_built += " no-remote-images policy";
+#endif
+#ifdef PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON
+    mitigation |= PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON;
+    mitigation_text += " no-low-label-images";
+#else
+    not_built += " no-low-label-images policy";
+#endif
+#if defined(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY) && defined(PROCESS_CREATION_CHILD_PROCESS_RESTRICTED)
+    child_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+    mitigation_text += " no-child-process";
+#else
+    not_built += " child-process policy";
+    (void)child_policy;
+#endif
+    if (in_container && !not_built.empty()) {
+        // The Windows headers this was built with lack a policy: never silently without it.
+        if (!options.allow_weaker) {
+            return fail_start("this build lacks:" + not_built);
+        }
+        container_text += " WEAKER: built without:" + not_built;
+    }
+    const DWORD attribute_count = 4;  // the most that are ever set below
     SIZE_T attribute_size = 0;
     ::InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &attribute_size);
     attribute_store.resize(attribute_size);
@@ -402,6 +501,17 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
                                          sizeof capabilities, nullptr, nullptr)) {
             return fail_start(win_error("UpdateProcThreadAttribute (AppContainer)", ::GetLastError()));
         }
+        if (mitigation != 0 &&
+            !::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation,
+                                         sizeof mitigation, nullptr, nullptr)) {
+            return fail_start(win_error("UpdateProcThreadAttribute (mitigation policy)", ::GetLastError()));
+        }
+#if defined(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY) && defined(PROCESS_CREATION_CHILD_PROCESS_RESTRICTED)
+        if (!::UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy,
+                                         sizeof child_policy, nullptr, nullptr)) {
+            return fail_start(win_error("UpdateProcThreadAttribute (child-process policy)", ::GetLastError()));
+        }
+#endif
     }
 
     // ---- command line and a minimal environment ---------------------------------------------
@@ -410,13 +520,10 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     for (const std::string& argument : arguments) {
         append_quoted(command_line, widen(argument));
     }
-    std::vector<std::wstring> variables;
-    for (const wchar_t* name : {L"SystemRoot", L"windir", L"SystemDrive"}) {
-        const std::wstring value = environment_value(name);
-        if (!value.empty()) {
-            variables.push_back(std::wstring(name) + L"=" + value);
-        }
-    }
+    std::string environment_source;
+    std::vector<std::wstring> variables = base_environment(environment_source);
+    // No MIE_* variable comes from anywhere but the lines below.
+    variables.erase(std::remove_if(variables.begin(), variables.end(), starts_with_mie), variables.end());
     if (options.confine) {
         variables.push_back(L"MIE_SANDBOX=1");
         if (options.allow_weaker) {
@@ -426,7 +533,14 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     if (file_copy != nullptr) {
         variables.push_back(L"MIE_INHERITED_FILE=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(file_copy)));
     }
-    std::sort(variables.begin(), variables.end());
+    // Windows wants the block sorted by name without regard to case.
+    std::sort(variables.begin(), variables.end(), [](const std::wstring& a, const std::wstring& b) {
+        return ::_wcsicmp(a.c_str(), b.c_str()) < 0;
+    });
+    std::string variable_names;  // names only, for the error text; never the values
+    for (const std::wstring& variable : variables) {
+        variable_names += (variable_names.empty() ? "" : " ") + narrow(variable.substr(0, variable.find(L'=')));
+    }
     std::wstring environment;
     for (const std::wstring& variable : variables) {
         environment += variable;
@@ -450,6 +564,9 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
                           environment.data(), nullptr, &startup.StartupInfo, &process)) {
         const DWORD code = ::GetLastError();
         return fail_start(win_error("CreateProcess", code) +
+                          (code == ERROR_ENVVAR_NOT_FOUND
+                               ? " (environment: " + environment_source + "; names passed: " + variable_names + ")"
+                               : "") +
                           (code == ERROR_ACCESS_DENIED && in_container
                                ? " (inside an AppContainer the program file and its folder must be readable by"
                                  " the worker's AppContainer SID or by ALL APPLICATION PACKAGES)"
@@ -530,8 +647,10 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     }
 
     result.output = std::move(out_reader.text);
-    result.confinement = container_text + "+job (memory limit " + std::to_string(limits.memory_bytes) +
-                         " bytes, one process, kill on close, UI restrictions)+handle list";
+    result.confinement = container_text + (in_container ? "+mitigations (" + mitigation_text + " )" : "") +
+                         "+job (memory limit " + std::to_string(limits.memory_bytes) +
+                         " bytes, one process, kill on close, UI restrictions)+handle list; environment: " +
+                         environment_source;
     if (!err_reader.text.empty()) {
         result.detail = "standard error: " + err_reader.text;
     }

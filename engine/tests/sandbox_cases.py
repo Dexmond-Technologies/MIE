@@ -114,21 +114,57 @@ def main():
     case("handle: the handed-over file is readable and its hash is the file's", read_handle)
 
     # ---- what it must not be able to do; each with a control run without confinement --------
-    def refused(action, key, control_needed=True):
+    def refused(action, key, control_needed=True, options=None, error_number=None):
+        """The action must succeed without confinement (the control) and be refused with it.
+        error_number: the error the confined child must report (1 = EPERM, the filter's answer)."""
+        options = options or []
+
         def run():
             if control_needed:
-                control, control_inner = run_parent(parent, child, ["--unconfined"], action)
+                control, control_inner = run_parent(parent, child, ["--unconfined"] + options, action)
                 if control_inner is None or control_inner.get(key) is not True:
                     return "FAIL", "control run (no confinement) did not succeed, so a refusal proves nothing: " \
                         + brief(control, control_inner)
-            result, inner = run_parent(parent, child, [], action)
+            result, inner = run_parent(parent, child, options, action)
             good = result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
                 and inner.get(key) is False
-            return ("PASS" if good else "FAIL"), brief(result, inner)
+            if good and error_number is not None:
+                good = inner.get("error") == error_number
+            return ("PASS" if good else "FAIL"), ("" if control_needed else "(no control run possible) ") \
+                + brief(result, inner)
         return run
 
     case("path: opening the same file BY PATH fails when confined", refused(["open-path", sample], "opened"))
     case("path: writing a file fails when confined", refused(["write-path", target], "opened"))
+
+    # ---- the handed-over file cannot be changed through its handle; unlisted calls are refused
+    def write_handle():
+        # No control run: the handle is read-only with or without the confinement.
+        result, inner = run_parent(parent, child, ["--file", sample], ["write-handle"])
+        good = result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
+            and inner.get("handle_present") is True and inner.get("wrote") is False
+        with open(sample, "rb") as handle:
+            unchanged = hashlib.sha256(handle.read()).hexdigest() == sample_hash
+        return ("PASS" if good and unchanged else "FAIL"), "file unchanged=%s %s" % (unchanged, brief(result, inner))
+    case("handle: writing through the handed-over handle fails, the file is unchanged", write_handle)
+
+    linux_only = (
+        ("handle: fchmod on the handed-over descriptor is refused (Linux)",
+         refused(["fchmod-handle"], "changed", options=["--file", sample], error_number=1)),
+        # ftruncate fails on a read-only descriptor even without the filter, so there is no
+        # control run; the error number 1 (EPERM) shows that the FILTER refused it.
+        ("handle: ftruncate on the handed-over descriptor is refused by the filter (Linux)",
+         refused(["ftruncate-handle"], "changed", control_needed=False, options=["--file", sample],
+                 error_number=1)),
+        ("filter: a system call that is not on the allow list (setpriority) is refused (Linux)",
+         refused(["unlisted-call"], "changed", error_number=1)),
+    )
+    for name, function in linux_only:
+        if linux:
+            case(name, function)
+        else:
+            record("NOT RUN", name, "Linux only: the case is about the Linux system-call filter; on Windows "
+                   "the handle's own access rights are what is tested (the write case above)")
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))

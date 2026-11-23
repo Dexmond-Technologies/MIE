@@ -28,7 +28,9 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -174,6 +176,58 @@ void try_spawn(Line& line) {
 #endif
 }
 
+// The raw number of the handed-over file (descriptor or handle value), -1 if there is none.
+// Used by the actions that try to misuse it; the sandbox library keeps owning it.
+long long inherited_number() {
+    const char* value = std::getenv("MIE_INHERITED_FILE");
+    if (value == nullptr || *value == '\0') {
+        return -1;
+    }
+    return std::strtoll(value, nullptr, 10);
+}
+
+// Tries to WRITE through the handed-over file. It was handed over read-only: must fail.
+void try_write_handle(Line& line) {
+    const long long number = inherited_number();
+    line.flag("handle_present", number >= 0);
+    if (number < 0) {
+        line.flag("wrote", false);
+        return;
+    }
+#if defined(_WIN32)
+    const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(number));
+    OVERLAPPED position{};  // offset 0; valid for a handle opened either way
+    DWORD written = 0;
+    const BOOL done = ::WriteFile(handle, "x", 1, &written, &position);
+    line.flag("wrote", done != FALSE && written == 1);
+    line.number("error", done ? 0 : static_cast<long long>(::GetLastError()));
+#else
+    errno = 0;
+    const ssize_t written = ::pwrite(static_cast<int>(number), "x", 1, 0);
+    line.flag("wrote", written == 1);
+    line.number("error", written == 1 ? 0 : errno);
+#endif
+}
+
+#if !defined(_WIN32)
+// Tries to change the handed-over file THROUGH its descriptor, or to make a system call that
+// is not on the allow list. `changed` must be false when confined.
+void try_descriptor_change(Line& line, const std::string& action) {
+    const int fd = static_cast<int>(inherited_number());
+    errno = 0;
+    int outcome = -1;
+    if (action == "fchmod-handle") {
+        outcome = ::fchmod(fd, 0600);
+    } else if (action == "ftruncate-handle") {
+        outcome = ::ftruncate(fd, 0);
+    } else {  // unlisted-call: lower this process's own priority; harmless, and not on the list
+        outcome = ::setpriority(PRIO_PROCESS, 0, 1);
+    }
+    line.flag("changed", outcome == 0);
+    line.number("error", outcome == 0 ? 0 : errno);
+}
+#endif
+
 int allocate_until_refused(Line& line) {
     // 16 MiB at a time, every page written so that it is really used, up to 4 GiB.
     constexpr std::size_t kChunk = 16u * 1024 * 1024;
@@ -282,6 +336,16 @@ int main(int argc, char** argv) {
 #endif
     } else if (action == "spawn") {
         try_spawn(line);
+    } else if (action == "write-handle") {
+        try_write_handle(line);
+    } else if (action == "fchmod-handle" || action == "ftruncate-handle" || action == "unlisted-call") {
+#if defined(_WIN32)
+        line.text("error", "this action has no meaning on Windows");
+        line.print();
+        return 2;
+#else
+        try_descriptor_change(line, action);
+#endif
     } else if (action == "whoami") {
         line.text("self", mie::sandbox::describe_self());
     } else {

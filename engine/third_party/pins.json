@@ -98,6 +98,38 @@
         "yr_rules_save_stream"
       ],
       "status": "ACCEPTED AS NOT REACHABLE by r-01, board B-3616, 2026-11-23; the guard stays for good."
+    },
+    {
+      "id": "CVE-2026-85091",
+      "library": "zlib",
+      "what": "Heap buffer overflow through a stale pointer in gzwrite after a failed write (zlib 1.2.11 through 1.3.2). Public record: https://api.osv.dev/v1/vulns/CVE-2026-85091. The flaw is in zlib's gz file layer (writing compressed files).",
+      "why_guarded": "The engine never uses zlib's gz file layer and never compresses. Its only calls into zlib are inflateInit2 (raw deflate, window -15), inflate, inflateEnd and crc32, all in engine/src/archive/codec.cpp.",
+      "forbidden_symbols": [
+        "gzopen",
+        "gzdopen",
+        "gzbuffer",
+        "gzsetparams",
+        "gzwrite",
+        "gzfwrite",
+        "gzprintf",
+        "gzvprintf",
+        "gzputs",
+        "gzputc",
+        "gzflush",
+        "gzread",
+        "gzfread",
+        "gzgets",
+        "gzgetc",
+        "gzungetc",
+        "gzseek",
+        "gzclose",
+        "gzclose_r",
+        "gzclose_w",
+        "deflateInit",
+        "deflateInit2",
+        "deflate"
+      ],
+      "status": "PROPOSED by the builder, NOT ACCEPTED: awaits the reviewer's ruling. Until then the vulnerability check fails on this record."
     }
   ]
 }
