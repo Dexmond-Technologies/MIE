@@ -73,7 +73,18 @@ jobs:
         run: |
           set -eu
           python -m pip install "aqtinstall==${AQT_VERSION}"
-          python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --external 7z -O "$GITHUB_WORKSPACE/.qt"
+          if ! python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --archives qtbase icu -O "$GITHUB_WORKSPACE/.qt"; then
+            rm -rf "$GITHUB_WORKSPACE/.qt"
+            printf '#!/bin/sh\n7z "$@"\nrc=$?\nif [ "$rc" -eq 2 ]; then exit 0; fi\nexit "$rc"\n' > /tmp/aqt-7z
+            chmod +x /tmp/aqt-7z
+            python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --archives qtbase icu --external /tmp/aqt-7z -O "$GITHUB_WORKSPACE/.qt"
+          fi
+          for so6 in "$GITHUB_WORKSPACE/.qt/${QT_VERSION}/gcc_64/lib"/libQt6*.so.6; do
+            so="${so6%.6}"
+            if [ ! -e "$so" ]; then
+              ln -s "$(basename "$so6")" "$so"
+            fi
+          done
       - name: Install pinned Qt 6.8.3 from official Qt repository (Windows)
         if: runner.os == 'Windows' && steps.qt-cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -168,7 +179,18 @@ jobs:
         run: |
           set -eu
           python -m pip install "aqtinstall==${AQT_VERSION}"
-          python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --external 7z -O "$GITHUB_WORKSPACE/.qt"
+          if ! python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --archives qtbase icu -O "$GITHUB_WORKSPACE/.qt"; then
+            rm -rf "$GITHUB_WORKSPACE/.qt"
+            printf '#!/bin/sh\n7z "$@"\nrc=$?\nif [ "$rc" -eq 2 ]; then exit 0; fi\nexit "$rc"\n' > /tmp/aqt-7z
+            chmod +x /tmp/aqt-7z
+            python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --archives qtbase icu --external /tmp/aqt-7z -O "$GITHUB_WORKSPACE/.qt"
+          fi
+          for so6 in "$GITHUB_WORKSPACE/.qt/${QT_VERSION}/gcc_64/lib"/libQt6*.so.6; do
+            so="${so6%.6}"
+            if [ ! -e "$so" ]; then
+              ln -s "$(basename "$so6")" "$so"
+            fi
+          done
       - name: Fetch and bootstrap vcpkg at the pinned commit
         run: |
           set -eu
