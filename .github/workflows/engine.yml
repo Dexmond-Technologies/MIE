@@ -141,7 +141,8 @@ jobs:
         if: always() && runner.os == 'Linux'
         shell: bash
         run: |
-          python3 engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/trace-set" --no-large
+          # ALL of set S, the four large files included (reviewer, run 45128299260).
+          python3 engine/tools/parity/make_set_s.py --out "$RUNNER_TEMP/trace-set"
           python3 engine/tools/sandbox_trace_check.py \
             --source engine/src/sandbox/sandbox_posix.cpp \
             --keep "$RUNNER_TEMP/worker-trace.txt" -- \
