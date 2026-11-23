@@ -64,6 +64,12 @@ if(MIE_FUZZ_ONLY)
   target_include_directories(fuzz_pe PRIVATE include)
   target_compile_options(fuzz_pe PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
   target_link_options(fuzz_pe PRIVATE -fsanitize=fuzzer,address,undefined)
+
+  # The target as it was when it stopped in run 45117930444: built only for the regression check.
+  add_executable(fuzz_pe_old_ee62e76 fuzz/regress/fuzz_pe_ee62e76.cpp src/pe/pe_reader.cpp)
+  target_include_directories(fuzz_pe_old_ee62e76 PRIVATE include)
+  target_compile_options(fuzz_pe_old_ee62e76 PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
+  target_link_options(fuzz_pe_old_ee62e76 PRIVATE -fsanitize=fuzzer,address,undefined)
   return()
 endif()
 

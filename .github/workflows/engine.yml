@@ -226,13 +226,45 @@ jobs:
           mkdir -p fuzz-corpus
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_frame -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus
+      # Reviewer's condition (board B-3629) after the stop in run 45117930444: test directly
+      # whether the OLD target stops on its rule "an import by ordinal has no name" when given
+      # the base file that imports by ordinal from oleaut32, ws2_32 and wsock32. Each base file
+      # is given to the old and to the corrected target, one at a time.
+      - name: Regression check of the old fuzz target on the base files
+        if: ${{ !cancelled() }}
+        run: |
+          set -u
+          python3 engine/tools/write_pe_bases.py pe-bases
+          old_stops=0; new_stops=0
+          for f in pe-bases/*; do
+            if ./build/fuzz_pe_old_ee62e76 "$f" > old.log 2>&1; then o=runs; else o=STOPS; old_stops=$((old_stops+1)); fi
+            if ./build/fuzz_pe "$f" > new.log 2>&1; then n=runs; else n=STOPS; new_stops=$((new_stops+1)); grep -E 'fuzz_pe: |ERROR|SUMMARY' new.log || true; fi
+            echo "$(basename "$f"): old target $o, corrected target $n"
+          done
+          echo "old target stops on $old_stops base files; corrected target stops on $new_stops"
+          if ./build/fuzz_pe_old_ee62e76 pe-bases/o01_imports_by_ordinal.exe > /dev/null 2>&1; then
+            echo "REGRESSION CHECK: NOT CONFIRMED. The old target does not stop on o01_imports_by_ordinal.exe; the cause of the stop in run 45117930444 is UNKNOWN."
+            exit 1
+          fi
+          echo "REGRESSION CHECK: CONFIRMED. The old target stops on o01_imports_by_ordinal.exe (imports by ordinal from oleaut32, ws2_32, wsock32)."
+          [ "$new_stops" -eq 0 ] || { echo "the corrected target stops on a base file"; exit 1; }
+      # At least 60 million inputs per push for this target (same condition), seeded with the base files.
       - name: Fuzz the reader for Windows executables
         if: ${{ !cancelled() }}
         run: |
           set -eu
+          # Part 1: 60 million inputs from an empty corpus (inputs up to 4096 bytes, as before).
           mkdir -p fuzz-corpus-pe
-          echo "fuzzing for $FUZZ_SECONDS seconds"
-          ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe
+          ./build/fuzz_pe -runs=60000000 -max_total_time=2400 -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe 2> fuzz_pe.part1.log || { tail -60 fuzz_pe.part1.log; exit 1; }
+          tail -12 fuzz_pe.part1.log
+          done_runs=$(sed -n 's/^stat::number_of_executed_units: *//p' fuzz_pe.part1.log | tail -1)
+          echo "fuzz_pe part 1: $done_runs inputs without a stop"
+          [ "${done_runs:-0}" -ge 60000000 ] || { echo "fewer than 60 million inputs were run"; exit 1; }
+          # Part 2: seeded with the parity test's base files, full length.
+          mkdir -p fuzz-corpus-pe-seeded
+          [ -d pe-bases ] || python3 engine/tools/write_pe_bases.py pe-bases
+          cp pe-bases/* fuzz-corpus-pe-seeded/
+          ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe-seeded
       - name: Fuzz the zip reader
         if: ${{ !cancelled() }}
         run: |
