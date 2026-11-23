@@ -136,6 +136,24 @@ bool read_tlv(Bytes& in, Tlv& out) {
     return true;
 }
 
+// A REQUIRED field that signify never reads. asn1crypto 1.5.1 splits a SEQUENCE into its
+// children without looking at the tag of a required field (core.py:3893-3928: only an
+// optional or defaulted field is compared, by class and tag number, line 3899); the tag is
+// checked when the field is first used (core.py:3471-3479 _lazy_child -> _build,
+// core.py:5458-5580). A field nobody uses is therefore accepted with ANY tag and ANY
+// content, as long as it is one well-formed element. Used for exactly these fields, which
+// signify 0.9.3 never touches while verifying: SignedData.version, SignerInfo.version,
+// SignerInfo.signatureAlgorithm (only the unused property pkcs7/signer_info.py:204 reads
+// it; the verify function is chosen from the certificate's key, x509/certificates.py
+// verify_signature), TSTInfo.policy and TSTInfo.serialNumber (properties only,
+// authenticode/tsp.py:57 and :75). None of them is covered by a signature, and none is
+// used by this code either, so accepting them unread changes no decision.
+Tlv skip_unread(Bytes& in, const char* what) {
+    Tlv out;
+    if (!read_tlv(in, out)) throw Fail{"ValueError", std::string("ASN.1: ") + what};
+    return out;
+}
+
 Tlv expect(Bytes& in, std::uint8_t tag, const char* what) {
     Tlv out;
     if (!read_tlv(in, out) || out.tag != tag) throw Fail{"ValueError", std::string("ASN.1: ") + what};
@@ -398,7 +416,7 @@ void require_single(const std::vector<Attr>& attrs, const std::array<std::uint8_
 // signify.pkcs7.SignerInfo.__init__ / _validate_asn1 and its subclasses.
 Signer parse_signer(Bytes content, SignerKind kind) {
     Signer out;
-    expect(content, 0x02, "SignerInfo.version");
+    skip_unread(content, "SignerInfo.version");
     Tlv sid;
     if (!read_tlv(content, sid)) throw Fail{"ValueError", "ASN.1: SignerInfo.sid"};
     if (sid.tag == 0x80 || sid.tag == 0xA0) {
@@ -420,7 +438,8 @@ Signer parse_signer(Bytes content, SignerKind kind) {
         out.auth = parse_attributes(next.content);
         if (!read_tlv(content, next)) throw Fail{"ValueError", "ASN.1: SignerInfo"};
     }
-    if (next.tag != 0x30) throw Fail{"ValueError", "ASN.1: SignerInfo.signatureAlgorithm"};
+    // `next` is SignerInfo.signatureAlgorithm: never read by the reference, any element is accepted
+    // (see skip_unread). An element with tag [0] cannot arrive here: it was taken as the signed attributes.
     out.signature = expect(content, 0x04, "SignerInfo.signature").content;
     if (!content.empty()) {
         const Tlv unsigned_attrs = expect(content, 0xA1, "SignerInfo.unsignedAttrs");
@@ -483,7 +502,7 @@ struct SignedData {
 // the content of the SignedData SEQUENCE.
 SignedData parse_signed_data(Bytes content, DataKind kind) {
     SignedData out;
-    expect(content, 0x02, "SignedData.version");
+    skip_unread(content, "SignedData.version");
     Bytes algorithms = expect(content, 0x31, "SignedData.digestAlgorithms").content;
     while (!algorithms.empty()) {
         if (out.digest_algs.size() >= kMaxAttributes) throw Fail{"ValueError", "too many digest algorithms"};
@@ -843,12 +862,12 @@ Countersignature read_countersignature(const Signer& primary) {
         if (version.content.size() != 1 || version.content[0] != 1) {
             throw Fail{"AuthenticodeParseError", "TSTInfo.version must be v1"};
         }
-        expect(info, 0x06, "TSTInfo.policy");
+        skip_unread(info, "TSTInfo.policy");
         Bytes imprint = expect(info, 0x30, "TSTInfo.messageImprint").content;
         const Tlv algorithm = expect(imprint, 0x30, "TSTInfo.messageImprint.hashAlgorithm");
         out.imprint_alg = digest_algorithm(algorithm, "TSTInfo.messageImprint.hashAlgorithm");
         out.imprint = expect(imprint, 0x04, "TSTInfo.messageImprint.hashedMessage").content;
-        expect(info, 0x02, "TSTInfo.serialNumber");
+        skip_unread(info, "TSTInfo.serialNumber");
         const Tlv stamp = expect(info, 0x18, "TSTInfo.genTime");
         if (!der_time_epoch(stamp, out.time)) throw Fail{"ValueError", "TSTInfo.genTime cannot be read"};
         return out;

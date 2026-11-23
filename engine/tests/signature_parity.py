@@ -293,6 +293,47 @@ def attach(pe, blobs):
     return bytes(out) + table
 
 
+def der_path(blob, target):
+    """Where the byte `target` of the DER text `blob` lies: the chain of elements around it,
+    outermost first, each as tag@offset+length, and whether the byte is in the header (tag or
+    length bytes) or the content of the innermost one. Only constructed elements are entered."""
+    path, start, end = [], 0, len(blob)
+    while True:
+        pos, found = start, False
+        while pos + 2 <= end:
+            tag, n, head = blob[pos], blob[pos + 1], 2
+            if n & 0x80:
+                count = n & 0x7f
+                if count == 0 or count > 4 or pos + 2 + count > end:
+                    break
+                n, head = int.from_bytes(blob[pos + 2:pos + 2 + count], 'big'), 2 + count
+            if pos + head + n > end:
+                break
+            if pos <= target < pos + head + n:
+                where = 'header' if target < pos + head else 'content'
+                path.append(f'{tag:02x}@{pos}+{head + n}:{where}')
+                if where == 'content' and tag & 0x20:
+                    start, end, found = pos + head, pos + head + n, True
+                break
+            pos += head + n
+        if not found:
+            return ' > '.join(path) or 'outside any element'
+
+
+def describe_mutation(base, changed, where, kind, table_at):
+    """One line for a damaged variant: where, what, the bytes around it before and after, and
+    the ASN.1 elements of the ORIGINAL signature the first changed byte lies in."""
+    a, b = max(0, where - 8), min(len(base), where + 8)
+    text = f'{kind} at file offset {where}; before {base[a:b].hex()} after {changed[a:b].hex()}'
+    if where < table_at:
+        return text + '; in the image (headers or section), not in the certificate table'
+    inside = where - table_at
+    if inside < 8:
+        return text + '; in the WIN_CERTIFICATE header (dwLength, revision, type)'
+    blob = base[table_at + 8:]
+    return text + f'; blob offset {inside - 8}; elements: {der_path(blob, inside - 8)}'
+
+
 # ----------------------------------------------------------------------------- the inputs
 def build_cases():
     code = [ExtendedKeyUsageOID.CODE_SIGNING]
@@ -445,6 +486,7 @@ def build_cases():
     # randomly damaged variants of three signed files (fixed seed)
     rng = random.Random(SEED)
     variants = []
+    mutations = {}
     for base_name, base in (('valid_sha256', good), ('valid_stamp_authenticode', stamped_a),
                             ('valid_stamp_rfc3161', stamped_r)):
         for index in range(120):
@@ -458,8 +500,11 @@ def build_cases():
             else:
                 length = rng.randrange(1, 9)
                 data[where:where + length] = bytes(rng.randrange(256) for _ in range(length))[:len(data) - where]
-            variants.append((f'v_{base_name}_{index:03d}', bytes(data)))
-    return cases, variants, roots_pem, policy
+            name = f'v_{base_name}_{index:03d}'
+            variants.append((name, bytes(data)))
+            mutations[name] = describe_mutation(base, bytes(data), where, ('bit flip', 'byte set', 'bytes overwritten')[kind],
+                                                table_at)
+    return cases, variants, roots_pem, policy, mutations
 
 
 # ----------------------------------------------------------------------------- comparison
@@ -482,7 +527,7 @@ def own_text(detail):
 
 def main():
     from dexmond_mie import signature as ref
-    cases, variants, roots_pem, policy = build_cases()
+    cases, variants, roots_pem, policy, mutations = build_cases()
     hard, soft, classes = [], 0, 0
     with tempfile.TemporaryDirectory(prefix='mie-sig-') as tmp:
         roots_path = os.path.join(tmp, 'test_roots.pem')
@@ -552,6 +597,8 @@ def main():
                 elif error_class(r['detail']) != c['error_class']:
                     classes += 1
                     print(f"CLASS {name}: reference {r['detail'][:160]!r}, C++ {c['detail'][:160]!r}")
+            if problems and name in mutations:
+                print(f'MUTATION {name}: {mutations[name]}')
             for problem in problems:
                 hard.append(f'{name}: {problem}')
             if name in named:
