@@ -218,6 +218,7 @@ jobs:
         run: >
           python engine/tools/parity/set_s_coverage.py --results "$RUNNER_TEMP/set_s/reference.jsonl"
           --details "$RUNNER_TEMP/set_s/reference.details.jsonl" --intent "$RUNNER_TEMP/set_s/set_s.intent.json"
+          --expect engine/tools/parity/set_s.manifest.json
 
   vuln-check:
     runs-on: ubuntu-latest

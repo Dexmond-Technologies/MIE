@@ -1,0 +1,1034 @@
+{
+ "covered": {
+  "archive_depth_limit": [
+   "a04_zip_nested_4_deep_stored.zip",
+   "a09_zip_nested_4_deep_deflated.zip"
+  ],
+  "clamp_at_100": [
+   "t10_clamp.txt"
+  ],
+  "family_cap_above:entropy": [
+   "p13_entropy_cap.exe"
+  ],
+  "family_cap_above:imports": [
+   "p03_injection_chain.exe",
+   "p17_download_exec_chain.exe",
+   "p18_hook_chain.exe",
+   "p22_many_signals.exe"
+  ],
+  "family_cap_above:packing": [
+   "p15_packer_confirmed.exe"
+  ],
+  "family_cap_above:yara": [
+   "t08_rule_cap.txt",
+   "t09_just_below_malicious.txt",
+   "t10_clamp.txt"
+  ],
+  "family_cap_exactly:entropy": [
+   "p08_high_entropy_section.exe",
+   "p11_tls_with_entropy.exe",
+   "p22_many_signals.exe",
+   "t11_random.bin"
+  ],
+  "family_cap_exactly:imports": [
+   "p24_imports_exactly_at_cap.exe"
+  ],
+  "family_cap_exactly:packing": [
+   "p23_packer_exactly_at_cap.exe"
+  ],
+  "family_cap_exactly:yara": [
+   "t16_rule_exactly_at_cap.txt"
+  ],
+  "floor:archive_member": [
+   "a02_zip_critical_member.zip",
+   "a03_tar_medium_member.tar",
+   "a04_zip_nested_4_deep_stored.zip",
+   "a06_targz_low_member.tar.gz",
+   "a07_zip_with_executable.zip",
+   "a08_zip_nested_3_deep_deflated.zip",
+   "a10_zip_deflated_member.zip"
+  ],
+  "floor:reputation": [
+   "r01_listed_bad.txt"
+  ],
+  "partial_scan_verdict": [
+   "L1_oversize_nothing.bin"
+  ],
+  "reduced_entropy_weight": [
+   "t12_pockets_after_zeros.bin",
+   "t13_gzip_magic_random.bin",
+   "t14_png_magic_random.bin"
+  ],
+  "trusted_hash_early_return": [
+   "r02_listed_trusted.txt"
+  ],
+  "verdict:CLEAN": [
+   "L3_blind_zone_tail.bin",
+   "a01_zip_clean.zip",
+   "a05_zip_201_members.zip",
+   "a09_zip_nested_4_deep_deflated.zip",
+   "p01_plain.exe",
+   "p09_big_overlay.exe",
+   "p10_random_overlay.exe",
+   "p12_tls_alone.exe",
+   "r02_listed_trusted.txt",
+   "t01_clean.txt"
+  ],
+  "verdict:MALICIOUS": [
+   "a02_zip_critical_member.zip",
+   "a04_zip_nested_4_deep_stored.zip",
+   "a07_zip_with_executable.zip",
+   "a08_zip_nested_3_deep_deflated.zip",
+   "a10_zip_deflated_member.zip",
+   "p22_many_signals.exe",
+   "r01_listed_bad.txt",
+   "t05_critical_words.txt",
+   "t10_clamp.txt"
+  ],
+  "verdict:SUSPICIOUS (LOW)": [
+   "L4_blind_zone_head.bin",
+   "a06_targz_low_member.tar.gz",
+   "m01_mz_packer_markers.bin",
+   "m02_pe_signature_only.bin",
+   "p02_suspicious_import.exe",
+   "p04_dynamic_resolution.exe",
+   "p05_persistence.exe",
+   "p06_wx_section.exe",
+   "p07_entry_zero.exe",
+   "p08_high_entropy_section.exe",
+   "p11_tls_with_entropy.exe",
+   "p13_entropy_cap.exe",
+   "p14_bad_certificate_table.exe",
+   "p15_packer_confirmed.exe",
+   "p16_packer_section_name.exe",
+   "p19_tiny_import_table.exe",
+   "p20_privilege_chain.exe",
+   "p23_packer_exactly_at_cap.exe",
+   "t02_shell_word.txt",
+   "t03_obfuscated.txt",
+   "t06_rule_high.txt",
+   "t07_rule_medium.txt",
+   "t11_random.bin",
+   "t12_pockets_after_zeros.bin",
+   "t13_gzip_magic_random.bin",
+   "t14_png_magic_random.bin",
+   "t15_pockets.bin"
+  ],
+  "verdict:SUSPICIOUS (MEDIUM)": [
+   "L2_oversize_with_indicator.bin",
+   "a03_tar_medium_member.tar",
+   "p03_injection_chain.exe",
+   "p17_download_exec_chain.exe",
+   "p18_hook_chain.exe",
+   "p21_antidebug.exe",
+   "p24_imports_exactly_at_cap.exe",
+   "t04_b64_marker.txt",
+   "t08_rule_cap.txt",
+   "t09_just_below_malicious.txt",
+   "t16_rule_exactly_at_cap.txt"
+  ],
+  "weight:anomaly": [
+   "p07_entry_zero.exe",
+   "p22_many_signals.exe"
+  ],
+  "weight:api_chain": [
+   "p03_injection_chain.exe",
+   "p17_download_exec_chain.exe",
+   "p18_hook_chain.exe",
+   "p22_many_signals.exe"
+  ],
+  "weight:api_chain_minor": [
+   "p05_persistence.exe",
+   "p20_privilege_chain.exe",
+   "p21_antidebug.exe"
+  ],
+  "weight:b64_executable": [
+   "a03_tar_medium_member.tar",
+   "t04_b64_marker.txt",
+   "t10_clamp.txt"
+  ],
+  "weight:critical_yara": [
+   "a02_zip_critical_member.zip",
+   "a04_zip_nested_4_deep_stored.zip",
+   "t05_critical_words.txt",
+   "t10_clamp.txt"
+  ],
+  "weight:dynamic_resolution_chain": [
+   "p04_dynamic_resolution.exe",
+   "p19_tiny_import_table.exe",
+   "p24_imports_exactly_at_cap.exe"
+  ],
+  "weight:high_entropy": [
+   "p08_high_entropy_section.exe",
+   "p11_tls_with_entropy.exe",
+   "p13_entropy_cap.exe",
+   "p15_packer_confirmed.exe",
+   "p22_many_signals.exe",
+   "t11_random.bin",
+   "t13_gzip_magic_random.bin",
+   "t14_png_magic_random.bin"
+  ],
+  "weight:malformed_certificate_table": [
+   "p14_bad_certificate_table.exe"
+  ],
+  "weight:malformed_pe": [
+   "m02_pe_signature_only.bin"
+  ],
+  "weight:obfuscated_script": [
+   "L2_oversize_with_indicator.bin",
+   "L4_blind_zone_head.bin",
+   "t03_obfuscated.txt",
+   "t09_just_below_malicious.txt",
+   "t10_clamp.txt"
+  ],
+  "weight:oversize_partial_scan": [
+   "L1_oversize_nothing.bin",
+   "L2_oversize_with_indicator.bin"
+  ],
+  "weight:packer_detected": [
+   "m01_mz_packer_markers.bin",
+   "p15_packer_confirmed.exe",
+   "p16_packer_section_name.exe",
+   "p23_packer_exactly_at_cap.exe"
+  ],
+  "weight:reputation_malicious": [
+   "r01_listed_bad.txt"
+  ],
+  "weight:sliding_entropy_spike": [
+   "t12_pockets_after_zeros.bin",
+   "t15_pockets.bin"
+  ],
+  "weight:suspicious_import": [
+   "p02_suspicious_import.exe",
+   "p03_injection_chain.exe",
+   "p17_download_exec_chain.exe",
+   "p18_hook_chain.exe",
+   "p20_privilege_chain.exe",
+   "p21_antidebug.exe",
+   "p22_many_signals.exe"
+  ],
+  "weight:suspicious_string": [
+   "a06_targz_low_member.tar.gz",
+   "a07_zip_with_executable.zip",
+   "p24_imports_exactly_at_cap.exe",
+   "t02_shell_word.txt"
+  ],
+  "weight:tls_callback": [
+   "p11_tls_with_entropy.exe",
+   "p22_many_signals.exe"
+  ],
+  "weight:wx_section": [
+   "p06_wx_section.exe",
+   "p15_packer_confirmed.exe",
+   "p22_many_signals.exe",
+   "p23_packer_exactly_at_cap.exe"
+  ],
+  "weight:yara_match": [
+   "p03_injection_chain.exe",
+   "p21_antidebug.exe",
+   "p22_many_signals.exe",
+   "p24_imports_exactly_at_cap.exe",
+   "t06_rule_high.txt",
+   "t07_rule_medium.txt",
+   "t08_rule_cap.txt",
+   "t09_just_below_malicious.txt",
+   "t10_clamp.txt",
+   "t16_rule_exactly_at_cap.txt"
+  ],
+  "yara_severity:critical": [
+   "a02_zip_critical_member.zip",
+   "a04_zip_nested_4_deep_stored.zip",
+   "t05_critical_words.txt",
+   "t10_clamp.txt"
+  ],
+  "yara_severity:high": [
+   "p03_injection_chain.exe",
+   "p22_many_signals.exe",
+   "p24_imports_exactly_at_cap.exe",
+   "t06_rule_high.txt",
+   "t08_rule_cap.txt",
+   "t09_just_below_malicious.txt",
+   "t10_clamp.txt",
+   "t16_rule_exactly_at_cap.txt"
+  ],
+  "yara_severity:medium": [
+   "p21_antidebug.exe",
+   "t07_rule_medium.txt"
+  ]
+ },
+ "files": [
+  {
+   "categories": [
+    "oversize_partial_scan"
+   ],
+   "error_class": null,
+   "intent": "above 256 MiB with nothing found: oversize_partial_scan (5) and the partial-scan verdict text",
+   "path": "L1_oversize_nothing.bin",
+   "score": 5,
+   "sha256": "053eadfdec682cf16f3f8704c7609c57868dd75765e08dc5a7491f5d06bcb74d",
+   "size": 269484032,
+   "verdict": "SUSPICIOUS (LOW): oversize, partially scanned"
+  },
+  {
+   "categories": [
+    "obfuscated_script",
+    "oversize_partial_scan"
+   ],
+   "error_class": null,
+   "intent": "above 256 MiB with an indicator in the first window: oversize_partial_scan + obfuscated_script",
+   "path": "L2_oversize_with_indicator.bin",
+   "score": 30,
+   "sha256": "c60131408d09ab9afa38104c7ed53d8bacb4f831427e1c5123039e2c8b2946cc",
+   "size": 269484032,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "between 32 and 256 MiB with an indicator only after the first 32 MiB: the blind zone (R-5); the reference is expected NOT to report it",
+   "path": "L3_blind_zone_tail.bin",
+   "score": 0,
+   "sha256": "f335f0228c3b35efde9be6e6013b7b2b8a61b16f5a1ec8af177e892588b92c37",
+   "size": 34603008,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "obfuscated_script"
+   ],
+   "error_class": null,
+   "intent": "between 32 and 256 MiB with the indicator in the first 32 MiB: reported",
+   "path": "L4_blind_zone_head.bin",
+   "score": 25,
+   "sha256": "c1103e4d1b36b02a47bac57f7d83d81cd1dd3bb90a32ffeb88f98c0be99c13a8",
+   "size": 34603008,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "archive fully covered by scanned members: no entropy score, CLEAN",
+   "path": "a01_zip_clean.zip",
+   "score": 0,
+   "sha256": "fa4e67b855a03fb1de12aca38a037e8e29ed17b963790a167ef9c672dab0266c",
+   "size": 3102,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "archive_member",
+    "critical_yara"
+   ],
+   "error_class": null,
+   "intent": "archive takes its worst member's score as a floor (archive_member, 70)",
+   "path": "a02_zip_critical_member.zip",
+   "score": 70,
+   "sha256": "57e8f35f6f4d86389b51c5b3564492055677b16ae0391d9658af03918e0fb4c8",
+   "size": 1750,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "archive_member",
+    "b64_executable"
+   ],
+   "error_class": null,
+   "intent": "tar archive with a member at 30: floor 30",
+   "path": "a03_tar_medium_member.tar",
+   "score": 30,
+   "sha256": "3336a06bd42661256d1dd45f12a9350b077b0fe9c532e67bd40d1896b5ff022b",
+   "size": 10240,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "archive_member",
+    "critical_yara"
+   ],
+   "error_class": null,
+   "intent": "nesting deeper than 3 with stored members: the innermost archive is not unpacked, but its bytes still hold the words as plain text",
+   "path": "a04_zip_nested_4_deep_stored.zip",
+   "score": 70,
+   "sha256": "2124a40ed9b8daafe9d1ac4b3a97b7b84817552608572517e2fcba236e7f0481",
+   "size": 564,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "more than 200 members: member limit",
+   "path": "a05_zip_201_members.zip",
+   "score": 0,
+   "sha256": "90d9a4a033fef00a25228aaa4bbde0a7d99aff047c054987e085cff921182c86",
+   "size": 19720,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "archive_member",
+    "suspicious_string"
+   ],
+   "error_class": null,
+   "intent": "compressed tar with a member at 5",
+   "path": "a06_targz_low_member.tar.gz",
+   "score": 5,
+   "sha256": "957dcd4aacec8134aa31259b9f2aab650562d5ec8c06a71f60a5416dde90adde",
+   "size": 10263,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "archive_member",
+    "suspicious_string"
+   ],
+   "error_class": null,
+   "intent": "archive whose worst member is an executable",
+   "path": "a07_zip_with_executable.zip",
+   "score": 75,
+   "sha256": "ba5a08413b63b16304afe518438604912b005353972b0545828b052c4984d66a",
+   "size": 29808,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "archive_member"
+   ],
+   "error_class": null,
+   "intent": "three archives deep, innermost member deflated: within the depth limit, unpacked and found",
+   "path": "a08_zip_nested_3_deep_deflated.zip",
+   "score": 70,
+   "sha256": "5e12e7a88801281cc26420ffd16539259187a99ab61e0ccf33ed88e3fad0231e",
+   "size": 450,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "four archives deep, innermost member deflated: beyond the depth limit of 3, the innermost archive is not unpacked and its content is not seen",
+   "path": "a09_zip_nested_4_deep_deflated.zip",
+   "score": 0,
+   "sha256": "2df37150dd0c97e1664dd706e794959025da00039f8f7c8c3b9cf9e2a178ffbe",
+   "size": 566,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "archive_member"
+   ],
+   "error_class": null,
+   "intent": "a deflated member is unpacked and scanned (archive_member floor 70)",
+   "path": "a10_zip_deflated_member.zip",
+   "score": 70,
+   "sha256": "9dfe707c7f490271bd3609955810f8b885db163e9530c9c21952f1d304d50d6c",
+   "size": 1754,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "packer_detected"
+   ],
+   "error_class": null,
+   "intent": "packer rule on a file that does not parse as PE: packer_detected (15)",
+   "path": "m01_mz_packer_markers.bin",
+   "score": 15,
+   "sha256": "ac3cfbe3d5626ae56d9cbc4d89c807f650497ffcae7d472f485df8beb00afe08",
+   "size": 279,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "malformed_pe"
+   ],
+   "error_class": null,
+   "intent": "PE signature present but headers cut off: malformed_pe (10)",
+   "path": "m02_pe_signature_only.bin",
+   "score": 10,
+   "sha256": "652658b89614e9b7504bb9934d5aeb48f92eda68fc79f644ed32cba1a63aacf9",
+   "size": 512,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "well-formed executable, nothing to report",
+   "path": "p01_plain.exe",
+   "score": 0,
+   "sha256": "8a6760e0b928325d49892c9a2cafabbcf3e1836c652d921b346cfa1848e854a3",
+   "size": 3584,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "suspicious_import"
+   ],
+   "error_class": null,
+   "intent": "suspicious_import (10)",
+   "path": "p02_suspicious_import.exe",
+   "score": 10,
+   "sha256": "4b483961edeb2dd32e636c5b765e12988d1948bd9583b968f1d3a4981c8368d4",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "api_chain",
+    "suspicious_import",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "api_chain (35) + suspicious_import (10) + an imports-category rule: imports family above its cap of 35",
+   "path": "p03_injection_chain.exe",
+   "score": 35,
+   "sha256": "846921f052e314058edac4f948700c1ae13231daaad91df1b723527ea7bf6777",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "dynamic_resolution_chain"
+   ],
+   "error_class": null,
+   "intent": "dynamic_resolution_chain (15)",
+   "path": "p04_dynamic_resolution.exe",
+   "score": 15,
+   "sha256": "ef9bb426d5004b62289b12ab4213e25009226e3345f860d1303b2ecdb86cf8fa",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "api_chain_minor"
+   ],
+   "error_class": null,
+   "intent": "api_chain_minor (15)",
+   "path": "p05_persistence.exe",
+   "score": 15,
+   "sha256": "ae0d4929b0d65e3fffb8d5f601cab684f552346345e20896015b58c9b25625a4",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "wx_section"
+   ],
+   "error_class": null,
+   "intent": "wx_section (10)",
+   "path": "p06_wx_section.exe",
+   "score": 10,
+   "sha256": "007c989effc507a1ddf5b11f0e12fbf48b6ca38e2aee577f9aaf39620582b807",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "anomaly"
+   ],
+   "error_class": null,
+   "intent": "anomaly (10): entry point is zero",
+   "path": "p07_entry_zero.exe",
+   "score": 10,
+   "sha256": "b0482c01369ba8c0267a575fd0fe8082590c2e2452d10595c45f5a0c3fb71372",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "high_entropy"
+   ],
+   "error_class": null,
+   "intent": "high_entropy (15) on a section",
+   "path": "p08_high_entropy_section.exe",
+   "score": 15,
+   "sha256": "fee4a36d3b0b004a584d927bd44db427ccfdd194c6165b480b2189a30b139f7a",
+   "size": 19968,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "more than 1 MiB after the last section, low entropy: the row pe_overlay (15), IF the reference can see an overlay at all (see set_s_coverage.py: overlay rows)",
+   "path": "p09_big_overlay.exe",
+   "score": 0,
+   "sha256": "653cde9d536e457562c83e80a0d7c54dd773f103de59ece6326e1b6ff4cb0527",
+   "size": 1219584,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "8 KiB of random bytes after the last section: the row overlay_high_entropy (5), IF the reference can see an overlay at all",
+   "path": "p10_random_overlay.exe",
+   "score": 0,
+   "sha256": "f4ce20e62e576ba477a9a765fc1beb8e33019857a5b4d3eb05476aa4cbf09992",
+   "size": 11776,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "high_entropy",
+    "tls_callback"
+   ],
+   "error_class": null,
+   "intent": "tls_callback (5), scored because an entropy signal is present",
+   "path": "p11_tls_with_entropy.exe",
+   "score": 20,
+   "sha256": "aa6cd659940753639c72568d8d4a6e19f64db7add0a12f436858f89d2b7fce7a",
+   "size": 20480,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "TLS callback without any packer or entropy signal: reported, not scored",
+   "path": "p12_tls_alone.exe",
+   "score": 0,
+   "sha256": "e799681e34f50fba84b06b305bdab884982bf79a72fb80d9975cd0071f5df39e",
+   "size": 4096,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "high_entropy",
+    "high_entropy"
+   ],
+   "error_class": null,
+   "intent": "entropy family above its cap of 15 (two sections and the overlay)",
+   "path": "p13_entropy_cap.exe",
+   "score": 15,
+   "sha256": "8d56d3bd2fe2c83d1a3cf0f80c08f2bfc4514872faa3cb5ac9f161aacf561633",
+   "size": 44544,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "malformed_certificate_table"
+   ],
+   "error_class": null,
+   "intent": "malformed_certificate_table (10)",
+   "path": "p14_bad_certificate_table.exe",
+   "score": 10,
+   "sha256": "f655c1db4b1ca50d13d2c741cbfd0e2e4b8f71a0e747055dac42932bcab99c72",
+   "size": 3648,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "high_entropy",
+    "packer_detected",
+    "wx_section"
+   ],
+   "error_class": null,
+   "intent": "confirmed packer layout: packing family above its cap of 25",
+   "path": "p15_packer_confirmed.exe",
+   "score": 25,
+   "sha256": "2087b05e65ad6a7aadfda72b6add3b986de120a0671755d8c8b4a5ba5dfe84cc",
+   "size": 17920,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "packer_detected"
+   ],
+   "error_class": null,
+   "intent": "packer_detected (15) by section name",
+   "path": "p16_packer_section_name.exe",
+   "score": 15,
+   "sha256": "e34d43887fd86c3417072454258895e73631a3e173b5b97066fc1fae17f6421d",
+   "size": 4096,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "api_chain",
+    "suspicious_import"
+   ],
+   "error_class": null,
+   "intent": "api_chain (35), second chain",
+   "path": "p17_download_exec_chain.exe",
+   "score": 35,
+   "sha256": "016fdf9e16c3265fbce5a120e901b0c4721fb2051b48599fbf76bfa0c3a61ff4",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "api_chain",
+    "suspicious_import"
+   ],
+   "error_class": null,
+   "intent": "api_chain (35), third chain",
+   "path": "p18_hook_chain.exe",
+   "score": 35,
+   "sha256": "ed4bd9670f0780bffc19adf5af13b88e19524fd84ee01dd600b076c19eda2fa0",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "dynamic_resolution_chain"
+   ],
+   "error_class": null,
+   "intent": "dynamic_resolution_chain (15) through the tiny import table rule",
+   "path": "p19_tiny_import_table.exe",
+   "score": 15,
+   "sha256": "6077d795da658514467f1e736cce03d698469aea539d7249ae1e2a461ae5dac7",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "api_chain_minor",
+    "suspicious_import"
+   ],
+   "error_class": null,
+   "intent": "api_chain_minor (15), privilege chain",
+   "path": "p20_privilege_chain.exe",
+   "score": 25,
+   "sha256": "7009a9072cfc923ac9cf7b0b59c843bc43a240ee8c7fd5d6e2033eb9224eae5e",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "api_chain_minor",
+    "suspicious_import",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "anti-debug chain and the anti-debug rule (medium, 10)",
+   "path": "p21_antidebug.exe",
+   "score": 35,
+   "sha256": "440291449f62b9a60fc519402d3b7b8cec665b23f06661a6a251e273e3e6ac68",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "anomaly",
+    "api_chain",
+    "api_chain",
+    "high_entropy",
+    "suspicious_import",
+    "tls_callback",
+    "wx_section",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "many heuristic families at once (no critical rule)",
+   "path": "p22_many_signals.exe",
+   "score": 75,
+   "sha256": "10974dd16b2a5a177ecb67033133b74f562f1d7df00093200c2f648d7426f9b6",
+   "size": 28160,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "packer_detected",
+    "wx_section"
+   ],
+   "error_class": null,
+   "intent": "confirmed packer layout without high entropy: packing family exactly at its cap of 25 (packer_detected 15 + wx_section 10)",
+   "path": "p23_packer_exactly_at_cap.exe",
+   "score": 25,
+   "sha256": "56b918b6ac3fa2c7ecfbc5b84ad7209499e6a108c35c64a5b6670f3d179a2be6",
+   "size": 6144,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "dynamic_resolution_chain",
+    "suspicious_string",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "imports family exactly at its cap of 35: dynamic_resolution_chain 15 + an imports-category rule 20 (the rule's words are plain text in the data section, not imports)",
+   "path": "p24_imports_exactly_at_cap.exe",
+   "score": 40,
+   "sha256": "278df8f14a94ceaa517d416ffcd24e0b223d922cd9826a0b9785dfbcb0652551",
+   "size": 3584,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "reputation_malicious"
+   ],
+   "error_class": null,
+   "intent": "reputation_malicious (70) and the floor of 70",
+   "path": "r01_listed_bad.txt",
+   "score": 70,
+   "sha256": "c3d471d51e4c6891b3bb710d4f570fb06e7575fcb0b5d0df4442ca58105bd50a",
+   "size": 65,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "trusted hash: CLEAN at once, although a critical rule would match",
+   "path": "r02_listed_trusted.txt",
+   "score": 0,
+   "sha256": "df1cda5a6a5651da5cb3c10c432871fac2f3aa9ae8ff85c499aa655630ab332c",
+   "size": 140,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [],
+   "error_class": null,
+   "intent": "score 0, CLEAN",
+   "path": "t01_clean.txt",
+   "score": 0,
+   "sha256": "afacb67910f80ad018b09e0b7b95a47f53cc89e1ed9c6abb02540833ba250cd8",
+   "size": 1440,
+   "verdict": "CLEAN"
+  },
+  {
+   "categories": [
+    "suspicious_string"
+   ],
+   "error_class": null,
+   "intent": "suspicious_string (5): lowest non-zero score",
+   "path": "t02_shell_word.txt",
+   "score": 5,
+   "sha256": "431590f6dbc0b856c0d9cbb141f76a0e82135fc27e17f8e257922d101aea87d0",
+   "size": 141,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "obfuscated_script"
+   ],
+   "error_class": null,
+   "intent": "obfuscated_script (25): highest reachable score below the MEDIUM line",
+   "path": "t03_obfuscated.txt",
+   "score": 25,
+   "sha256": "31b623f73d912f6c7b90c4a662331e24a716bd201b759adb4b1be2ef6f92594b",
+   "size": 104,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "b64_executable"
+   ],
+   "error_class": null,
+   "intent": "b64_executable (30): exactly the MEDIUM line",
+   "path": "t04_b64_marker.txt",
+   "score": 30,
+   "sha256": "6861eb2793f58dcbcb2f63cdca1e0f1d10f01cc8cce43ed71f05c2d54f9a8e4c",
+   "size": 144,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "critical_yara"
+   ],
+   "error_class": null,
+   "intent": "critical_yara (70): exactly the MALICIOUS line",
+   "path": "t05_critical_words.txt",
+   "score": 70,
+   "sha256": "8444df0a17b0a270fcd9cbf4c7cb986192261af5d681021329547bc4af09fc89",
+   "size": 100,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "yara_match, severity high (20)",
+   "path": "t06_rule_high.txt",
+   "score": 20,
+   "sha256": "ce90b2d5425dda32fe2a44328b02ca54207fb48d20927689dab36bd86f6d5033",
+   "size": 58,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "yara_match, severity medium (10)",
+   "path": "t07_rule_medium.txt",
+   "score": 10,
+   "sha256": "c330ae69ca5e70825dd33cce33dc225f19d63de2385e9e1e55379788414a1a01",
+   "size": 60,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "yara_match",
+    "yara_match",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "yara family above its cap of 40 (three high rules = 60)",
+   "path": "t08_rule_cap.txt",
+   "score": 40,
+   "sha256": "4e978fa6c977f34d5b32c21108f793bf0fc870270598d2999d94d4d0fc4001cf",
+   "size": 118,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "obfuscated_script",
+    "yara_match",
+    "yara_match",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "yara cap 40 + obfuscated_script 25 = 65: highest reachable score below the MALICIOUS line",
+   "path": "t09_just_below_malicious.txt",
+   "score": 65,
+   "sha256": "75011e5b85bdfef5553d000e6a38956a18d7072ffa2123762651fcc24c4b6a08",
+   "size": 143,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  },
+  {
+   "categories": [
+    "b64_executable",
+    "critical_yara",
+    "obfuscated_script",
+    "yara_match",
+    "yara_match",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "sum above 100: clamp at 100",
+   "path": "t10_clamp.txt",
+   "score": 100,
+   "sha256": "bd352eb10c0922a60fd38de1880eb5ee2c5d52bd888ef04ee6ffb0ec1020f535",
+   "size": 384,
+   "verdict": "MALICIOUS"
+  },
+  {
+   "categories": [
+    "high_entropy"
+   ],
+   "error_class": null,
+   "intent": "non-PE whole-file entropy above 7.2: high_entropy (15)",
+   "path": "t11_random.bin",
+   "score": 15,
+   "sha256": "338262b1b6fe1aa5bfae1b0028a09ad646558500d5768b5e211bf07d03cee7f0",
+   "size": 65536,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "sliding_entropy_spike"
+   ],
+   "error_class": null,
+   "intent": "entropy at most 7.2 but more than a quarter of the windows high, in a file that begins with zero bytes: the reference takes leading zero blocks for a tar archive, so the weight is the reduced one (5)",
+   "path": "t12_pockets_after_zeros.bin",
+   "score": 5,
+   "sha256": "14cd33427ababd2291da9b32ceb506ab521d334e1d3dffccea0a8ad28fed4e0d",
+   "size": 102400,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "high_entropy"
+   ],
+   "error_class": null,
+   "intent": "compressed-format magic with high entropy, not an archive: entropy at reduced weight (5)",
+   "path": "t13_gzip_magic_random.bin",
+   "score": 5,
+   "sha256": "3d880a6e7794f71d3b40795475af886992127d6dfde082697f0be5ce11197419",
+   "size": 65540,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "high_entropy"
+   ],
+   "error_class": null,
+   "intent": "compressed-format magic (png) with high entropy: entropy at reduced weight (5)",
+   "path": "t14_png_magic_random.bin",
+   "score": 5,
+   "sha256": "2c010591026c0a3e4a217e120bb591b6c7dd45ec49bb6faf7c9a7ebdf9ea4537",
+   "size": 65544,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "sliding_entropy_spike"
+   ],
+   "error_class": null,
+   "intent": "entropy at most 7.2 but more than a quarter of the windows high: sliding_entropy_spike (10)",
+   "path": "t15_pockets.bin",
+   "score": 10,
+   "sha256": "00c75a3520294d8bb248fa598d04647295b423b8d2a96c618231b9e3950d733d",
+   "size": 102400,
+   "verdict": "SUSPICIOUS (LOW)"
+  },
+  {
+   "categories": [
+    "yara_match",
+    "yara_match"
+   ],
+   "error_class": null,
+   "intent": "yara family exactly at its cap of 40 (two high rules = 40)",
+   "path": "t16_rule_exactly_at_cap.txt",
+   "score": 40,
+   "sha256": "f3fe7a2b228d24842992bd35c3a16b1fbe7de223301d545bbab9e3e898ad94cc",
+   "size": 86,
+   "verdict": "SUSPICIOUS (MEDIUM)"
+  }
+ ],
+ "missing": [],
+ "not_by_files": {
+  "default_weight": "the reference never creates a finding of an unknown category",
+  "signed_cap": "needs a file with a genuine trusted signature; cannot be generated (r-01, B-3488: named Microsoft-signed corpus files, or NOT COVERED by files)",
+  "yara_severity:low": "no rule of the reference has severity \"low\""
+ },
+ "provenance": {
+  "note": "Copied from that run's log. .github/workflows/engine.yml regenerates the set on every push and requires every file's hash, score, verdict and categories to equal this file (--expect).",
+  "produced_by": "CI run 45097126429, job set-s, commit 12878b9 (GitHub Actions, ubuntu-latest)"
+ },
+ "reference": {
+  "commit": "12878b97dd2b2b0639cc41114bd7f74bccc2d470",
+  "options": {
+   "reputation_sha256": "dd02f10b28eb6e53b72e2da6dcadba0ae6c9e32c93a4850fbfc61eda0ec6e61b",
+   "use_reputation": true
+  },
+  "pefile": "2024.8.26",
+  "python": "3.12.16",
+  "rules": {
+   "eicar.yar": "5dcbdc6b0cf8e7d74c4866431b35e6a5baf258a64665a18ab47a49d9f12a298a",
+   "malware_families.yar": "85665f4412c769dddd1932c874d7ac1172daba722a31a80f4605f2009aaa0fc6",
+   "packers.yar": "ff9f4bf0a8bb3d2761f4ca3cb86b1408174b92449765792527d6d483c539b20b",
+   "scripts_and_droppers.yar": "fa4993c1fdb641907ce3feff5465068e477a82a9bc7f01b5ee878b827add7be3",
+   "suspicious_behavior.yar": "fb094f03154fdc6bd18f3d0570dd69fc844b259440f6680c38be6bb7fb0191e2"
+  },
+  "yara_library": "4.5.1",
+  "yara_python": "4.5.1",
+  "yara_status": "ON"
+ },
+ "scores_present": [
+  0,
+  5,
+  10,
+  15,
+  20,
+  25,
+  30,
+  35,
+  40,
+  65,
+  70,
+  75,
+  100
+ ],
+ "scores_required": [
+  0,
+  5,
+  25,
+  30,
+  65,
+  70,
+  100
+ ],
+ "seed": 20261123,
+ "set": "S",
+ "unreachable_in_reference": {
+  "weight:overlay_high_entropy": "cannot be produced by the reference: it asks pefile for the overlay through a method this pefile does not have, and swallows the error. pefile 2024.8.26: PE.get_overlay_data_offset (the name the reference calls) exists: False; PE.get_overlay_data_start_offset exists: True",
+  "weight:pe_overlay": "cannot be produced by the reference: it asks pefile for the overlay through a method this pefile does not have, and swallows the error. pefile 2024.8.26: PE.get_overlay_data_offset (the name the reference calls) exists: False; PE.get_overlay_data_start_offset exists: True"
+ }
+}
