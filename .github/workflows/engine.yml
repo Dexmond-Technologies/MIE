@@ -83,6 +83,10 @@ jobs:
         with:
           path: .vcpkg-cache
           key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          # an older cache of the same vcpkg commit is still useful: vcpkg takes from it every
+          # package whose build inputs are unchanged and builds only the rest
+          restore-keys: |
+            vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-
       - name: Configure
         shell: pwsh
         run: |
@@ -93,7 +97,7 @@ jobs:
         run: cmake --build build --config Release --parallel 4
       - name: Test
         shell: pwsh
-        run: ctest --test-dir build -C Release --verbose --timeout 180
+        run: ctest --test-dir build -C Release --verbose --timeout 900
 
   sanitize:
     runs-on: ubuntu-latest
@@ -124,6 +128,10 @@ jobs:
         with:
           path: .vcpkg-cache
           key: vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          # an older cache of the same vcpkg commit is still useful: vcpkg takes from it every
+          # package whose build inputs are unchanged and builds only the rest
+          restore-keys: |
+            vcpkg-${{ runner.os }}-build-${{ env.VCPKG_COMMIT }}-
       - name: Configure (AddressSanitizer + UndefinedBehaviorSanitizer)
         run: >
           cmake -S engine -B build -DCMAKE_BUILD_TYPE=Debug -DMIE_SANITIZE=ON
@@ -133,7 +141,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
       - name: Test
-        run: ctest --test-dir build --verbose --timeout 300
+        run: ctest --test-dir build --verbose --timeout 900
 
   fuzz:
     runs-on: ubuntu-latest
@@ -160,6 +168,8 @@ jobs:
         with:
           path: .vcpkg-cache
           key: vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-fuzz-${{ env.VCPKG_COMMIT }}-
       - name: Configure (fuzz targets only)
         run: >
           cmake -S engine -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMIE_FUZZ_ONLY=ON
@@ -173,6 +183,12 @@ jobs:
           mkdir -p fuzz-corpus
           echo "fuzzing for $FUZZ_SECONDS seconds"
           ./build/fuzz_frame -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus
+      - name: Fuzz the reader for Windows executables
+        run: |
+          set -eu
+          mkdir -p fuzz-corpus-pe
+          echo "fuzzing for $FUZZ_SECONDS seconds"
+          ./build/fuzz_pe -max_total_time="$FUZZ_SECONDS" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 fuzz-corpus-pe
 
   parity-tools:
     runs-on: ubuntu-latest

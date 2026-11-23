@@ -13,8 +13,8 @@ builds the fuzz targets with clang, libFuzzer, AddressSanitizer and UndefinedBeh
 from the vcpkg commit that `.github/workflows/engine.yml` pins, and runs every target for one
 hour, each on its own core, all at the same time.
 
-Targets today: `fuzz_frame` (the channel frame decoder). Planned with the engine: the executable
-parser and the archive reader. A new target is added to `TARGETS` in the script and in the
+Targets today: `fuzz_frame` (the channel frame decoder) and `fuzz_pe` (the reader for Windows
+executables). Planned with the engine: the archive reader. A new target is added to `TARGETS` in the script and in the
 `CPUQuota` of the unit.
 
 ## What it leaves, under `/mnt/node4-work/mie-fuzz/`

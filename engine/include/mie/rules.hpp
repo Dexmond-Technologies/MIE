@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -57,6 +58,14 @@ public:
     // Hash of the rule set (see engine/docs/INTERFACES.md): SHA-256 over one line per loaded
     // rule file, sorted by name, "<name> <SHA-256 of the file>\n". Empty when the state is Off.
     const std::string& sha256() const;
+
+    // SHA-256 of every loaded rule file, by its name below the rules directory.
+    const std::map<std::string, std::string>& file_hashes() const;
+
+    // Version of the YARA library this program was built with. YARA has no call that
+    // returns its version at run time; this is the version constant of the library's own
+    // header, the one installed with the library that is linked.
+    static std::string library_version();
 
     // Matches the rules against `data`. Returns true with the matches in `out` (possibly
     // none). Returns false with `error` set when the scan failed or timed out, or when the

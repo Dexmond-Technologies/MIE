@@ -128,6 +128,7 @@ struct RuleSet::Impl {
     std::size_t files_loaded = 0;
     std::vector<RuleFileError> errors;
     std::string sha256;
+    std::map<std::string, std::string> file_hashes;
 };
 
 RuleSet::RuleSet() : impl_(std::make_unique<Impl>()) {}
@@ -142,6 +143,8 @@ RulesState RuleSet::state() const { return impl_->state; }
 std::size_t RuleSet::files_loaded() const { return impl_->files_loaded; }
 const std::vector<RuleFileError>& RuleSet::errors() const { return impl_->errors; }
 const std::string& RuleSet::sha256() const { return impl_->sha256; }
+const std::map<std::string, std::string>& RuleSet::file_hashes() const { return impl_->file_hashes; }
+std::string RuleSet::library_version() { return YR_VERSION; }
 
 std::unique_ptr<RuleSet> RuleSet::load(const std::filesystem::path& directory) {
     std::unique_ptr<RuleSet> set(new RuleSet());
@@ -225,6 +228,7 @@ std::unique_ptr<RuleSet> RuleSet::load(const std::filesystem::path& directory) {
     for (const auto& [name, digest] : hashes) {
         lines += name + " " + digest + "\n";
     }
+    impl.file_hashes = hashes;
     impl.sha256 = sha256_hex(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(lines.data()), lines.size()));
     return set;
 }

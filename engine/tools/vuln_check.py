@@ -97,6 +97,16 @@ def main():
             continue
 
         print(f'{name}: version {version} (port revision {port_revision}), tag {tag}, commit {commit}')
+        if lib.get('port_dir') and lib.get('source_archive_sha512'):
+            # a recipe of our own: the hash of the source archive it accepts must be the recorded one
+            portfile = os.path.join(os.path.dirname(os.path.dirname(HERE)), lib['port_dir'], 'portfile.cmake')
+            with open(portfile, encoding='utf-8') as f:
+                pinned = lib['source_archive_sha512'] in f.read()
+            print(f"      source archive SHA-512 {lib['source_archive_sha512'][:24]}... "
+                  f"{'is the one the recipe accepts' if pinned else 'is NOT in the recipe'}")
+            if not pinned:
+                print(f'FAIL  {name}: the recipe does not pin the recorded source archive hash')
+                failed = True
         for key, value in (('expected_version', version), ('expected_commit', commit)):
             if lib.get(key) is None:
                 print(f'      {key}: NOT YET RECORDED (record {value})')
@@ -114,6 +124,29 @@ def main():
             failed = True
         elif open_vulns:
             print(f'      {name} is not shipped (tests only): reported, not failing')
+
+    # Guards: for a vulnerability that concerns a part of a library the engine must never use,
+    # the engine's sources are searched for the calls that would reach it. A guard is checked
+    # whether or not the vulnerability has been accepted.
+    engine_dir = os.path.dirname(HERE)
+    for guard in pins.get('vulnerability_guards', []):
+        used = []
+        for folder in ('src', 'include', 'fuzz', 'tests'):
+            for root, _, names in os.walk(os.path.join(engine_dir, folder)):
+                for name in names:
+                    if not name.endswith(('.cpp', '.hpp', '.h', '.c')):
+                        continue
+                    with open(os.path.join(root, name), encoding='utf-8', errors='replace') as f:
+                        text = f.read()
+                    for symbol in guard['forbidden_symbols']:
+                        if symbol + '(' in text:
+                            used.append(f'{os.path.relpath(os.path.join(root, name), engine_dir)}: {symbol}')
+        state = 'accepted' if guard['id'] in accepted else 'NOT ACCEPTED'
+        if used:
+            print(f"FAIL  guard {guard['id']} ({state}): the engine calls {used}")
+            failed = True
+        else:
+            print(f"guard {guard['id']} ({state}): none of {guard['forbidden_symbols']} is called anywhere in the engine")
 
     print('RESULT:', 'FAIL' if failed else 'PASS')
     return 1 if failed else 0

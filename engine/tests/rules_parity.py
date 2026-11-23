@@ -71,6 +71,19 @@ def main():
     rules_dir = os.path.join(REPO, 'rules')
     reference = YaraAnalyzer(rules_dir)
     ours = probe(rules_dir)
+    # The reviewer wants these three in the log (board B-3598): the YARA version on the C++ side,
+    # the five rule-file hashes against the manifest of set S, and the matches per file on both sides.
+    print(f"C++ side: YARA library {ours.get('yara_library')} (the version constant of the linked library's own header; "
+          f"YARA has no run-time version call)")
+    check('the C++ side is built with exactly the reference\'s YARA version',
+          ours.get('yara_library') == getattr(yara, 'YARA_VERSION', None) == '4.5.1',
+          f"(reference {getattr(yara, 'YARA_VERSION', None)}, C++ {ours.get('yara_library')})")
+    with open(os.path.join(REPO, 'engine', 'tools', 'parity', 'set_s.manifest.json'), encoding='utf-8') as f:
+        manifest_rules = json.load(f)['reference']['rules']
+    for name in sorted(manifest_rules):
+        print(f"rule file {name}: manifest {manifest_rules[name]}  C++ {ours.get('rule_files', {}).get(name)}")
+    check('the five rule-file hashes equal the manifest of set S', ours.get('rule_files') == manifest_rules,
+          f"({len(manifest_rules)} files in the manifest, {len(ours.get('rule_files', {}))} loaded)")
     rule_files = sorted(f for f in os.listdir(rules_dir) if f.endswith(('.yar', '.yara')))
     check('rule set state equals the reference', ours.get('rules_state') == STATE[reference.status],
           f"(reference {reference.status}, C++ {ours.get('rules_state')})")
@@ -97,6 +110,7 @@ def main():
                           for m in got.get('matches', []))
             ok = got.get('scan') == 'ok' and want == have
             with_matches += 1 if want else 0
+            print(f"{'PASS' if ok else 'FAIL'}  {name}: reference {[w[0] for w in want]}  C++ {[h[0] for h in have]}")
             check(f'matches on {name}', ok, '' if ok else f'(reference {want}, C++ {got})')
         print(f'set S: {len(os.listdir(files_dir))} files compared, {with_matches} of them with at least one match in the reference')
         check('the set exercises the rules (at least 15 files match a rule in the reference)', with_matches >= 15,

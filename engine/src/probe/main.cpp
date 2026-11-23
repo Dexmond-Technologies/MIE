@@ -4,10 +4,14 @@
 // Python reference and with the file-type refusal rules.
 //
 // Numbers are printed with 17 significant digits so that the comparison is exact.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -15,6 +19,7 @@
 #include "mie/entropy.hpp"
 #include "mie/hash.hpp"
 #include "mie/io.hpp"
+#include "mie/strings.hpp"
 #ifdef MIE_WITH_RULES
 #include "mie/rules.hpp"
 #endif
@@ -40,7 +45,9 @@ int probe_rules(int argc, char** argv) {
     for (const auto& e : set->errors()) {
         errors.push_back(json{{"file", e.file}, {"error", e.error}});
     }
-    json out = {{"rules_state", mie::to_string(set->state())},
+    json out = {{"yara_library", mie::rules::RuleSet::library_version()},
+                {"rule_files", set->file_hashes()},
+                {"rules_state", mie::to_string(set->state())},
                 {"files_loaded", set->files_loaded()},
                 {"rules_sha256", set->sha256()},
                 {"errors", errors}};
@@ -83,8 +90,47 @@ int probe_rules(int argc, char** argv) {
 }
 #endif
 
+// mie-probe strings DIR: for every regular file directly in DIR (sorted by name) prints one
+// JSON line with the string indicators. A file "<name>.spans" beside a file, if present, holds
+// lines "begin end": ASCII runs at exactly these offsets do not count for suspicious_api.
+int probe_strings(const char* directory) {
+    using nlohmann::json;
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+        if (entry.is_regular_file(ec) && entry.path().extension() != ".spans") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& path : files) {
+        std::ifstream in(path, std::ios::binary);
+        const std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<mie::strings::Span> spans;
+        std::ifstream span_file(path.string() + ".spans");
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        while (span_file >> begin >> end) {
+            spans.emplace_back(begin, end);
+        }
+        const mie::strings::Indicators found = mie::strings::scan(
+            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size()), spans);
+        const json line = {{"name", path.filename().string()},
+                           {"powershell", found.powershell},
+                           {"suspicious_api", found.suspicious_api},
+                           {"b64_executable", found.b64_executable},
+                           {"obfuscated_script", found.obfuscated_script},
+                           {"string_count", found.string_count}};
+        std::printf("%s\n", line.dump().c_str());
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     using nlohmann::json;
+    if (argc == 3 && std::string(argv[1]) == "strings") {
+        return probe_strings(argv[2]);
+    }
 #ifdef MIE_WITH_RULES
     if ((argc == 3 || argc == 4) && std::string(argv[1]) == "rules") {
         return probe_rules(argc, argv);

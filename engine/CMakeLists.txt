@@ -34,6 +34,11 @@ if(MIE_FUZZ_ONLY)
   target_link_libraries(fuzz_frame PRIVATE nlohmann_json::nlohmann_json)
   target_compile_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
   target_link_options(fuzz_frame PRIVATE -fsanitize=fuzzer,address,undefined)
+
+  add_executable(fuzz_pe fuzz/fuzz_pe.cpp src/pe/pe_reader.cpp)
+  target_include_directories(fuzz_pe PRIVATE include)
+  target_compile_options(fuzz_pe PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined -g)
+  target_link_options(fuzz_pe PRIVATE -fsanitize=fuzzer,address,undefined)
   return()
 endif()
 
@@ -47,6 +52,7 @@ add_library(mie_core STATIC
   src/core/io_common.cpp
   src/core/result.cpp
   src/core/scoring.cpp
+  src/core/strings.cpp
 )
 if(WIN32)
   target_sources(mie_core PRIVATE src/core/io_win.cpp)
@@ -55,6 +61,10 @@ else()
 endif()
 target_include_directories(mie_core PUBLIC include)
 target_link_libraries(mie_core PUBLIC nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto)
+
+# ---- reader for Windows executables (own code, standard library only) --------------
+add_library(mie_pe STATIC src/pe/pe_reader.cpp)
+target_include_directories(mie_pe PUBLIC include)
 
 # ---- rules engine (YARA) -----------------------------------------------------------
 if(MIE_WITH_RULES)
@@ -90,6 +100,9 @@ if(MIE_WITH_RULES)
   target_compile_definitions(mie-probe PRIVATE MIE_WITH_RULES)
 endif()
 
+add_executable(mie-pe-probe src/probe/pe_probe.cpp)
+target_link_libraries(mie-pe-probe PRIVATE mie_pe nlohmann_json::nlohmann_json)
+
 add_executable(mie-scoring-check src/probe/scoring_check.cpp)
 target_link_libraries(mie-scoring-check PRIVATE mie_core)
 
@@ -122,6 +135,14 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scoring_vectors_test.py
                    $<TARGET_FILE:mie-scoring-check> ${MIE_REPO_ROOT})
   set_tests_properties(unit io_cases parity_primitives service_smoke scoring_vectors PROPERTIES TIMEOUT 300)
+  add_test(NAME strings_parity
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/strings_parity.py
+                   $<TARGET_FILE:mie-probe> ${MIE_REPO_ROOT})
+  set_tests_properties(strings_parity PROPERTIES TIMEOUT 600)
+  add_test(NAME pe_parity
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_parity.py
+                   $<TARGET_FILE:mie-pe-probe> ${MIE_REPO_ROOT})
+  set_tests_properties(pe_parity PROPERTIES TIMEOUT 900)
   if(MIE_WITH_RULES)
     add_test(NAME rules_parity
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rules_parity.py

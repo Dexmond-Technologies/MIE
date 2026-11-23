@@ -37,8 +37,25 @@
       "touches_hostile_bytes": true,
       "used_for": "rule matching over file bytes; pinned to the reference's version 4.5.1 (reviewer's condition M-5)",
       "expected_version": "4.5.1",
-      "expected_commit": "0e5b6bb9660cba500eb58dbccb027757c82cc4cf"
+      "expected_commit": "0e5b6bb9660cba500eb58dbccb027757c82cc4cf",
+      "source_archive": "https://github.com/VirusTotal/yara/archive/v4.5.1.tar.gz",
+      "source_archive_sha512": "8bf1df7089f9bc5a448dbae0999e04f4ecdec06b4478e2cb5f42a2a3201b99fce68379e3f8f7c67a9db201205366250d7befe5c38451cced807ed692d436422c"
     }
   },
-  "accepted_vulnerabilities": []
+  "accepted_vulnerabilities": [],
+  "vulnerability_guards": [
+    {
+      "id": "CVE-2026-88341",
+      "library": "yara",
+      "what": "An assertion can be reached when LOADING a crafted compiled-rules file (.yrc); the program then terminates. Public record: https://api.osv.dev/v1/vulns/CVE-2026-88341 (CVSS 3.1 AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:N/A:H). The record names YARA 4.5.8, the newest release, as affected; the fix it points to is in a fork, not in a YARA release.",
+      "why_guarded": "The engine never loads compiled-rules files: rules are compiled at start from the rule source files shipped with the product, and the bytes of a scanned file never reach the rule loader.",
+      "forbidden_symbols": [
+        "yr_rules_load",
+        "yr_rules_load_stream",
+        "yr_rules_save",
+        "yr_rules_save_stream"
+      ],
+      "status": "NOT ACCEPTED. Acceptance is the reviewer's (r-01), not the builder's. Until it is in accepted_vulnerabilities the vulnerability check fails."
+    }
+  ]
 }

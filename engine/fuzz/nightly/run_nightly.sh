@@ -26,7 +26,7 @@ BRANCH="${MIE_FUZZ_BRANCH:-cpp/stage1}"
 FUZZ_SECONDS="${MIE_FUZZ_SECONDS:-3600}"
 RSS_LIMIT_MB="${MIE_FUZZ_RSS_MB:-2048}"
 # Every fuzz target built by engine/CMakeLists.txt with -DMIE_FUZZ_ONLY=ON. Add new targets here.
-TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame}"
+TARGETS="${MIE_FUZZ_TARGETS:-fuzz_frame fuzz_pe}"
 
 case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "MIE_FUZZ_SECONDS must be a whole number" >&2; exit 2;; esac
 
