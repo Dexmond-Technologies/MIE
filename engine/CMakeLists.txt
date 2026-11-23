@@ -66,6 +66,11 @@ target_link_libraries(mie_core PUBLIC nlohmann_json::nlohmann_json PRIVATE OpenS
 add_library(mie_pe STATIC src/pe/pe_reader.cpp)
 target_include_directories(mie_pe PUBLIC include)
 
+# ---- analysis of Windows executables (the reference's judgement, parity profile) ---
+add_library(mie_pe_analysis STATIC src/pe/pe_analysis.cpp)
+target_include_directories(mie_pe_analysis PUBLIC include)
+target_link_libraries(mie_pe_analysis PUBLIC mie_pe mie_core)
+
 # ---- rules engine (YARA) -----------------------------------------------------------
 if(MIE_WITH_RULES)
   find_package(unofficial-libyara CONFIG REQUIRED)
@@ -102,6 +107,9 @@ endif()
 
 add_executable(mie-pe-probe src/probe/pe_probe.cpp)
 target_link_libraries(mie-pe-probe PRIVATE mie_pe nlohmann_json::nlohmann_json)
+
+add_executable(mie-pe-analysis-probe src/probe/pe_analysis_probe.cpp)
+target_link_libraries(mie-pe-analysis-probe PRIVATE mie_pe_analysis nlohmann_json::nlohmann_json)
 
 add_executable(mie-scoring-check src/probe/scoring_check.cpp)
 target_link_libraries(mie-scoring-check PRIVATE mie_core)
@@ -143,6 +151,10 @@ if(MIE_BUILD_TESTS)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_parity.py
                    $<TARGET_FILE:mie-pe-probe> ${MIE_REPO_ROOT})
   set_tests_properties(pe_parity PROPERTIES TIMEOUT 900)
+  add_test(NAME pe_analysis_parity
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_analysis_parity.py
+                   $<TARGET_FILE:mie-pe-analysis-probe> ${MIE_REPO_ROOT})
+  set_tests_properties(pe_analysis_parity PROPERTIES TIMEOUT 1200)
   if(MIE_WITH_RULES)
     add_test(NAME rules_parity
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rules_parity.py

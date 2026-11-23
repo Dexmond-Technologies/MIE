@@ -101,7 +101,7 @@ jobs:
         run: cmake --build build --config Release --parallel 4
       - name: Test
         shell: pwsh
-        run: ctest --test-dir build -C Release --verbose --timeout 900
+        run: ctest --test-dir build -C Release --verbose --timeout 1200
 
   sanitize:
     runs-on: ubuntu-latest
@@ -145,7 +145,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
       - name: Test
-        run: ctest --test-dir build --verbose --timeout 900
+        run: ctest --test-dir build --verbose --timeout 1200
 
   fuzz:
     runs-on: ubuntu-latest
