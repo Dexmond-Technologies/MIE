@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -530,38 +531,47 @@ def check_windows_worker_acl_and_forbidden(
     if not any("(RX)" in ln.upper() for ln in wkr_lines):
         errors.append(f"mie-worker.exe icacls missing (RX) for ALL APPLICATION PACKAGES: {wkr_lines}")
 
-    # 2. Verify exact SID S-1-15-2-1 via Get-Acl SecurityIdentifier translation on both targets
-    ps_script = f"""
-$ErrorActionPreference = 'Stop'
-function Check-SidRx($Path, [bool]$NeedInherit) {{
-  $acl = Get-Acl -LiteralPath $Path
-  foreach ($ace in $acl.Access) {{
-    try {{
-      $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    }} catch {{ continue }}
-    if ($sid -eq 'S-1-15-2-1' -and $ace.AccessControlType -eq 'Allow') {{
-      $hasRx = (($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
-      $hasInh = (-not $NeedInherit) -or (
-        (($ace.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -ne 0) -and
-        (($ace.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0)
-      )
-      if ($hasRx -and $hasInh) {{ return $true }}
-    }}
-  }}
-  return $false
-}}
-$dirOk = Check-SidRx '{install_dir}' $true
-$wkrOk = Check-SidRx '{worker_exe}' $false
-Write-Output ("dir_s1_15_2_1=$dirOk;wkr_s1_15_2_1=$wkrOk")
-if (-not ($dirOk -and $wkrOk)) {{ exit 1 }}
-"""
-    ps_res = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", ps_script],
-        capture_output=True,
-        text=True,
-    )
-    if ps_res.returncode != 0:
-        errors.append(f"S-1-15-2-1 SID ACL verification failed: {ps_res.stdout.strip()} {ps_res.stderr.strip()}")
+    # 2. Verify exact SDDL trustee AC / S-1-15-2-1 on both targets via Get-Acl Sddl
+    def get_sddl(target: Path) -> str:
+        env = os.environ.copy()
+        env["MIE_ACL_TARGET"] = str(target)
+        out = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", "(Get-Acl -LiteralPath $env:MIE_ACL_TARGET).Sddl"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return out.stdout.strip()
+
+    def has_appcontainer_allow_ace(sddl: str, need_inherit: bool) -> bool:
+        for m in re.finditer(r"\(([^()]+)\)", sddl):
+            parts = m.group(1).split(";")
+            if len(parts) != 6:
+                continue
+            ace_type, ace_flags, rights, _, _, trustee = parts
+            if ace_type.upper() != "A":
+                continue
+            if trustee.upper() not in ("AC", "S-1-15-2-1"):
+                continue
+            if not rights:
+                continue
+            if need_inherit and not ("OI" in ace_flags.upper() and "CI" in ace_flags.upper()):
+                continue
+            return True
+        return False
+
+    dir_sddl = get_sddl(install_dir)
+    wkr_sddl = get_sddl(worker_exe)
+    print(f"install_dir SDDL: {dir_sddl}", flush=True)
+    print(f"mie-worker.exe SDDL: {wkr_sddl}", flush=True)
+
+    dir_sid_ok = has_appcontainer_allow_ace(dir_sddl, need_inherit=True)
+    wkr_sid_ok = has_appcontainer_allow_ace(wkr_sddl, need_inherit=False)
+    if not (dir_sid_ok and wkr_sid_ok):
+        errors.append(
+            f"SDDL S-1-15-2-1/AC check failed: dir_ok={dir_sid_ok}, wkr_ok={wkr_sid_ok}"
+        )
 
     # 3. Verify mie-worker.exe is installed and NO forbidden test/sandbox programs exist
     inst_ok, inst_detail = check_worker_and_no_forbidden_programs(install_dir, ".exe")
@@ -591,8 +601,8 @@ if (-not ($dirOk -and $wkrOk)) {{ exit 1 }}
         return False, "; ".join(errors)
     return (
         True,
-        f"S-1-15-2-1 (ALL APPLICATION PACKAGES) RX ACL verified on folder and mie-worker.exe "
-        f"({ps_res.stdout.strip()}); {inst_detail}",
+        f"S-1-15-2-1 (ALL APPLICATION PACKAGES / AC) RX ACL verified on folder and mie-worker.exe "
+        f"(dir_sid_ok={dir_sid_ok}, wkr_sid_ok={wkr_sid_ok}); {inst_detail}",
     )
 
 

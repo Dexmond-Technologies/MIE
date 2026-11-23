@@ -577,7 +577,12 @@ def main() -> int:
     if args.with_ui:
         cmake_cmd.append("-DWITH_UI=ON")
     if os.name != "nt":
-        cmake_cmd.append("-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,relro,-z,now")
+        cmake_cmd.extend(
+            [
+                f"-DCMAKE_PROJECT_INCLUDE={PACKAGING_DIR / 'gcc_compat.cmake'}",
+                "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,relro,-z,now",
+            ]
+        )
         if args.with_ui:
             cmake_cmd.extend(
                 [
