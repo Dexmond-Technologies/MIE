@@ -271,6 +271,12 @@ int main(int argc, char** argv) {
         if (!size_error) {
             record["size"] = size;
         }
+        if (log.is_open()) {
+            // Written and flushed BEFORE the file is opened or hashed: a test that changes the
+            // file during the scan waits for this line.
+            log << line_of(json{{"record", "start"}, {"path", relative}});
+            log.flush();
+        }
         const auto fault = faults.find(relative);
         host.set_test_fault(fault != faults.end() ? fault->second : std::string());
         const mie::worker::JobOutcome outcome = host.scan_file(path);

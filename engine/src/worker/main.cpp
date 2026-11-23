@@ -127,7 +127,7 @@ std::size_t write_all_to_standard_output(const char* data, std::size_t size) {
 
 #if defined(MIE_WORKER_TEST_HOOKS)
 // TEST BUILD ONLY: a switch that takes effect late ("answer-none", "answer-half",
-// "answer-extra", "answer-wrong-file", "move-position"); empty = none. Set from the job's test_fault.
+// "answer-extra", "answer-wrong-file", "move-position", "pause-before-read"); empty = none. Set from the job's test_fault.
 std::string g_answer_fault;
 #endif
 
@@ -253,7 +253,8 @@ int run(int argc, char** argv) {
 
     if (!job.test_fault.empty()) {
 #if defined(MIE_WORKER_TEST_HOOKS)
-        if (job.test_fault.rfind("answer-", 0) == 0 || job.test_fault == "move-position") {
+        if (job.test_fault.rfind("answer-", 0) == 0 || job.test_fault == "move-position" ||
+            job.test_fault == "pause-before-read") {
             g_answer_fault = job.test_fault;  // takes effect when the answer is written
         } else {
             test_fault(job.test_fault);
@@ -324,6 +325,17 @@ int run(int argc, char** argv) {
     }
 
 #if defined(MIE_WORKER_TEST_HOOKS)
+    if (g_answer_fault == "pause-before-read") {
+        // TEST BUILD ONLY: three seconds before the first read of the file, so a test can change
+        // or replace the file in that window. A busy wait on the steady clock (clock_gettime,
+        // normally answered without a system call); no sleep call, none is on the allow list.
+        const Clock::time_point until = Clock::now() + std::chrono::seconds(3);
+        volatile unsigned long long turns = 0;
+        while (Clock::now() < until) {
+            turns = turns + 1;
+        }
+        say("test: paused 3 seconds before the first read of the file");
+    }
     if (g_answer_fault == "move-position") {
         // TEST BUILD ONLY (reviewer's question SB-2): the handed-over handle shares its read
         // position with the parent's. Move that position with a plain, non-positional read,

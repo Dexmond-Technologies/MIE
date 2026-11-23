@@ -24,6 +24,7 @@ No malware and no EICAR file: set S and three small text files made here.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -325,7 +326,7 @@ def main():
         fault_case('answer-none', ['the answer is cut short (0 bytes received'], 60, 600)
         fault_case('answer-half', ['the answer is cut short ('], 60, 600)
         fault_case('answer-extra', ['bytes follow the answer'], 60, 600)
-        fault_case('answer-wrong-file', ['names another file than the one handed over'], 60, 600)
+        fault_case('answer-wrong-file', ['the file changed during the scan'], 60, 600)
 
         # Reviewer's question SB-2: the worker's handle shares its read position with the parent's.
         # A worker that MOVES that position (a plain read / SetFilePointerEx on the handed-over
@@ -343,6 +344,93 @@ def main():
               'B (SB-2): a worker that moves the shared read position of the handed-over file changes nothing: all three '
               'results as without it: %s; b.txt answered: %s; the worker says: %r' % (
                   got == base, job.get('answered'), said[-200:]))
+
+        # A file that CHANGES while it is scanned (reviewer's ruling: files stay shared for reading,
+        # writing and deleting; the protection is the parent's hash before the worker against the
+        # hash of what the worker read). The test-hooks worker pauses 3 seconds before its first
+        # read; the test waits for the runner's "start" line of b.txt (written before the parent
+        # opens and hashes the file), then 0.7 s, then acts.
+        def during_scan(label, action):
+            folder = os.path.join(tmp, 'changing-' + label)
+            os.mkdir(folder)
+            for name in ('a.txt', 'b.txt', 'c.txt'):
+                shutil.copyfile(os.path.join(small, name), os.path.join(folder, name))
+            table = os.path.join(tmp, 'changing-%s.jsonl' % label)
+            details = os.path.join(tmp, 'changing-%s.details.jsonl' % label)
+            change_log = os.path.join(tmp, 'changing-%s.log.jsonl' % label)
+            process = subprocess.Popen([RUNNER, '--worker', WORKER_HOOKS, '--corpus', folder, '--out', table,
+                                        '--details', details, '--log', change_log, '--wall', '120',
+                                        '--test-fault', 'b.txt=pause-before-read'] + common,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            acted = 'the start line of b.txt never appeared'
+            deadline = time.time() + 300
+            while time.time() < deadline and process.poll() is None:
+                try:
+                    started = any(r.get('record') == 'start' and r.get('path') == 'b.txt' for r in records(change_log))
+                except ValueError:
+                    started = False  # a line half written
+                if started:
+                    time.sleep(0.7)
+                    try:
+                        acted = action(os.path.join(folder, 'b.txt'))
+                    except OSError as problem:
+                        acted = 'REFUSED BY THE SYSTEM: %r' % (problem,)
+                    break
+                time.sleep(0.05)
+            try:
+                process.communicate(timeout=600)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            return (process.returncode, by_path(records(table)), by_path(records(details)),
+                    by_path([r for r in records(change_log) if r.get('record') == 'job']), acted)
+
+        original_hash = base.get('b.txt', {}).get('sha256')
+
+        def overwrite_in_place(path):
+            size = os.path.getsize(path)
+            with open(path, 'r+b') as f:
+                f.seek(size // 2)
+                f.write(b'CHANGED-DURING-THE-SCAN'[:max(1, size - size // 2)])
+                f.flush()
+                os.fsync(f.fileno())
+            return 'overwrote bytes in the middle in place, size still %d: %s' % (size, os.path.getsize(path) == size)
+
+        code, got, reasons, jobs_now, acted = during_scan('overwrite', overwrite_in_place)
+        b, reason = got.get('b.txt', {}), reasons.get('b.txt', {})
+        check(code == 0 and not acted.startswith(('REFUSED', 'the start line')) and b.get('verdict') == NOT_FULLY and
+              b.get('score') == 0 and b.get('categories') == [] and reason.get('state') == 'not_fully_scanned' and
+              reason.get('reason', '').startswith('the file changed during the scan') and
+              got.get('a.txt') == base.get('a.txt') and got.get('c.txt') == base.get('c.txt'),
+              'B: a file CHANGED IN PLACE during the scan (%s): b.txt is %r, state %r, reason %r; a.txt and c.txt as '
+              'before: %s; parent exit %d' % (acted, b.get('verdict'), reason.get('state'), reason.get('reason'),
+                                               got.get('a.txt') == base.get('a.txt') and got.get('c.txt') == base.get('c.txt'),
+                                               code))
+
+        def replace_by_rename(path):
+            other = path + '.new'
+            with open(other, 'w', encoding='ascii', newline='\n') as f:
+                f.write('quite another file with the same name\n' * 30)
+            try:
+                os.replace(other, path)
+                return 'replaced by rename over the open file'
+            except OSError as first:
+                os.rename(path, path + '.old')   # move the open original away, then put the new one in
+                os.rename(other, path)
+                return 'renamed the open original away and the new file in (rename over it was refused: %r)' % (first,)
+
+        # Expectation: the worker reads the ORIGINAL through its handle, so both hashes agree and
+        # the result is the original file's (its hash, its verdict). What is at the path afterwards
+        # is another file, which this scan does not speak about.
+        code, got, reasons, jobs_now, acted = during_scan('rename', replace_by_rename)
+        b = got.get('b.txt', {})
+        check(code == 0 and not acted.startswith(('REFUSED', 'the start line')) and
+              jobs_now.get('b.txt', {}).get('answered') is True and b.get('sha256') == original_hash and
+              b.get('verdict') == base.get('b.txt', {}).get('verdict') and b.get('score') == base.get('b.txt', {}).get('score') and
+              got.get('a.txt') == base.get('a.txt') and got.get('c.txt') == base.get('c.txt'),
+              'B: a file REPLACED BY RENAME during the scan (%s): the worker read the ORIGINAL through its handle: '
+              'result hash %s, the original\'s %s, verdict %r; neighbours as before; parent exit %d' % (
+                  acted, b.get('sha256'), original_hash, b.get('verdict'), code))
 
         # ---------------------------------------------------------------- part C
         table = os.path.join(tmp, 'shipped-fault.jsonl')

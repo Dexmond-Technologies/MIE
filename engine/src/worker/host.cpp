@@ -376,9 +376,19 @@ JobOutcome Host::scan_open(io::File& file, const std::string& display_name) {
     if (result.engine_version != kEngineVersion) {
         return failed("unusable answer: another engine version");
     }
+    // THE RULE against a file that changes while it is scanned (the file stays shared for
+    // reading, writing and deleting): the parent's hash, taken BEFORE the worker started, and
+    // the hash of the bytes the WORKER read must be equal, and so must the sizes. If not, the
+    // file is "not fully scanned: the file changed during the scan", never clean. (A worker
+    // whose answer names other bytes for any other reason looks the same from here and gets
+    // the same result.)
     if (options_.verify_identity && result.state != ScanState::NotScanned &&
         (result.hashes.sha256 != base.hashes.sha256 || result.size != base.size)) {
-        return failed("unusable answer: it names another file than the one handed over");
+        JobOutcome outcome = failed("its answer is about other bytes than the parent hashed before it started");
+        outcome.result.reason =
+            "the file changed during the scan (the bytes the worker read do not have the hash or size the "
+            "parent took before the worker started)";
+        return outcome;
     }
     const std::string worker_confinement = text_field(body, "confinement");
     if (options_.run.confine && !options_.run.allow_weaker && worker_confinement.rfind("WEAKER", 0) == 0) {
