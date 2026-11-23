@@ -249,7 +249,8 @@ def page_hash_entries(pe, pairs):
 
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
-                      wrong_stamp_digest=False, page_hashes=None, nested=None, leaf_last=False):
+                      wrong_stamp_digest=False, page_hashes=None, nested=None, leaf_last=False,
+                      stamp_before=(), stamp_after=()):
     """The PKCS#7 SignedData (ContentInfo) of an Authenticode signature over `pe`."""
     spc = spc_indirect(pe, digest, page_hashes)
     spc_contents = spc[len(spc) - len(seq_contents(spc)):]
@@ -269,7 +270,7 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
                          attribute(OID_MESSAGE_DIGEST, der(0x04, stamped))]
         _, counter_fields = signer_info(tsa, 'sha256', counter_attrs)
         unsigned.append(attribute(OID_COUNTER_SIGNATURE, seq(*counter_fields)))
-        certs.append(tsa.der)
+        certs.extend(c.der for c in (*stamp_before, tsa, *stamp_after))
     elif timestamp == 'rfc3161':
         when = stamp_time.strftime('%Y%m%d%H%M%SZ').encode()
         tst = seq(der_int(1), oid('1.2.3.4'), seq(alg_id('sha256'), der(0x04, stamped)), der_int(7),
@@ -279,7 +280,7 @@ def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, ts
         _, token_fields = signer_info(tsa, 'sha256', token_attrs)
         token = seq(oid(OID_SIGNED_DATA), der(0xA0, seq(
             der_int(3), der(0x31, alg_id('sha256')), seq(oid(OID_TST_INFO), der(0xA0, der(0x04, tst))),
-            der(0xA0, tsa.der), der(0x31, seq(*token_fields)))))
+            der(0xA0, b''.join(c.der for c in (*stamp_before, tsa, *stamp_after))), der(0x31, seq(*token_fields)))))
         unsigned.append(attribute(OID_MS_TIMESTAMP, token))
     if unsigned:
         fields.append(der(0xA1, b''.join(unsigned)))
@@ -540,6 +541,16 @@ def build_cases():
                                 serial=twin.cert.serial_number)
     add('same_serial_allowed_name_first', signed(pe, real_signer, [twin, inter], leaf_last=True))
     add('same_serial_real_signer_first', signed(pe, real_signer, [twin, inter]))
+    # the same for the timestamp (r-01, B-3632 follow-up): `tsa` is a proper time-stamping certificate;
+    # `real_counter` has the same issuer name and serial number, another key and NO time-stamping usage
+    # (code signing), and makes the countersignature. The leaf is expired, so only an accepted timestamp
+    # could make the file valid. No asserted reference status; the shipped setting is asserted in main().
+    real_counter = make_identity('Not A TSA', issuer=root, eku=code, serial=tsa.cert.serial_number)
+    for kind in ('rfc3161', 'authenticode'):
+        add(f'stamp_same_serial_proper_first_{kind}', signed(
+            pe, expired, [inter], timestamp=kind, tsa=real_counter, stamp_time=mid, stamp_before=[tsa]))
+        add(f'stamp_same_serial_real_first_{kind}', signed(
+            pe, expired, [inter], timestamp=kind, tsa=real_counter, stamp_time=mid, stamp_after=[tsa]))
 
     # not signed at all
     add('unsigned', pe, 'unsigned', False)
@@ -773,7 +784,9 @@ def main():
         # check on): the allowed publisher's name must never get the cap from another key's signature.
         twins = os.path.join(tmp, 'twins')
         os.mkdir(twins)
-        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256'):
+        stamp_twins = [f'stamp_same_serial_{order}_first_{kind}' for order in ('proper', 'real')
+                       for kind in ('rfc3161', 'authenticode')]
+        for name in ('same_serial_allowed_name_first', 'same_serial_real_signer_first', 'valid_sha256', *stamp_twins):
             with open(os.path.join(twins, name + '.bin'), 'wb') as f:
                 f.write(dict(inputs)[name])
         done = subprocess.run([PROBE, roots_path, pinned, policy_path, twins, 'shipped'], capture_output=True, timeout=600)
@@ -794,6 +807,15 @@ def main():
                   f"publisher {r.get('publisher')!r} cap {r_cap}")
             if not safe:
                 hard.append(f'{name}: the shipped setting names or caps the allowed publisher: {c!r}')
+        for name in stamp_twins:   # the expired leaf must stay not valid: the timestamp's time is not accepted
+            c = shipped.get(name)
+            r = reference_result(ref, dict(inputs)[name], roots_path, pinned, loaded_policy)
+            safe = c is not None and c['status'] != 'valid'
+            print(f"{'PASS' if safe else 'FAIL'}  shipped setting, {name}: C++ {None if c is None else c['status']} "
+                  f"({None if c is None else c['detail'][:100]!r}); the REFERENCE gives {r['status']} "
+                  f"timestamp {r.get('timestamp')!r} ({r['detail'][:100]!r})")
+            if not safe:
+                hard.append(f'{name}: the shipped setting accepts the timestamp of a certificate that did not make it: {c!r}')
         c = shipped.get('valid_sha256') or {}
         print(f"NOTE  shipped setting, valid_sha256: status {c.get('status')} allowed {c.get('publisher_allowed')} "
               f"second check {c.get('second_check')} ({c.get('second_check_reason')!r})")

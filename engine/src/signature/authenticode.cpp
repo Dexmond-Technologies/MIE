@@ -847,6 +847,12 @@ X509* verify_signer(const Signer& signer, const std::vector<X509*>& pool, const 
                std::string("No valid certificate chain found to a trust anchor from ") + signer_class};
 }
 
+// Which entry of `pool` the certificate is, or -1 (it came from the pinned store).
+std::ptrdiff_t index_in(const std::vector<X509*>& pool, const X509* certificate) {
+    const auto found = std::find(pool.begin(), pool.end(), certificate);
+    return found == pool.end() ? -1 : found - pool.begin();
+}
+
 const Tlv& single_value(const std::vector<Attr>& attrs, const std::array<std::uint8_t, 9>& oid, const char* what) {
     const Attr* attr = find_attr(attrs, oid);
     if (attr == nullptr || attr->values.size() != 1) throw Fail{"ValueError", std::string("missing attribute: ") + what};
@@ -913,10 +919,12 @@ Countersignature read_countersignature(const Signer& primary) {
 }
 
 // signify SignerInfo._verify_countersigner in "strict" mode: returns the countersignature
-// time; any failure is AuthenticodeCounterSignerError.
+// time; any failure is AuthenticodeCounterSignerError. `verified_index`: which certificate
+// verified the countersignature and chained, as an index into the set it was searched in
+// (the token's certificates for RFC 3161, the signature's own otherwise), or -1.
 std::int64_t signify_countersignature(const Countersignature& counter, const Signer& primary,
                                       const std::vector<X509*>& primary_certs, const Roots& roots,
-                                      std::vector<X509Ptr>& token_certs) {
+                                      std::vector<X509Ptr>& token_certs, std::ptrdiff_t& verified_index) {
     try {
         if (counter.rfc3161) {
             if (!same_bytes(digest_of(counter.imprint_alg.md, primary.signature), counter.imprint)) {
@@ -932,8 +940,10 @@ std::int64_t signify_countersignature(const Countersignature& counter, const Sig
             }
             token_certs = load_certificates(counter.token.certs);
             const std::int64_t when = counter.time;
-            verify_signer(counter.signer, raw(token_certs), roots, [when](X509*) { return when; }, kEkuTimeStamping,
-                          "time stamping", "RFC3161SignerInfo");
+            const std::vector<X509*> token_pool = raw(token_certs);
+            verified_index = index_in(token_pool, verify_signer(counter.signer, token_pool, roots,
+                                                                 [when](X509*) { return when; }, kEkuTimeStamping,
+                                                                 "time stamping", "RFC3161SignerInfo"));
         } else {
             const DigestAlg algorithm = digest_algorithm(counter.signer.digest_alg, "SignerInfo.digestAlgorithm");
             if (!same_bytes(digest_of(algorithm.md, primary.signature), message_digest_of(counter.signer))) {
@@ -941,8 +951,9 @@ std::int64_t signify_countersignature(const Countersignature& counter, const Sig
                            "The expected hash of the encryptedDigest does not match countersigner's SignerInfo"};
             }
             const std::int64_t when = counter.time;
-            verify_signer(counter.signer, primary_certs, roots, [when](X509*) { return when; }, kEkuTimeStamping,
-                          "time stamping", "AuthenticodeCounterSignerInfo");
+            verified_index = index_in(primary_certs, verify_signer(counter.signer, primary_certs, roots,
+                                                                    [when](X509*) { return when; }, kEkuTimeStamping,
+                                                                    "time stamping", "AuthenticodeCounterSignerInfo"));
         }
     } catch (const Fail& failure) {
         throw Fail{"AuthenticodeCounterSignerError",
@@ -1166,9 +1177,15 @@ void parse_nested(const Signer& signer, int depth, std::size_t& total) {
 }
 
 // signify AuthenticodeFile.verify(multi_verify_mode='first', countersignature_mode='strict')
-// on one signature. Throws the failure. Returns which of the signature's own certificates
-// (index into signed_data.certs) verified it, or -1 if that certificate came from the store.
-std::ptrdiff_t signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots, std::int64_t now) {
+// on one signature. Throws the failure. Returns which certificates did the verifying
+// (finding SG-1): `signer` is an index into signed_data.certs; `countersigner` an index into
+// the timestamp token's certificates (RFC 3161) or into signed_data.certs (Authenticode
+// countersignature); -1 where the certificate came from the store or there is none.
+struct VerifiedBy {
+    std::ptrdiff_t signer = -1;
+    std::ptrdiff_t countersigner = -1;
+};
+VerifiedBy signify_verify(const SignedData& signed_data, Bytes data, const Layout& layout, const Roots& roots, std::int64_t now) {
     std::size_t nested_total = 0;
     parse_nested(signed_data.signer, 0, nested_total);
 
@@ -1206,8 +1223,10 @@ std::ptrdiff_t signify_verify(const SignedData& signed_data, Bytes data, const L
     const Countersignature counter = read_countersignature(signed_data.signer);
     std::optional<std::int64_t> signing_time;
     std::vector<X509Ptr> token_certificates;
+    VerifiedBy verified_by;
     if (counter.present) {
-        signing_time = signify_countersignature(counter, signed_data.signer, pool, roots, token_certificates);
+        signing_time = signify_countersignature(counter, signed_data.signer, pool, roots, token_certificates,
+                                                verified_by.countersigner);
     }
 
     // AuthenticodeSignerInfo._verify_issuer: a signer certificate with the "lifetime signing"
@@ -1218,10 +1237,9 @@ std::ptrdiff_t signify_verify(const SignedData& signed_data, Bytes data, const L
         if (!signing_time || has_usage(usages, kEkuLifetimeSigning)) return now;
         return *signing_time;
     };
-    X509* verified =
-        verify_signer(signed_data.signer, pool, roots, time_for, kEkuCodeSigning, "code signing", "AuthenticodeSignerInfo");
-    const auto found = std::find(pool.begin(), pool.end(), verified);
-    return found == pool.end() ? -1 : found - pool.begin();
+    verified_by.signer = index_in(pool, verify_signer(signed_data.signer, pool, roots, time_for, kEkuCodeSigning,
+                                                      "code signing", "AuthenticodeSignerInfo"));
+    return verified_by;
 }
 
 // ---- the reference's own checks after signify (signature.py) ----------------------------
@@ -1229,8 +1247,15 @@ std::ptrdiff_t signify_verify(const SignedData& signed_data, Bytes data, const L
 // _signing_time / _countersigner_trusted: the countersignature time, used only if the
 // countersigner chains to the pinned store with the time-stamping usage at that time and
 // without MD2/MD5 in the path.
+// WHICH certificate is "the countersigner" here: the reference looks it up again by issuer
+// name and serial number and takes the first match (signature.py:333, _find_cert 297-301),
+// which need not be the one whose key verified the countersignature. D-19: by default
+// (shipped) the certificate that verified it (`verified_index`, from signify_verify) is
+// the one whose chain and usage are checked; the reference's lookup only with the parity
+// switch `second_lookup`. The timestamp decides whether an expired signer still counts.
 std::optional<std::int64_t> trusted_signing_time(const SignedData& primary, const std::vector<X509*>& primary_certs,
-                                                 const Roots& roots) {
+                                                 const Roots& roots, bool second_lookup,
+                                                 std::ptrdiff_t verified_index) {
     const Countersignature counter = read_countersignature(primary.signer);
     if (!counter.present) return std::nullopt;
     std::vector<X509Ptr> token_certificates;
@@ -1239,10 +1264,18 @@ std::optional<std::int64_t> trusted_signing_time(const SignedData& primary, cons
         token_certificates = load_certificates(counter.token.certs);
         pool = raw(token_certificates);
     }
+    // `verified_index` counts in the set the countersigner was searched in; that set is the
+    // front of `pool` in both cases (the token's certificates, or the signature's own).
+    const std::size_t searched = counter.rfc3161 ? token_certificates.size() : primary_certs.size();
     pool.insert(pool.end(), primary_certs.begin(), primary_certs.end());
-    const std::vector<X509*> found = find_certificates(pool, counter.signer);
-    if (found.empty()) return std::nullopt;
-    X509* certificate = found.front();
+    X509* certificate = nullptr;
+    if (second_lookup) {
+        const std::vector<X509*> found = find_certificates(pool, counter.signer);
+        if (!found.empty()) certificate = found.front();
+    } else if (verified_index >= 0 && static_cast<std::size_t>(verified_index) < searched) {
+        certificate = pool[static_cast<std::size_t>(verified_index)];
+    }
+    if (certificate == nullptr) return std::nullopt;
     std::vector<X509*> others;
     for (X509* other : pool) {
         if (other != certificate) others.push_back(other);
@@ -1330,9 +1363,9 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     const SignedData& primary = signatures.front();
 
     // VERIFY: the first entry only (signify).
-    std::ptrdiff_t verified_index = -1;
+    VerifiedBy verified_by;
     try {
-        verified_index = signify_verify(primary, data, layout, roots, now);
+        verified_by = signify_verify(primary, data, layout, roots, now);
     } catch (const Fail& failure) {
         Result out = make_result("invalid", "signify: " + failure.cls + ": " + failure.text);
         out.error_class = failure.cls;
@@ -1352,11 +1385,12 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
     if (options.signer_by_second_lookup) {
         const std::vector<X509*> leaves = find_certificates(pool, primary.signer);
         if (!leaves.empty()) leaf = leaves.front();
-    } else if (verified_index >= 0 && static_cast<std::size_t>(verified_index) < pool.size()) {
-        leaf = pool[static_cast<std::size_t>(verified_index)];
+    } else if (verified_by.signer >= 0 && static_cast<std::size_t>(verified_by.signer) < pool.size()) {
+        leaf = pool[static_cast<std::size_t>(verified_by.signer)];
     }
     if (leaf == nullptr) throw Fail{"ValueError", "signer certificate not in the signature certificate set"};
-    const std::optional<std::int64_t> signing_time = trusted_signing_time(primary, pool, roots);
+    const std::optional<std::int64_t> signing_time =
+        trusted_signing_time(primary, pool, roots, options.signer_by_second_lookup, verified_by.countersigner);
 
     // _leaf_checks
     bool eku_present = false;
