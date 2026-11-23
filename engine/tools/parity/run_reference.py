@@ -11,7 +11,9 @@ Output format (also the format the C++ engine will write for the comparison):
   then one line per file, sorted by relative path:
           {"record":"file","path":<relative path with />,"sha256":...,"size":...,
            "score":<int or null>,"verdict":<text or null>,"categories":[sorted finding categories],
-           "error":<text or null>}
+           "error":<text or null>,"error_class":<class or null>}
+  error_class is what the two engines are compared on (the text of an operating-system error
+  differs between systems): not_found, access_denied, unreadable, not_regular.
 
 Rules of the harness:
   - The engine works on a COPY of rules/ and data/reputation.json in a temp folder, so a
@@ -28,6 +30,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -44,6 +47,22 @@ def sha256_of(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def error_class(text):
+    """Reduces a reference error text to its class (see ERROR_RESULT_MAPPING, sent to r-01)."""
+    if text is None:
+        return None
+    if text == 'not a regular file':
+        return 'not_regular'
+    if text == 'File not found':
+        return 'not_found'
+    lowered = text.lower()
+    if re.search(r'errno 13\b|winerror 5\b', lowered) or 'permission denied' in lowered:
+        return 'access_denied'
+    if re.search(r'errno 2\b|winerror [23]\b', lowered) or 'no such file' in lowered:
+        return 'not_found'
+    return 'unreadable'
 
 
 def git_commit():
@@ -112,10 +131,12 @@ def scan_corpus(corpus, out_path, use_reputation):
             for path in files:
                 rel = os.path.relpath(path, corpus).replace(os.sep, '/')
                 record = {'record': 'file', 'path': rel, 'sha256': None, 'size': None,
-                          'score': None, 'verdict': None, 'categories': [], 'error': None}
+                          'score': None, 'verdict': None, 'categories': [], 'error': None,
+                          'error_class': None}
                 st = os.lstat(path)
                 if not stat.S_ISREG(st.st_mode):
                     record['error'] = 'not a regular file'
+                    record['error_class'] = error_class(record['error'])
                     out.write(json.dumps(record, sort_keys=True) + '\n')
                     continue
                 record['sha256'] = sha256_of(path)
@@ -123,6 +144,7 @@ def scan_corpus(corpus, out_path, use_reputation):
                 result = engine.scan_file(path)
                 if 'error' in result:
                     record['error'] = str(result['error'])
+                    record['error_class'] = error_class(record['error'])
                 else:
                     record['score'] = result.get('score')
                     record['verdict'] = result.get('verdict')

@@ -1,5 +1,5 @@
 {
-  "note": "Third-party libraries of the engine. Versions follow from the vcpkg commit pinned in .github/workflows/engine.yml. engine/tools/vuln_check.py reads each version from that vcpkg checkout, resolves the upstream release tag to a commit, and asks the OSV database about that commit on every push. 'expected_version' and 'expected_commit' are filled from the first CI run and enforced from then on; null means not yet recorded.",
+  "note": "Third-party libraries of the engine. Versions follow from the vcpkg commit pinned in .github/workflows/engine.yml. engine/tools/vuln_check.py reads each version from that vcpkg checkout, resolves the upstream release tag to a commit, and asks the OSV database about that commit on every push. 'expected_version' and 'expected_commit' were recorded from CI run 45086860497 (2026-11-23) and are enforced: a different value fails the check.",
   "vcpkg_commit": "9eec002df1cd109f8f104cd966a763daf9751489",
   "libraries": {
     "openssl": {
@@ -8,8 +8,8 @@
       "shipped": true,
       "touches_hostile_bytes": true,
       "used_for": "MD5, SHA-1, SHA-256 of file bytes",
-      "expected_version": null,
-      "expected_commit": null
+      "expected_version": "3.6.5",
+      "expected_commit": "c8bd5a57108599ac650bbae77fcabe3109dab2e8"
     },
     "nlohmann-json": {
       "repository": "https://github.com/nlohmann/json",
@@ -17,8 +17,8 @@
       "shipped": true,
       "touches_hostile_bytes": false,
       "used_for": "JSON of results and of channel messages (messages come from the same user, not from scanned files)",
-      "expected_version": null,
-      "expected_commit": null
+      "expected_version": "3.12.0",
+      "expected_commit": "55f93686c01528224f448c19128836e7df245f72"
     },
     "catch2": {
       "repository": "https://github.com/catchorg/Catch2",
@@ -26,8 +26,8 @@
       "shipped": false,
       "touches_hostile_bytes": false,
       "used_for": "unit tests only",
-      "expected_version": null,
-      "expected_commit": null
+      "expected_version": "3.16.0",
+      "expected_commit": "317ac1ed4c0bb6e6b91eafc817e05c488feffcb3"
     }
   },
   "accepted_vulnerabilities": []

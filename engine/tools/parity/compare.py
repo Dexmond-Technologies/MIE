@@ -6,7 +6,8 @@ run_reference.py (one from the Python reference, one from the C++ engine).
     compare.py --identical A.jsonl B.jsonl      (two runs of the same engine: byte-equal after sorting)
 
 Compared per file, all four (r-01's pass line for A-1, board B-3484): SHA-256, score, verdict,
-sorted list of finding categories; and the error text.
+sorted list of finding categories; and the error CLASS (not the error text, which is the
+operating system's wording and differs between systems).
 
 Outcome per file:
   identical     all fields equal
@@ -18,7 +19,7 @@ PASS only if: 0 unexplained, 0 verdict differences of any cause, explained <= N 
 and the rule-file hashes in the two headers are equal.
 Exit code: 0 PASS, 1 FAIL, 2 usage or unreadable input.
 
---explained file: {"<relative path>": {"library": "...", "field": "score|categories|error", "reason": "..."}}
+--explained file: {"<relative path>": {"library": "...", "field": "score|categories|error_class", "reason": "..."}}
 The cap of 5 is across all sets together; run the tool once per set and add the counts, or pass
 the remaining allowance with --max-explained.
 """
@@ -26,7 +27,7 @@ import argparse
 import json
 import sys
 
-FIELDS = ('sha256', 'score', 'verdict', 'categories', 'error')
+FIELDS = ('sha256', 'score', 'verdict', 'categories', 'error_class')
 
 
 def load(path):

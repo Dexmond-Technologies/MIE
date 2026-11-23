@@ -23,9 +23,9 @@ def header(rules=None):
     return {'record': 'header', 'producer': 'test', 'rules': RULES if rules is None else rules}
 
 
-def rec(path, score=0, verdict='CLEAN', categories=(), sha='0' * 64, error=None):
+def rec(path, score=0, verdict='CLEAN', categories=(), sha='0' * 64, error=None, error_class=None):
     return {'record': 'file', 'path': path, 'sha256': sha, 'size': 1, 'score': score,
-            'verdict': verdict, 'categories': list(categories), 'error': error}
+            'verdict': verdict, 'categories': list(categories), 'error': error, 'error_class': error_class}
 
 
 def side(*records, rules=None):
@@ -102,10 +102,31 @@ def test_sha_difference_cannot_be_explained():
     assert not compare.compare(a, b, note, 5)['pass']
 
 
-def test_error_text_is_compared():
-    a = side(rec('a.bin', None, None, [], error='File not found'))
-    b = side(rec('a.bin', None, None, [], error=None))
+def test_error_class_is_compared_and_error_text_is_not():
+    a = side(rec('a.bin', None, None, [], error='File not found', error_class='not_found'))
+    b = side(rec('a.bin', None, None, [], error=None, error_class=None))
     assert not compare.compare(a, b, {}, 5)['pass']
+    # same class, different wording of the operating system: equal
+    c = side(rec('a.bin', None, None, [], error='[Errno 13] Permission denied', error_class='access_denied'))
+    d = side(rec('a.bin', None, None, [], error='NOT SCANNED: access_denied', error_class='access_denied'))
+    assert compare.compare(c, d, {}, 5)['pass']
+    # different class: a difference
+    e = side(rec('a.bin', None, None, [], error='x', error_class='unreadable'))
+    assert not compare.compare(c, e, {}, 5)['pass']
+
+
+def test_error_class_of_reference_texts():
+    sys.path.insert(0, HERE)
+    import run_reference
+    assert run_reference.error_class(None) is None
+    assert run_reference.error_class('File not found') == 'not_found'
+    assert run_reference.error_class('not a regular file') == 'not_regular'
+    assert run_reference.error_class("[Errno 13] Permission denied: '/x'") == 'access_denied'
+    assert run_reference.error_class("[Errno 2] No such file or directory: '/x'") == 'not_found'
+    assert run_reference.error_class('[Errno 5] Input/output error') == 'unreadable'
+    assert run_reference.error_class("[Errno 21] Is a directory: '/x'") == 'unreadable'
+    assert run_reference.error_class('[WinError 5] Access is denied') == 'access_denied'
+    assert run_reference.error_class('[WinError 32] The process cannot access the file') == 'unreadable'
 
 
 def test_different_rule_files_fail():
@@ -168,6 +189,7 @@ def test_reference_runner_on_harmless_files(tmp_path):
     assert sorted(files) == ['plain.txt', 'sub/numbers.csv', 'zeros.bin']
     for record in files.values():
         assert record['error'] is None
+        assert record['error_class'] is None
         assert len(record['sha256']) == 64
         assert isinstance(record['score'], int)
         assert record['verdict'] in ('CLEAN', 'SUSPICIOUS (LOW)', 'SUSPICIOUS (MEDIUM)', 'MALICIOUS')

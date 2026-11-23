@@ -13,10 +13,10 @@ option(MIE_FUZZ_ONLY "Build only the fuzz targets (Clang, libFuzzer)" OFF)
 set(MIE_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "Repository root (holds the Python reference)")
 
 if(MSVC)
-  add_compile_options(/W4 /permissive- /utf-8)
+  add_compile_options(/W4 /WX /permissive- /utf-8)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS)
 else()
-  add_compile_options(-Wall -Wextra -Wpedantic)
+  add_compile_options(-Wall -Wextra -Wpedantic -Werror)
 endif()
 
 if(MIE_SANITIZE AND NOT MSVC)
