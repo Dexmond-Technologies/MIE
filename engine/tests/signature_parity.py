@@ -207,7 +207,8 @@ def spc_indirect(pe, digest, page_hashes=None):
     if page_hashes is None:
         link = der(0xA2, der(0x80, b''))                                       # file: empty unicode string
     else:
-        serialized = der(0x31, seq(oid(OID_PAGE_HASH_V2), der(0x31, der(0x04, page_hashes))))
+        tables = page_hashes if isinstance(page_hashes, list) else [page_hashes]
+        serialized = der(0x31, seq(oid(OID_PAGE_HASH_V2), der(0x31, b''.join(der(0x04, x) for x in tables))))
         link = der(0xA1, der(0x04, PAGE_HASH_CLASS_ID) + der(0x04, serialized))  # moniker
     image_data = seq(der(0x03, b'\x00'), der(0xA0, link))
     return seq(seq(oid(OID_SPC_PE_IMAGE), image_data),
@@ -222,6 +223,19 @@ def page_hash_table(pe, wrong=False):
             digest = bytes(32)
         table += struct.pack('<I', start) + digest
     return table + struct.pack('<I', 0x400) + bytes(32)
+
+
+def page_hash_entries(pe, pairs):
+    """A page-hash table for the given (start, end) pairs, each with the digest signify
+    expects for it, closed by the usual last entry."""
+    table = b''
+    for start, end in pairs:
+        if start < end:
+            digest = image_digest(pe, 'sha256', start, end, 0x1000)
+        else:
+            digest = hashlib.sha256(b'').digest()
+        table += struct.pack('<I', start) + digest
+    return table + struct.pack('<I', pairs[-1][1]) + bytes(32)
 
 
 def authenticode_blob(pe, leaf, extra_certs, digest='sha256', timestamp=None, tsa=None, stamp_time=None,
@@ -412,6 +426,14 @@ def build_cases():
     add('page_hashes_right', signed(pe, leaf, [inter], page_hashes=page_hash_table(pe)))
     add('page_hashes_wrong', signed(pe, leaf, [inter], page_hashes=page_hash_table(pe, wrong=True)))
     add('page_hashes_cut', signed(pe, leaf, [inter], page_hashes=page_hash_table(pe)[:-3]))
+    # signify accepts more than one table and an offset that does not grow (indirect_data.py:157-170,
+    # 194-217); the engine keeps that and bounds the total work instead. No asserted status.
+    add('page_hashes_two_tables',
+        signed(pe, leaf, [inter], page_hashes=[page_hash_table(pe), page_hash_table(pe)]))
+    add('page_hashes_offset_repeated',
+        signed(pe, leaf, [inter], page_hashes=page_hash_entries(pe, [(0, 0x200), (0x200, 0x200), (0x200, 0x400)])))
+    add('page_hashes_offset_decreasing',
+        signed(pe, leaf, [inter], page_hashes=struct.pack('<I', 0x200) + bytes(32) + struct.pack('<I', 0) + bytes(32)))
 
     # not signed at all
     add('unsigned', pe, 'unsigned', False)

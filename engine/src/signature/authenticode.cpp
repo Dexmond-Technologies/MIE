@@ -58,6 +58,24 @@ constexpr int kMaxNestedDepth = 4;              // nested signatures inside nest
 constexpr std::size_t kMaxNestedTotal = 16;
 constexpr std::size_t kMaxPageHashEntries = 1u << 16;
 constexpr int kMaxChainDepth = 10;
+// Page hashes: the total number of bytes hashed for ONE signature's page hashes (file bytes
+// plus zero padding) may not pass kPageHashBudgetFactor times the file size plus
+// kPageHashBudgetSlack. A well-formed table covers the file once per table; a signature
+// carries at most two (SHA-1 and SHA-256), so the honest total is about two file sizes.
+// Four leaves a factor of two; the slack covers the padding of small files, where one
+// page of padding per entry outweighs the file itself. signify has no such limit: it
+// accepts any number of tables and repeated or overlapping ranges
+// (indirect_data.py:157-170 and 194-217); the reference only has its 2-second timeout.
+constexpr std::uint64_t kPageHashBudgetFactor = 4;
+constexpr std::uint64_t kPageHashBudgetSlack = 1024 * 1024;
+// D-13 on (every entry verified): at most this many certificate-table entries. Each
+// verified entry costs one image digest and one page-hash budget.
+constexpr std::size_t kMaxEntriesWhenAllVerified = 4;
+
+// The page-hash budget ran out. Not a Fail: it must pass through the handlers that turn a
+// verification failure into "invalid" and end as "unavailable", which is what the
+// reference answers when its timeout fires (signature.py:539-543).
+struct OverBudget {};
 
 // ---- OpenSSL owners --------------------------------------------------------------------
 struct X509Free { void operator()(X509* p) const { X509_free(p); } };
@@ -947,8 +965,10 @@ Layout signify_layout(Bytes data) {
 // Fingerprinter with one finger: the bytes of the file outside the checksum, the
 // certificate-table directory entry and the certificate table, restricted to
 // [start, end), then padded with zeros to a multiple of `block` (0 = no padding).
+// `budget` (may be null): bytes this call may still hash; what it hashes is taken off, and
+// OverBudget is thrown BEFORE hashing anything the budget does not cover.
 std::vector<std::uint8_t> fingerprint(Bytes data, const Layout& layout, const EVP_MD* md, std::uint64_t start,
-                                      std::uint64_t end, std::uint64_t block) {
+                                      std::uint64_t end, std::uint64_t block, std::uint64_t* budget = nullptr) {
     const std::uint64_t size = data.size();
     const std::array<Range, 4> ranges{Range{0, layout.checksum.start}, Range{layout.checksum.end, layout.directory_entry.start},
                                       Range{layout.directory_entry.end, layout.table.start}, Range{layout.table.end, size}};
@@ -958,15 +978,23 @@ std::vector<std::uint8_t> fingerprint(Bytes data, const Layout& layout, const EV
         adjusted.push_back({std::max(start, range.start), std::min(end, range.end)});
     }
     if (adjusted.empty()) throw Fail{"IndexError", "list index out of range"};
-    Hasher hasher(md);
     for (const Range& range : adjusted) {
         if (range.start > range.end || range.end > size) throw Fail{"RuntimeError", "Short read on file."};
+    }
+    const std::uint64_t covered_span = adjusted.back().end - adjusted.front().start;
+    if (budget != nullptr) {
+        std::uint64_t cost = (block != 0 && covered_span % block != 0) ? block - covered_span % block : 0;
+        for (const Range& range : adjusted) cost += range.end - range.start;
+        if (cost > *budget) throw OverBudget{};
+        *budget -= cost;
+    }
+    Hasher hasher(md);
+    for (const Range& range : adjusted) {
         hasher.update(data.subspan(static_cast<std::size_t>(range.start), static_cast<std::size_t>(range.end - range.start)));
     }
     if (block != 0) {
-        const std::uint64_t covered = adjusted.back().end - adjusted.front().start;
-        if (covered % block != 0) {
-            const std::vector<std::uint8_t> zeros(static_cast<std::size_t>(block - covered % block), 0);
+        if (covered_span % block != 0) {
+            const std::vector<std::uint8_t> zeros(static_cast<std::size_t>(block - covered_span % block), 0);
             hasher.update(zeros);
         }
     }
@@ -1003,6 +1031,7 @@ IndirectData parse_indirect_data(const SignedData& signed_data) {
 // signify SignedPEFile.verify_additional_hashes: the page hashes inside SpcPeImageData.
 void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& layout) {
     if (!indirect.is_pe_image || !indirect.has_value) return;
+    std::uint64_t budget = kPageHashBudgetFactor * data.size() + kPageHashBudgetSlack;
     if (indirect.value.tag != 0x30) throw Fail{"ValueError", "SpcPeImageData is not a SEQUENCE"};
     Bytes image = indirect.value.content;
     Tlv element;
@@ -1053,7 +1082,7 @@ void verify_page_hashes(const IndirectData& indirect, Bytes data, const Layout& 
                 if (have_previous) {
                     if (++entries > kMaxPageHashEntries) throw Fail{"ValueError", "too many page hashes"};
                     const std::vector<std::uint8_t> expected =
-                        fingerprint(data, layout, md, previous_offset, offset, layout.page_size);
+                        fingerprint(data, layout, md, previous_offset, offset, layout.page_size, &budget);
                     if (!same_bytes(expected, previous_digest)) {
                         throw Fail{"AuthenticodeInvalidPageHashError",
                                    "The page hash for page " + std::to_string(previous_offset) + "-" +
@@ -1288,6 +1317,10 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
 
     // D-13 (off in parity): every further entry must verify like the first.
     if (options.verify_every_entry) {
+        if (signatures.size() > kMaxEntriesWhenAllVerified) {
+            return make_result("invalid", "more than " + std::to_string(kMaxEntriesWhenAllVerified) +
+                                              " certificate table entries; not all can be verified");
+        }
         for (std::size_t i = 1; i < signatures.size(); ++i) {
             try {
                 signify_verify(signatures[i], data, layout, roots, now);
@@ -1513,6 +1546,11 @@ Result verify(std::span<const std::uint8_t> data, const Options& options) {
     } catch (const Fail& failure) {
         out = make_result("unavailable", "verification error: " + failure.cls + ": " + failure.text);
         out.error_class = failure.cls;
+    } catch (const OverBudget&) {
+        // The reference would be past its 2-second limit: 'unavailable' (signature.py:539-543).
+        out = make_result("unavailable", "page-hash work over the limit of " + std::to_string(kPageHashBudgetFactor) +
+                                             " file sizes; signature not checked");
+        out.error_class = "OverBudget";
     } catch (const std::exception& error) {
         out = make_result("unavailable", std::string("verification error: ") + error.what());
         out.error_class = "exception";
