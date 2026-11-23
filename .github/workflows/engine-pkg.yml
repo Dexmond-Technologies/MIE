@@ -170,15 +170,14 @@ jobs:
               python3 engine/packaging/build_linux_packages.py
               chown -R "$HOST_UID:$HOST_GID" "$WORKSPACE/build-pkg" "$WORKSPACE/.vcpkg" "$WORKSPACE/.vcpkg-cache"
             '
-          python -c '
+          python - <<'PY'
           import json, os
-          m = json.load(open("build-pkg/out/linux-pkg-metadata.json"))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"version={m[\"version\"]}\n")
-              out.write(f"short_sha={m[\"short_sha\"]}\n")
-              out.write(f"deb_name={m[\"deb_name\"]}\n")
-              out.write(f"tar_name={m[\"tar_name\"]}\n")
-          '
+          with open("build-pkg/out/linux-pkg-metadata.json", encoding="utf-8") as f:
+              m = json.load(f)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for k in ("version", "short_sha", "deb_name", "tar_name"):
+                  out.write(f"{k}={m[k]}\n")
+          PY
       - name: Install lintian on Ubuntu runner
         run: |
           sudo apt-get update -qq

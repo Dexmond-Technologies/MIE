@@ -226,7 +226,11 @@ def build_deb(
     )
     installed_kib = max(1, math.ceil(total_bytes / 1024))
 
-    deb_version = f"{version}+git{short_sha}"
+    deb_version = (
+        f"{version}+git{short_sha}-1"
+        if signed
+        else f"{version}+git{short_sha}~UNSIGNED-TEST-BUILD-1"
+    )
     description = format_deb_description(wording, signed)
     control_text = (
         "Package: dexmond-mie\n"
@@ -267,8 +271,7 @@ def build_deb(
 
     set_clean_permissions(deb_root)
 
-    label = "" if signed else "_UNSIGNED-TEST-BUILD"
-    deb_name = f"dexmond-mie_{deb_version}_amd64{label}.deb"
+    deb_name = f"dexmond-mie_{deb_version}_amd64.deb"
     deb_path = out_dir / deb_name
     subprocess.run(
         ["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(deb_root), str(deb_path)],
