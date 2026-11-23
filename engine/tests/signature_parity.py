@@ -511,6 +511,12 @@ def build_cases():
     extra('signer_ecdsa_p256', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP256R1())), [inter]))
     extra('signer_ecdsa_p384', lambda: signed(pe, with_key(ec.generate_private_key(ec.SECP384R1())), [inter]))
     extra('digest_md5', lambda: signed(pe, leaf, [inter], digest='md5'))
+    # SG-2b: a SECOND certificate-table entry made with MD5, or carrying a cut page-hash table. The
+    # reference only parses further entries (valid, cap); the shipped setting verifies every entry
+    # (D-13) and must refuse these like a first entry (D-21, D-22).
+    extra('second_entry_md5', lambda: attach(pe, [blob, authenticode_blob(pe, leaf, [inter], digest='md5')]))
+    extra('second_entry_page_hashes_cut', lambda: attach(
+        pe, [blob, authenticode_blob(pe, leaf, [inter], page_hashes=page_hash_table(pe)[:-3])]))
     # an MD5 time-stamp over an expired leaf: the reference trusts it; the shipped setting must not (D-21)
     extra('stamp_md5_rfc3161', lambda: signed(pe, expired, [inter], timestamp='rfc3161', tsa=tsa, stamp_time=mid,
                                               stamp_digest='md5'))
@@ -773,9 +779,18 @@ def handle_test(inputs, tmp, roots_path, pinned, policy_path):
     def rename_over(path):
         os.replace(unsigned, path)
 
+    def rename_away_and_put_another(path):
+        # Windows refuses a rename OVER an open file, but lets the open original be renamed AWAY
+        # (delete sharing) and another file be moved INTO its name.
+        os.replace(path, path + '.moved-away')
+        os.replace(unsigned, path)
+
+    SWAP = 'rename the open file away and move another file into its name'
+
     # 1 and 2 on the generated, validly signed file (walker: valid)
     answer, outcome = run(inputs['valid_sha256'], 'generated file', [('overwrite in place', overwrite),
-                                                                    ('rename another file over the path', rename_over)])
+                                                                    ('rename another file over the path', rename_over),
+                                                                    (SWAP, rename_away_and_put_another)])
     if answer is None:
         return ['cap-path handle test: the probe gave no answer']
     refused = outcome.get('overwrite in place', '').startswith('REFUSED')
@@ -786,14 +801,16 @@ def handle_test(inputs, tmp, roots_path, pinned, policy_path):
     print(f"{'PASS' if follows else 'FAIL'}  cap path: the walker's answer is for the ORIGINAL bytes and the cap handle read the same bytes")
     if not follows:
         failures.append(f'cap path: answer not for the original bytes: {answer!r}')
-    if outcome.get('rename another file over the path') == 'went through':
+    replaced = [name for name in ('rename another file over the path', SWAP) if outcome.get(name) == 'went through']
+    if replaced:
         caught = answer.get('path_identity_after_check') in ('different', 'path gone')
-        print(f"{'PASS' if caught else 'FAIL'}  cap path: after a rename over the path the identity comparison says "
-              f"{answer.get('path_identity_after_check')!r}")
+        print(f"{'PASS' if caught else 'FAIL'}  cap path: the path now names another file ({'; '.join(replaced)}) and "
+              f"the identity comparison says {answer.get('path_identity_after_check')!r}")
         if not caught:
-            failures.append(f'cap path: a rename over the path was not caught by the identity comparison: {answer!r}')
+            failures.append(f'cap path: another file behind the path was not caught by the identity comparison: {answer!r}')
     else:
-        print('NOTE  cap path: the rename over the path was refused too on this system; the identity comparison was not exercised')
+        print('NOTE  cap path: no way of putting another file behind the path went through on this system; the '
+              'identity comparison was not exercised')
 
     # the measurement: does WinVerifyTrust judge the handle or re-open the path?
     real = os.environ.get('MIE_REAL_SIGNED_FILE')
@@ -824,7 +841,8 @@ def handle_test(inputs, tmp, roots_path, pinned, policy_path):
                                 candidates.append(full)
                     except OSError:
                         continue
-        print(f'HANDLE  looked at {looked} system programs; {len(candidates)} carry an embedded signature')
+        print(f'HANDLE  looked at {looked} system programs; {len(candidates)} carry an embedded signature'
+              + ('' if candidates else ': NONE FOUND'))
     chosen = None
     for full in candidates:
         with open(full, 'rb') as f:
@@ -841,18 +859,21 @@ def handle_test(inputs, tmp, roots_path, pinned, policy_path):
     full, data, reason = chosen
     print(f'HANDLE  measuring with a private copy of {full} (sha256 {hashlib.sha256(data).hexdigest()}); untouched, '
           f'WinVerifyTrust accepted it (second check went on to: {reason!r})')
-    after, outcome = run(data, 'real file, another file renamed over its path', [('rename another file over the path', rename_over)])
-    if after is None or outcome.get('rename another file over the path') != 'went through':
-        print('NOT DETERMINED  the rename over the real file\'s copy did not go through')
+    after, outcome = run(data, 'real file, an unsigned file put behind its path', [(SWAP, rename_away_and_put_another)])
+    if after is None or outcome.get(SWAP) != 'went through':
+        print('NOT DETERMINED  whether WinVerifyTrust judges the handle or re-opens the path: putting another file '
+              'behind the real file\'s copy did not go through')
         return failures
+    identity = after.get('path_identity_after_check')
+    if identity not in ('different', 'path gone'):
+        failures.append(f'cap path: another file behind the real copy\'s path was not caught by the identity comparison: {after!r}')
     reason_after = after.get('second_check_reason') or ''
     if any(word in reason_after for word in not_accepted):
-        print(f'MEASURED  WinVerifyTrust RE-OPENED THE PATH: after the rename it judged the replacement ({reason_after!r}). '
-              f"The identity comparison said {after.get('path_identity_after_check')!r}. Per the ruling: compare the "
-              f'identity after the check and refuse on a difference, or drop delete sharing on the cap path.')
+        print(f'MEASURED: WinVerifyTrust RE-OPENED THE PATH. With the signed original still open and an UNSIGNED file '
+              f'behind its name, its answer became {reason_after!r}. Identity comparison after the check: {identity!r}.')
     else:
-        print(f'MEASURED  WinVerifyTrust JUDGED THE OPEN HANDLE: after the rename its answer is still the one for the '
-              f'original ({reason_after!r}); path identity after the check: {after.get("path_identity_after_check")!r}')
+        print(f'MEASURED: WinVerifyTrust JUDGED THE OPEN HANDLE. With an UNSIGNED file behind the name, its answer is '
+              f'still the one for the signed original ({reason_after!r}). Identity comparison after the check: {identity!r}.')
     return failures
 
 
@@ -1064,7 +1085,8 @@ def main():
                 hard.append(f'{name}: the shipped setting accepts the timestamp of a certificate that did not make it: {c!r}')
         # SG-2 (D-21) and SG-3 (D-22): the shipped setting gives no cap and says why
         for name, word in (('digest_md5', 'MD5'), ('page_hashes_cut', 'page-hash'),
-                           ('page_hashes_offset_repeated', 'page-hash'), ('page_hashes_two_tables', 'page-hash')):
+                           ('page_hashes_offset_repeated', 'page-hash'), ('page_hashes_two_tables', 'page-hash'),
+                           ('second_entry_md5', 'MD5'), ('second_entry_page_hashes_cut', 'page-hash')):
             c = shipped.get(name)
             if name not in named:
                 print(f'NOT RUN  shipped setting, {name}: the case could not be built here')

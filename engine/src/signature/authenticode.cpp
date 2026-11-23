@@ -1447,7 +1447,13 @@ Result verify_inner(Bytes data, const Options& options, const Precheck& checked)
         }
         for (std::size_t i = 1; i < signatures.size(); ++i) {
             try {
-                signify_verify(signatures[i], data, layout, roots, now, !options.accept_malformed_page_hashes);
+                // D-22 applies to every verified entry (the flag); D-21 too (SG-2b): a further
+                // entry that uses MD5 is refused like the first.
+                const VerifiedBy other =
+                    signify_verify(signatures[i], data, layout, roots, now, !options.accept_malformed_page_hashes);
+                if (!options.accept_md5 && (other.file_digest == "md5" || other.signer_digest == "md5")) {
+                    throw Fail{"MD5", "the entry uses the MD5 digest, which is not accepted"};
+                }
             } catch (const Fail& failure) {
                 Result out = make_result("invalid", "certificate table entry " + std::to_string(i + 1) +
                                                         " does not verify (" + failure.cls + ": " + failure.text + ")");
