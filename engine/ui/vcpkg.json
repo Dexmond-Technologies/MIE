@@ -1,0 +1,8 @@
+{
+  "name": "mie-ui",
+  "version-string": "0.0.1",
+  "description": "Dexmond MIE stage 1 Qt 6 window and tray program. Dependency versions follow from the vcpkg commit pinned in .github/workflows/engine-qt.yml.",
+  "dependencies": [
+    "nlohmann-json"
+  ]
+}

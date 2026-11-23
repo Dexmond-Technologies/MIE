@@ -1,0 +1,6 @@
+# Process-lifetime caches allocated inside system libraries loaded by Qt platform/font plugins on Linux.
+# Never suppress any mie symbol.
+leak:libfontconfig.so
+leak:libglib-2.0.so
+leak:libdbus-1.so
+leak:libfreetype.so

@@ -1,0 +1,201 @@
+# MIE stage 1 Qt 6 window and tray (mie-ui), built and tested on GitHub runners only.
+# - build-test: Ubuntu (GCC) and Windows (MSVC): pinned Qt 6.8.3 dynamic libraries (Core, Gui,
+#   Widgets), pinned vcpkg commit (nlohmann-json), warnings as errors, headless Qt Test
+#   acceptance suite T-1 through T-14 (QT_QPA_PLATFORM=offscreen).
+# - sanitize: Ubuntu, Debug + AddressSanitizer + UndefinedBehaviorSanitizer, same acceptance suite.
+# Only actions/checkout, actions/setup-python and actions/cache are used, pinned identically to engine.yml.
+# No release, no tag, no installer, no artefact is published by this workflow.
+# No EICAR file and no malware is used here.
+name: engine-qt
+
+on:
+  push:
+    branches: [cpp/stage1-qt, cpp/stage1]
+    paths:
+      - "engine/ui/**"
+      - "engine/include/**"
+      - "engine/src/channel/**"
+      - "engine/src/core/result.cpp"
+      - "engine/src/service/**"
+      - ".github/workflows/engine-qt.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same vcpkg release tag 2026.10.16 commit as .github/workflows/engine.yml.
+  VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+  VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+  VCPKG_DISABLE_METRICS: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  QT_VERSION: "6.8.3"
+  AQT_VERSION: "3.3.0"
+  QT_QPA_PLATFORM: "offscreen"
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install system OpenGL and XKB/font runtime libraries (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libegl1 libdbus-1-3 libfontconfig1 libfreetype6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+      - name: Cache pinned Qt 6.8.3 dynamic SDK
+        id: qt-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .qt
+          key: qt-${{ runner.os }}-${{ env.QT_VERSION }}-aqt-${{ env.AQT_VERSION }}
+      - name: Install pinned Qt 6.8.3 from official Qt repository (Ubuntu)
+        if: runner.os == 'Linux' && steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          python -m pip install "aqtinstall==${AQT_VERSION}"
+          python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --external 7z -O "$GITHUB_WORKSPACE/.qt"
+      - name: Install pinned Qt 6.8.3 from official Qt repository (Windows)
+        if: runner.os == 'Windows' && steps.qt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install "aqtinstall==$env:AQT_VERSION"
+          python -m aqt install-qt windows desktop "$env:QT_VERSION" win64_msvc2022_64 --external 7z -O "$env:GITHUB_WORKSPACE/.qt"
+      - name: Configure Qt environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $qtDir = "$env:GITHUB_WORKSPACE/.qt/$env:QT_VERSION/msvc2022_64"
+            "$qtDir/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          } else {
+            $qtDir = "$env:GITHUB_WORKSPACE/.qt/$env:QT_VERSION/gcc_64"
+            "LD_LIBRARY_PATH=$qtDir/lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if (-not (Test-Path "$qtDir/lib/cmake/Qt6/Qt6Config.cmake")) {
+            Write-Error "Qt6Config.cmake not found under $qtDir"
+            exit 1
+          }
+          Write-Host "Pinned Qt $env:QT_VERSION located at $qtDir"
+          "QT_DIR=$qtDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QT_PLUGIN_PATH=$qtDir/plugins" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Fetch vcpkg at the pinned commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin $env:VCPKG_COMMIT
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $head = git -C .vcpkg rev-parse HEAD
+          if ($head -ne $env:VCPKG_COMMIT) { Write-Host "vcpkg is at $head, expected $env:VCPKG_COMMIT"; exit 1 }
+          Write-Host "vcpkg at $head"
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+      - name: Bootstrap vcpkg (Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-ui-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/ui/vcpkg.json') }}
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S engine/ui -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake" "-DCMAKE_PREFIX_PATH=$env:QT_DIR" "-DQt6_DIR=$env:QT_DIR/lib/cmake/Qt6"
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 4
+      - name: Acceptance tests (Qt Test, offscreen)
+        shell: pwsh
+        run: ctest --test-dir build -C Release --verbose --output-on-failure --timeout 180
+
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+      LSAN_OPTIONS: "suppressions=${{ github.workspace }}/engine/ui/tests/lsan.supp"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install system OpenGL and XKB/font runtime libraries (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libegl1 libdbus-1-3 libfontconfig1 libfreetype6 \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb1 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+      - name: Cache pinned Qt 6.8.3 dynamic SDK
+        id: qt-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .qt
+          key: qt-${{ runner.os }}-${{ env.QT_VERSION }}-aqt-${{ env.AQT_VERSION }}
+      - name: Install pinned Qt 6.8.3 from official Qt repository (Ubuntu)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          python -m pip install "aqtinstall==${AQT_VERSION}"
+          python -m aqt install-qt linux desktop "${QT_VERSION}" linux_gcc_64 --external 7z -O "$GITHUB_WORKSPACE/.qt"
+      - name: Fetch and bootstrap vcpkg at the pinned commit
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-ui-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/ui/vcpkg.json') }}
+      - name: Configure (AddressSanitizer + UndefinedBehaviorSanitizer)
+        run: |
+          set -eu
+          QT_DIR="$GITHUB_WORKSPACE/.qt/$QT_VERSION/gcc_64"
+          test -f "$QT_DIR/lib/cmake/Qt6/Qt6Config.cmake"
+          cmake -S engine/ui -B build -DCMAKE_BUILD_TYPE=Debug -DMIE_UI_SANITIZE=ON \
+            "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            "-DCMAKE_PREFIX_PATH=$QT_DIR" "-DQt6_DIR=$QT_DIR/lib/cmake/Qt6"
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Acceptance tests under ASan + UBSan
+        run: |
+          set -eu
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/.qt/$QT_VERSION/gcc_64/lib"
+          export QT_PLUGIN_PATH="$GITHUB_WORKSPACE/.qt/$QT_VERSION/gcc_64/plugins"
+          ctest --test-dir build --verbose --output-on-failure --timeout 300
