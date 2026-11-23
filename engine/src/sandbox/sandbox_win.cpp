@@ -169,6 +169,7 @@ std::vector<std::wstring> child_environment() {
 std::string status_words(DWORD code) {
     switch (code) {
         case 0xC0000005u: return "access violation";
+        case 0xC0000008u: return "an invalid handle was used (Windows ends an AppContainer process for that)";
         case 0xC0000017u: return "no memory";
         case 0xC0000022u: return "access denied (a program file or library could not be read)";
         case 0xC000007Bu: return "invalid image format";

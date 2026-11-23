@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -94,7 +95,14 @@ long long last_socket_error() {
 #endif
 }
 
-// socket_only: stop after creating the socket. Otherwise connect to host:port (numbers only).
+// How long a connection attempt may take. A confined Windows child gets no answer at all (its
+// packets are dropped, not refused), so a plain connect() would wait far longer than the
+// test's time limit. The control run without confinement has the SAME bound, so "timed out"
+// in the confined run means something only because the control connected within it.
+constexpr int kConnectSeconds = 5;
+
+// socket_only: stop after creating the socket. Otherwise connect to host:port (numbers only),
+// without blocking, waiting at most kConnectSeconds for the outcome.
 void try_network(Line& line, bool socket_only, const char* host, const char* port) {
 #if defined(_WIN32)
     WSADATA startup{};
@@ -124,11 +132,61 @@ void try_network(Line& line, bool socket_only, const char* host, const char* por
         address.sin_family = AF_INET;
         address.sin_port = htons(static_cast<unsigned short>(std::atoi(port)));
         ::inet_pton(AF_INET, host, &address.sin_addr);
-        const int connected = ::connect(s, reinterpret_cast<const sockaddr*>(&address), sizeof address);
-        line.flag("connected", connected == 0);
-        if (connected != 0) {
+#if defined(_WIN32)
+        u_long non_blocking = 1;
+        ::ioctlsocket(s, FIONBIO, &non_blocking);
+#else
+        ::fcntl(s, F_SETFL, ::fcntl(s, F_GETFL) | O_NONBLOCK);
+#endif
+        bool connected = ::connect(s, reinterpret_cast<const sockaddr*>(&address), sizeof address) == 0;
+        long long error = 0;
+        std::string how = "connected at once";
+        if (!connected) {
+            error = last_socket_error();
+#if defined(_WIN32)
+            const bool pending = error == WSAEWOULDBLOCK;
+#else
+            const bool pending = error == EINPROGRESS;
+#endif
+            if (!pending) {
+                how = "refused at once";
+            } else {
+                fd_set writable;
+                fd_set failed;
+                FD_ZERO(&writable);
+                FD_ZERO(&failed);
+                FD_SET(s, &writable);
+                FD_SET(s, &failed);
+                timeval wait{};
+                wait.tv_sec = kConnectSeconds;
+                const int ready = ::select(static_cast<int>(s) + 1, nullptr, &writable, &failed, &wait);
+                if (ready == 0) {
+                    how = "timed out after " + std::to_string(kConnectSeconds) + " s (no answer)";
+                    error = 0;
+                } else if (ready < 0) {
+                    how = "waiting for the connection failed";
+                    error = last_socket_error();
+                } else {
+                    int outcome = 0;
+#if defined(_WIN32)
+                    int length = sizeof outcome;
+                    ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&outcome), &length);
+#else
+                    socklen_t length = sizeof outcome;
+                    ::getsockopt(s, SOL_SOCKET, SO_ERROR, &outcome, &length);
+#endif
+                    connected = outcome == 0 && FD_ISSET(s, &writable) != 0;
+                    error = outcome;
+                    how = connected ? "connected within the bound" : "connection failed";
+                }
+            }
+        }
+        line.flag("connected", connected);
+        line.text("how", how);
+        line.number("bound_seconds", kConnectSeconds);
+        if (!connected) {
             line.text("failed_at", "connect");
-            line.number("error", last_socket_error());
+            line.number("error", error);
         }
     }
 #if defined(_WIN32)
@@ -229,37 +287,105 @@ void try_descriptor_change(Line& line, const std::string& action) {
 }
 #endif
 
+#if defined(_WIN32)
+// The layout NtQueryInformationProcess(ProcessHandleInformation = 51) writes: a header, then
+// one entry per handle of the process. NOT in the public Windows headers; written here from
+// the commonly published native-API definitions. UNSURE of it: the sizes are asserted for
+// 64-bit, and the test accepts the answer only if the inheritable handles it yields are
+// EXACTLY the three standard handles and the file, which a wrong layout would not produce.
+struct HandleEntry {
+    HANDLE value;
+    ULONG_PTR handle_count;
+    ULONG_PTR pointer_count;
+    ULONG granted_access;
+    ULONG object_type_index;
+    ULONG attributes;  // OBJ_INHERIT = 0x2
+    ULONG reserved;
+};
+struct HandleSnapshotHeader {
+    ULONG_PTR number_of_handles;
+    ULONG_PTR reserved;
+};
+#if defined(_WIN64)
+static_assert(sizeof(HandleEntry) == 40, "handle entry layout (64-bit)");
+static_assert(sizeof(HandleSnapshotHeader) == 16, "handle snapshot header layout (64-bit)");
+#endif
+using QueryProcessFunction = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+#endif
+
 // Lists what this process holds that it got from its parent.
 //   Linux: every open descriptor (asked one by one with fcntl F_GETFD, the only way left once
 //     paths cannot be opened), and how the handed-over file is open.
-//   Windows: every handle value that is valid AND marked inheritable. A handle a process
-//     inherits keeps that mark; the handles Windows itself opens in every new process, and the
-//     ones the program opens, do not have it. So "inheritable" = "came from the parent".
-// Not shown: numbers above the scanned range (printed as "scanned").
+//   Windows: the system's own list of this process's handles, and which of them are marked
+//     inheritable. A handle a process inherits keeps that mark; the handles Windows itself
+//     opens in every new process, and the ones the program opens, do not have it. So
+//     "inheritable" = "came from the parent". No handle value is ever probed: inside an
+//     AppContainer the use of an invalid handle ends the process (status 0xC0000008; third CI
+//     run), so asking "is this number a handle" one by one cannot be the method.
 void list_inherited(Line& line) {
     std::string list;
 #if defined(_WIN32)
-    constexpr std::uintptr_t kHighest = 0x40000;  // handle values are multiples of 4
-    long long valid = 0;
-    for (std::uintptr_t value = 4; value <= kHighest; value += 4) {
-        DWORD flags = 0;
-        if (!::GetHandleInformation(reinterpret_cast<HANDLE>(value), &flags)) {
-            continue;
-        }
-        ++valid;
-        if ((flags & HANDLE_FLAG_INHERIT) != 0) {
-            list += (list.empty() ? "" : ",") + std::to_string(value);
-        }
-    }
-    line.raw("inheritable_handles", "[" + list + "]");
-    line.number("valid_handles", valid);
-    line.number("scanned", static_cast<long long>(kHighest));
     const auto standard = [](DWORD which) {
         return std::to_string(reinterpret_cast<std::uintptr_t>(::GetStdHandle(which)));
     };
     line.raw("standard_handles", "[" + standard(STD_INPUT_HANDLE) + "," + standard(STD_OUTPUT_HANDLE) + "," +
                                      standard(STD_ERROR_HANDLE) + "]");
-    line.number("file_handle", inherited_number());
+    const long long file = inherited_number();
+    line.number("file_handle", file);
+    DWORD counted = 0;
+    if (::GetProcessHandleCount(::GetCurrentProcess(), &counted)) {
+        line.number("process_handle_count", counted);
+    }
+    // Whether Windows ends this process on the use of an invalid handle (reported, not needed).
+    PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict{};
+    if (::GetProcessMitigationPolicy(::GetCurrentProcess(), ProcessStrictHandleCheckPolicy, &strict, sizeof strict)) {
+        line.number("strict_handle_check_flags", strict.Flags);
+    }
+
+    const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    const QueryProcessFunction query =
+        ntdll != nullptr ? reinterpret_cast<QueryProcessFunction>(::GetProcAddress(ntdll, "NtQueryInformationProcess"))
+                         : nullptr;
+    std::vector<unsigned char> buffer(64 * 1024);
+    LONG status = -1;
+    for (int attempt = 0; attempt < 8 && query != nullptr; ++attempt) {
+        ULONG needed = 0;
+        status = query(::GetCurrentProcess(), 51 /* ProcessHandleInformation */, buffer.data(),
+                       static_cast<ULONG>(buffer.size()), &needed);
+        if (status != static_cast<LONG>(0xC0000004u)) {  // not "buffer too small"
+            break;
+        }
+        buffer.resize(needed > buffer.size() ? static_cast<std::size_t>(needed) + 4096 : buffer.size() * 2);
+    }
+    if (query == nullptr || status != 0) {
+        line.text("method", "count only: the system's handle list could not be read");
+        line.number("query_status", status);
+        return;
+    }
+    HandleSnapshotHeader header{};
+    std::memcpy(&header, buffer.data(), sizeof header);
+    if (header.number_of_handles > (buffer.size() - sizeof header) / sizeof(HandleEntry)) {
+        line.text("method", "count only: the system's handle list does not have the expected layout");
+        return;
+    }
+    long long file_access = -1;
+    for (std::size_t i = 0; i < header.number_of_handles; ++i) {
+        HandleEntry entry{};
+        std::memcpy(&entry, buffer.data() + sizeof header + i * sizeof(HandleEntry), sizeof entry);
+        const auto value = reinterpret_cast<std::uintptr_t>(entry.value);
+        if ((entry.attributes & 0x2u) != 0) {
+            list += (list.empty() ? "" : ",") + std::to_string(value);
+        }
+        if (file >= 0 && value == static_cast<std::uintptr_t>(file)) {
+            file_access = entry.granted_access;
+        }
+    }
+    line.text("method", "NtQueryInformationProcess(ProcessHandleInformation)");
+    line.number("total_handles", static_cast<long long>(header.number_of_handles));
+    line.raw("inheritable_handles", "[" + list + "]");
+    line.number("file_granted_access", file_access);
+    line.flag("file_handle_can_write",
+              file_access >= 0 && (file_access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
 #else
     long highest = 1L << 20;
     struct rlimit limit {};

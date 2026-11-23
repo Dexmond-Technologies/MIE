@@ -202,7 +202,12 @@ def run_cases(parent, child, windows, linux, work):
     listener.bind(("127.0.0.1", 0))
     listener.listen(8)
     port = str(listener.getsockname()[1])
-    case(P1, refused("TCP connection to a listener of this test on 127.0.0.1:" + port,
+    # The child waits at most 5 s for the connection (a confined Windows child gets no answer
+    # at all). The control run has the same 5 s and must connect within them: only then does
+    # "timed out" in the confined run count as "the connection fails".
+    case(P1, refused("TCP connection to a listener of this test on 127.0.0.1:" + port + ", waiting at most 5 s; "
+                     "a time-out counts as failed only because the control run (same listener, same 5 s) "
+                     "connected; see 'how' in the child's answer",
                      ["connect", "127.0.0.1", port], "connected"))
     listener.close()
     if linux:
@@ -258,13 +263,21 @@ def run_cases(parent, child, windows, linux, work):
                 "file is open (F_GETFL); expected exactly 0, 1, 2 and the file, read-only. NOT SHOWN: " \
                 "numbers at or above that bound" % inner.get("scanned")
         elif windows:
+            if not inner:
+                return "FAIL", "the child gave no answer; " + brief(result, None)
             expected = sorted(set(inner.get("standard_handles", [])) | {inner.get("file_handle")})
-            good = len(expected) == 4 and sorted(inner.get("inheritable_handles", [])) == expected
-            tried = "asked every handle value up to %s whether it is valid and marked inheritable (a handle " \
-                "that came from the parent keeps that mark); expected exactly the three standard handles " \
-                "and the file. NOT SHOWN: values above that bound; the %s other valid handles are ones " \
-                "Windows opens in every process or the program opened itself, not checked one by one" % (
-                    inner.get("scanned"), inner.get("valid_handles"))
+            listed = inner.get("inheritable_handles")
+            if listed is None:
+                return "FAIL", "the child could not read the system's list of its handles (%s), so the point " \
+                    "is not shown; %s" % (inner.get("method"), brief(result, inner))
+            good = len(expected) == 4 and sorted(listed) == expected \
+                and inner.get("file_handle_can_write") is False
+            tried = "read the system's own list of this process's handles (%s): %s handles in all, of which " \
+                "those marked inheritable (a handle that came from the parent keeps that mark) must be exactly " \
+                "the three standard handles and the file, and the file's granted access (0x%x) must hold no " \
+                "write right. NOT SHOWN: the other handles are the ones Windows opens in every process or " \
+                "the program opened itself; they are counted, not examined one by one" % (
+                    inner.get("method"), inner.get("total_handles"), inner.get("file_granted_access") or 0)
         else:
             return "NOT RUN", "no confinement is written for this system"
         good = good and result.get("end") == "exited" and inner.get("confined") is True
