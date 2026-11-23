@@ -38,6 +38,25 @@ NOT_BY_FILES = {
 }
 
 
+def overlay_rows_reachable():
+    """The reference asks pefile for the overlay with PE.get_overlay_data_offset() inside a
+    try/except that swallows every error (dexmond_mie/pe_analyzer.py, get_overlay_info and
+    get_overlay_entropy). If the installed pefile has no method of that name, the call fails,
+    the reference sees no overlay in any file, and the rows pe_overlay and overlay_high_entropy
+    can never be produced. This function looks at the installed pefile and says which it is.
+    Returns (reachable, sentence)."""
+    try:
+        import pefile
+    except ImportError:
+        return True, 'pefile is not installed here; cannot tell'
+    has_called = hasattr(pefile.PE, 'get_overlay_data_offset')
+    has_real = hasattr(pefile.PE, 'get_overlay_data_start_offset')
+    version = getattr(pefile, '__version__', '?')
+    sentence = (f'pefile {version}: PE.get_overlay_data_offset (the name the reference calls) exists: {has_called}; '
+                f'PE.get_overlay_data_start_offset exists: {has_real}')
+    return has_called, sentence
+
+
 def load_lines(path):
     with open(path, encoding='utf-8') as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -113,7 +132,8 @@ def main():
             scores.setdefault(record['score'], []).append(path)
         if record['verdict'] == labels['partial']:
             mark('partial_scan_verdict', path)
-        if detail.get('archive_not_unpacked'):
+        reasons = (detail.get('archive_coverage') or {}).get('reasons', [])
+        if detail.get('archive_not_unpacked') or any(str(r).startswith('nested archive') for r in reasons):
             mark('archive_depth_limit', path)
         print(f"{path}: score {record['score']} {record['verdict']!r} error={record['error']!r} "
               f"[{', '.join(shown)}]"
@@ -147,10 +167,24 @@ def main():
                    'default_weight', 'signed_cap']
                 + ['verdict:' + labels[k] for k in ('clean', 'low', 'medium', 'malicious')])
 
+    overlay_reachable, overlay_sentence = overlay_rows_reachable()
+    unreachable = {}
+    if not overlay_reachable:
+        for item in ('weight:pe_overlay', 'weight:overlay_high_entropy'):
+            unreachable[item] = ('cannot be produced by the reference: it asks pefile for the overlay through a '
+                                 'method this pefile does not have, and swallows the error. ' + overlay_sentence)
+
     print('\n--- coverage of the scoring table by set S ---')
+    print('overlay rows: ' + overlay_sentence)
     missing = []
     for item in required:
-        if item in hit:
+        if item in hit and item in unreachable:
+            # the reference DID produce it: the claim "unreachable" is wrong and must not be kept
+            print(f'MISSING      {item}: produced by {hit[item]} although judged unreachable; check overlay_rows_reachable')
+            missing.append(item)
+        elif item in unreachable:
+            print(f'UNREACHABLE  {item}: {unreachable[item]}')
+        elif item in hit:
             print(f'COVERED      {item}: {", ".join(sorted(set(hit[item]))[:6])}'
                   + (' ...' if len(set(hit[item])) > 6 else ''))
         elif item in NOT_BY_FILES:
@@ -166,6 +200,7 @@ def main():
     covered = [i for i in required if i in hit]
     print(f'set S: {len(files)} files; {len(covered)} items covered by files, '
           f'{len([i for i in required if i not in hit and i in NOT_BY_FILES])} not coverable by files, '
+          f'{len(unreachable)} unreachable in the reference, '
           f'{len(missing)} missing')
 
     manifest = {
@@ -180,6 +215,7 @@ def main():
                   for p in sorted(files)],
         'covered': {i: sorted(set(hit[i])) for i in required if i in hit},
         'not_by_files': {i: NOT_BY_FILES[i] for i in required if i not in hit and i in NOT_BY_FILES},
+        'unreachable_in_reference': unreachable,
         'missing': missing,
         'scores_present': present,
     }

@@ -205,6 +205,53 @@ def gzip_stored(data):
     return out + struct.pack('<II', zlib.crc32(data) & 0xFFFFFFFF, len(data) & 0xFFFFFFFF)
 
 
+def deflate_fixed(data):
+    """A valid deflate stream written here, without a compression library: one block with the
+    fixed Huffman code and literals only. The bytes are the same on every machine, and the
+    content is no longer readable as plain text inside the archive."""
+    bits = []
+
+    def put(value, count, msb_first):
+        order = range(count - 1, -1, -1) if msb_first else range(count)
+        for i in order:
+            bits.append((value >> i) & 1)
+
+    put(1, 1, False)            # last block
+    put(1, 2, False)            # block type 1: fixed Huffman codes
+    for byte in data:
+        if byte < 144:
+            put(0x30 + byte, 8, True)
+        else:
+            put(0x190 + (byte - 144), 9, True)
+    put(0, 7, True)             # end of block
+    out = bytearray()
+    for i in range(0, len(bits), 8):
+        value = 0
+        for j, bit in enumerate(bits[i:i + 8]):
+            value |= bit << j
+        out.append(value)
+    return bytes(out)
+
+
+def make_zip_deflated(members):
+    """A zip archive whose members are deflated with deflate_fixed (written by hand so that
+    the bytes do not depend on a compression library)."""
+    import zlib
+    dos_date = ((2026 - 1980) << 9) | (11 << 5) | 23
+    body, central = b'', b''
+    for name, data in members:
+        raw_name = name.encode('ascii')
+        packed = deflate_fixed(data)
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        offset = len(body)
+        body += struct.pack('<IHHHHHIIIHH', 0x04034B50, 20, 0, 8, 0, dos_date, crc, len(packed), len(data),
+                            len(raw_name), 0) + raw_name + packed
+        central += struct.pack('<IHHHHHHIIIHHHHHII', 0x02014B50, 20, 20, 0, 8, 0, dos_date, crc, len(packed),
+                               len(data), len(raw_name), 0, 0, 0, 0, 0o644 << 16, offset) + raw_name
+    end = struct.pack('<IHHHHIIH', 0x06054B50, 0, 0, len(members), len(members), len(central), len(body), 0)
+    return body + central + end
+
+
 def make_zip(members, stored=True):
     # Stored (uncompressed) members: the archive's bytes, and so its hash in the manifest,
     # do not depend on the version of the compression library.
@@ -268,7 +315,10 @@ def build_files(rng, large):
                                                             'z = "TVqQAAMAAAA4A' + 'B' * 120 + '"'),
         'sum above 100: clamp at 100')
     add('t11_random.bin', random_64k, 'non-PE whole-file entropy above 7.2: high_entropy (15)')
-    add('t12_pockets.bin', bytes(60 * 1024) + rng.randbytes(40 * 1024),
+    add('t12_pockets_after_zeros.bin', bytes(60 * 1024) + rng.randbytes(40 * 1024),
+        'entropy at most 7.2 but more than a quarter of the windows high, in a file that begins with zero '
+        'bytes: the reference takes leading zero blocks for a tar archive, so the weight is the reduced one (5)')
+    add('t15_pockets.bin', b'A' * (60 * 1024) + rng.randbytes(40 * 1024),
         'entropy at most 7.2 but more than a quarter of the windows high: sliding_entropy_spike (10)')
     add('t13_gzip_magic_random.bin', b'\x1f\x8b\x08\x00' + rng.randbytes(64 * 1024),
         'compressed-format magic with high entropy, not an archive: entropy at reduced weight (5)')
@@ -288,10 +338,21 @@ def build_files(rng, large):
         'archive takes its worst member\'s score as a floor (archive_member, 70)')
     add('a03_tar_medium_member.tar', make_tar([('notes.txt', clean), ('blob.txt', files[3][1])]),
         'tar archive with a member at 30: floor 30')
-    inner = make_zip([('words.txt', critical_words)])
+    stored_inner = make_zip([('words.txt', critical_words)])
     for _ in range(3):
-        inner = make_zip([('inner.zip', inner)])
-    add('a04_zip_nested_4_deep.zip', inner, 'nesting deeper than 3: the innermost archive is not unpacked')
+        stored_inner = make_zip([('inner.zip', stored_inner)])
+    add('a04_zip_nested_4_deep_stored.zip', stored_inner,
+        'nesting deeper than 3 with stored members: the innermost archive is not unpacked, but its bytes '
+        'still hold the words as plain text')
+    deflated = make_zip_deflated([('words.txt', critical_words)])
+    three = make_zip([('inner.zip', make_zip([('inner.zip', deflated)]))])
+    add('a08_zip_nested_3_deep_deflated.zip', three,
+        'three archives deep, innermost member deflated: within the depth limit, unpacked and found')
+    add('a09_zip_nested_4_deep_deflated.zip', make_zip([('inner.zip', three)]),
+        'four archives deep, innermost member deflated: beyond the depth limit of 3, the innermost archive '
+        'is not unpacked and its content is not seen')
+    add('a10_zip_deflated_member.zip', make_zip_deflated([('words.txt', critical_words), ('notes.txt', clean)]),
+        'a deflated member is unpacked and scanned (archive_member floor 70)')
     add('a05_zip_201_members.zip', make_zip([(f'f{i:03d}.txt', b'line\r\n') for i in range(201)]),
         'more than 200 members: member limit')
     add('a06_targz_low_member.tar.gz', gzip_stored(make_tar([('shell.txt', files[1][1])])),
@@ -329,9 +390,11 @@ def build_files(rng, large):
         build_pe(plain + [('.blob', rng.randbytes(0x4000), SEC_RDATA)], BENIGN_IMPORTS),
         'high_entropy (15) on a section')
     add('p09_big_overlay.exe', build_pe(plain, BENIGN_IMPORTS, overlay=(b'overlay text line\r\n' * 64000)),
-        'pe_overlay (15): more than 1 MiB after the last section, low entropy')
+        'more than 1 MiB after the last section, low entropy: the row pe_overlay (15), IF the reference '
+        'can see an overlay at all (see set_s_coverage.py: overlay rows)')
     add('p10_random_overlay.exe', build_pe(plain, BENIGN_IMPORTS, overlay=rng.randbytes(8192)),
-        'overlay_high_entropy (5)')
+        '8 KiB of random bytes after the last section: the row overlay_high_entropy (5), IF the reference '
+        'can see an overlay at all')
     add('p11_tls_with_entropy.exe',
         build_pe(plain + [('.blob', rng.randbytes(0x4000), SEC_RDATA)], BENIGN_IMPORTS, tls=True),
         'tls_callback (5), scored because an entropy signal is present')
