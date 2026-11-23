@@ -2,7 +2,11 @@
 """Worker confinement: what a confined child can and cannot do (conditions M-2, M-9; r-01's
 ruling B-3627: five things shown from inside the confined worker on each system).
 
-Usage: sandbox_cases.py <mie-sandbox-testparent> <mie-sandbox-testchild>
+Usage: sandbox_cases.py <mie-sandbox-testparent> <mie-sandbox-testchild> <mie-sandbox-shippedchild>
+
+The first two programs are built with the test build of the sandbox library (test switches
+compiled in). The third is the same test child built with the SHIPPED library, in which the
+test switches do not exist (reviewer's finding SB-1).
 
 Every case starts the test child through mie::sandbox::run_confined (by way of the test
 parent) and looks at the ChildResult. One line per case: PASS, FAIL or NOT RUN with the
@@ -26,6 +30,8 @@ GIB = 1024 * 1024 * 1024
 WALL = "20"  # seconds, the limit of every case that does not set its own
 
 P1 = "r-01 point 1: a network connection from the confined child fails"
+P1B = "r-01 point 1 (not the local loop): a connection to the machine's own network address fails"
+SHIPPED = "SB-1: a child built with the shipped library ignores the test switches in its environment"
 P2 = "r-01 point 2: reading a file in the user's profile that was not handed over fails"
 P3 = "r-01 point 3: starting another process from the confined child fails"
 P4 = "r-01 point 4: writing a file outside what was handed over fails"
@@ -33,7 +39,8 @@ P5A = "r-01 point 5: the handed-over file is readable through its handle (hash e
 P5B = "r-01 point 5: the handed-over file is read-only (writing through the handle fails)"
 P5C = "r-01 point 5: the handed-over file is the only thing inherited besides the three standard streams"
 MEMORY = "memory: the limit ends the child, the parent carries on"
-MUST_RUN = (P1, P2, P3, P4, P5A, P5B, P5C, MEMORY)
+MUST_RUN = (P1, P1B, P2, P3, P4, P5A, P5B, P5C, MEMORY, SHIPPED)
+SANITIZER = {"seen": False}  # set when the test parent says it is a sanitizer build
 
 results = []  # (status, name, text)
 
@@ -53,6 +60,8 @@ def run_parent(parent, child, options, action, wall=WALL):
                 "error: %s" % (done.returncode, done.stderr.decode("ascii", "replace")[:500]),
                 "confinement": "", "output": ""}, None
     result = json.loads(lines[-1].decode("ascii"))
+    if result.get("sanitizer_build"):
+        SANITIZER["seen"] = True
     inner = None
     for line in result.get("output", "").split("\n"):
         if line.strip().startswith("{"):
@@ -86,7 +95,10 @@ def summary():
     not_run = sum(1 for status, _, _ in results if status == "NOT RUN")
     blocking = [name for name in MUST_RUN
                 if not any(status in ("PASS", "FAIL") and case_name == name for status, case_name, _ in results)]
-    print("sandbox_cases: %d passed, %d failed, %d not run" % (passed, failed, not_run))
+    print("sandbox_cases: %d passed, %d failed, %d not run%s" % (
+        passed, failed, not_run,
+        " [SANITIZER BUILD: the system-call filter here is the WIDER sanitizer list; these results "
+        "are NOT evidence for the shipped filter]" if SANITIZER["seen"] else ""))
     for name in blocking:
         print("FAIL    required case was not run: %s" % name)
     return 1 if failed or blocking else 0
@@ -120,9 +132,11 @@ def windows_setup(parent, child):
 
 def main():
     if len(sys.argv) < 3:
-        print("usage: sandbox_cases.py <mie-sandbox-testparent> <mie-sandbox-testchild>")
+        print("usage: sandbox_cases.py <mie-sandbox-testparent> <mie-sandbox-testchild> "
+              "<mie-sandbox-shippedchild>")
         return 2
     parent, child = sys.argv[1], sys.argv[2]
+    shipped_child = sys.argv[3] if len(sys.argv) > 3 else None
     windows = os.name == "nt"
     linux = sys.platform.startswith("linux")
 
@@ -130,12 +144,39 @@ def main():
     home = os.path.expanduser("~")
     work = tempfile.mkdtemp(prefix="mie-sandbox-test-", dir=home)
     try:
-        return run_cases(parent, child, windows, linux, work)
+        return run_cases(parent, child, shipped_child, windows, linux, work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def run_cases(parent, child, windows, linux, work):
+def own_network_address():
+    """A non-loopback IPv4 address of this machine, found WITHOUT sending anything: connecting
+    a UDP socket only chooses the local address for a route (no packet leaves), and the host
+    name is resolved by the machine itself. Returns (address or None, how)."""
+    tried = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))  # documentation-only address; UDP connect sends nothing
+            address = probe.getsockname()[0]
+        finally:
+            probe.close()
+        if address and not address.startswith("127.") and address != "0.0.0.0":
+            return address, "local address the system would use for a route (UDP connect, nothing sent)"
+        tried.append("route lookup gave %s" % address)
+    except OSError as error:
+        tried.append("route lookup failed: %s" % error)
+    try:
+        for address in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if not address.startswith("127."):
+                return address, "address of the machine's own host name"
+        tried.append("the host name has only loopback addresses")
+    except OSError as error:
+        tried.append("host name lookup failed: %s" % error)
+    return None, "; ".join(tried)
+
+
+def run_cases(parent, child, shipped_child, windows, linux, work):
     sample = os.path.join(work, "handed-over.bin")
     with open(sample, "wb") as handle:
         handle.write(b"MIE sandbox test file\n" * 1000)
@@ -210,6 +251,41 @@ def run_cases(parent, child, windows, linux, work):
                      "connected; see 'how' in the child's answer",
                      ["connect", "127.0.0.1", port], "connected"))
     listener.close()
+    # r-01's ruling 2a: 127.0.0.1 shows only that the local loop is closed. The same attempt
+    # against a listener of this test on the machine's own NETWORK address. Nothing outside
+    # the machine is contacted.
+    address, how_found = own_network_address()
+    if address is None:
+        record("NOT RUN", P1B, "this machine has no IPv4 address other than the local loop (%s)" % how_found)
+    else:
+        try:
+            outside = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            outside.bind((address, 0))
+            outside.listen(8)
+        except OSError as error:
+            record("FAIL", P1B, "could not listen on the machine's own address %s (%s): %s" % (
+                address, how_found, error))
+        else:
+            outside_port = str(outside.getsockname()[1])
+            case(P1B, refused("TCP connection to a listener of this test on %s:%s (%s), waiting at most 5 s; a "
+                              "time-out counts as failed only because the control run connected. Whether "
+                              "Windows treats the machine's own address as 'local loop' for a container is "
+                              "not shown by this case" % (address, outside_port, how_found),
+                              ["connect", address, outside_port], "connected"))
+            outside.close()
+    if windows:
+        def no_capability():
+            result, inner = run_parent(parent, child, [], ["whoami"])
+            text_self = (inner or {}).get("self", "")
+            return ("PASS" if "capabilities=0" in text_self else "FAIL"), \
+                "tried: read the capability list of the child's own token; the network capabilities " \
+                "(internetClient and the like) are what would open the network, and there must be none; " \
+                + brief(result, inner)
+        case("r-01 point 1 (capabilities): the confined child's token holds no capability (Windows)",
+             no_capability)
+    else:
+        record("NOT RUN", "r-01 point 1 (capabilities): the confined child's token holds no capability (Windows)",
+               "Windows only: capabilities are a Windows AppContainer notion")
     if linux:
         case("network: creating a socket fails when confined (Linux)",
              refused("socket(AF_INET, SOCK_STREAM)", ["socket"], "socket_created", error_number=1))
@@ -246,6 +322,10 @@ def run_cases(parent, child, windows, linux, work):
         result, inner = run_parent(parent, child, ["--file", sample], ["write-handle"])
         good = result.get("end") == "exited" and inner is not None and inner.get("confined") is True \
             and inner.get("handle_present") is True and inner.get("wrote") is False
+        if good and linux:
+            # 9 = "bad file descriptor": the descriptor itself refuses (opened read-only); the
+            # call write is on the filter's allow list, so this is not the filter's refusal.
+            good = inner.get("error") == 9
         with open(sample, "rb") as handle:
             unchanged = hashlib.sha256(handle.read()).hexdigest() == sample_hash
         return ("PASS" if good and unchanged else "FAIL"), "tried: write one byte through the inherited " \
@@ -257,11 +337,10 @@ def run_cases(parent, child, windows, linux, work):
         result, inner = run_parent(parent, child, ["--file", sample], ["handles"])
         inner = inner or {}
         if linux:
-            good = inner.get("open_descriptors") == [0, 1, 2, inner.get("file_descriptor")] \
-                and inner.get("file_access") == "read-only"
-            tried = "asked every descriptor number below %s whether it is open (fcntl F_GETFD) and how the " \
-                "file is open (F_GETFL); expected exactly 0, 1, 2 and the file, read-only. NOT SHOWN: " \
-                "numbers at or above that bound" % inner.get("scanned")
+            good = inner.get("open_descriptors") == [0, 1, 2, inner.get("file_descriptor")]
+            tried = "asked every descriptor number below %s whether it is open (system call fstat); " \
+                "expected exactly 0, 1, 2 and the file (read-only is shown by the case before). NOT " \
+                "SHOWN: numbers at or above that bound, the kernel's default ceiling" % inner.get("scanned")
         elif windows:
             if not inner:
                 return "FAIL", "the child gave no answer; " + brief(result, None)
@@ -283,6 +362,22 @@ def run_cases(parent, child, windows, linux, work):
         good = good and result.get("end") == "exited" and inner.get("confined") is True
         return ("PASS" if good else "FAIL"), "tried: " + tried + "; " + brief(result, inner)
     case(P5C, only_handle)
+    if windows:
+        # r-01's ruling 2b: the other handles, by type, and the names of files and keys.
+        result, inner = run_parent(parent, child, ["--file", sample], ["handles"])
+        inner = inner or {}
+        types = inner.get("handle_types")
+        if types is None:
+            print("handles: the child gave no table of handle types (%s)" % brief(result, inner), flush=True)
+        else:
+            print("handles: %s in all; types not given by the system for %s of them; file names not asked "
+                  "for %s (pipes, consoles, devices, sockets)" % (
+                      inner.get("total_handles"), inner.get("types_refused"),
+                      inner.get("file_names_not_asked")), flush=True)
+            for name in sorted(types):
+                print("handles:   %-40s %d" % (name, types[name]), flush=True)
+            for entry in inner.get("file_and_key_handles", []):
+                print("handles:   %s" % entry, flush=True)
 
     linux_only = (
         ("handle: fchmod on the handed-over descriptor is refused by the filter (Linux)",
@@ -381,6 +476,39 @@ def run_cases(parent, child, windows, linux, work):
         return ("PASS" if good else "FAIL"), brief(result, inner)
     case("refusal: with allow_weaker (tests only) the run goes on and SAYS it is weaker",
          weaker_only_when_asked)
+
+    # ---- SB-1: the shipped library has no test switches -----------------------------------------
+    def shipped_ignores_switches():
+        # The test parent (test build) puts MIE_SANDBOX_ALLOW_WEAKER=1 in the child's
+        # environment, and on Linux MIE_SANDBOX_TEST_BREAK=1 as well. The child here is built
+        # with the SHIPPED library.
+        hooked, hooked_inner = run_parent(parent, child, ["--break", "--allow-weaker"], ["whoami"])
+        hooked_said = "WEAKER" in hooked.get("confinement", "") or "WEAKER" in (hooked_inner or {}).get(
+            "what_applied", "")
+        if not hooked_said:
+            return "FAIL", "the control (the test-build child with the same switches) did not run WEAKER, " \
+                "so the switches were not in effect and nothing is shown: " + brief(hooked, hooked_inner)
+        result, inner = run_parent(parent, shipped_child, ["--break", "--allow-weaker"], ["whoami"])
+        inner = inner or {}
+        if linux:
+            # The child must confine itself in full, whatever the variables say.
+            good = result.get("end") == "exited" and inner.get("confined") is True \
+                and "WEAKER" not in inner.get("what_applied", "") and "seccomp=2" in inner.get("self", "") \
+                and "test hook" not in inner.get("what_applied", "")
+            expected = "the child applies the whole confinement (seccomp=2, no WEAKER text)"
+        else:
+            # On Windows the test parent leaves the AppContainer out; a child without the switch
+            # must REFUSE to work outside a container instead of going on weaker.
+            good = inner.get("confined") is False and "self" not in inner and result.get("exit_code") == 3
+            expected = "the child, started outside a container, refuses to work (exit code 3) instead of " \
+                "going on weaker"
+        return ("PASS" if good else "FAIL"), "tried: started %s with the test switches in its environment; " \
+            "the test-build child with the same switches ran WEAKER (control); expected: %s; %s" % (
+                os.path.basename(shipped_child), expected, brief(result, inner))
+    if shipped_child:
+        case(SHIPPED, shipped_ignores_switches)
+    else:
+        record("NOT RUN", SHIPPED, "the test was not given the third program (mie-sandbox-shippedchild)")
 
     return summary()
 

@@ -42,6 +42,10 @@ struct Limits {
     int wall_seconds = kWorkerWallLimitSeconds;
 };
 
+// `allow_weaker`, `test_break_confinement` and `test_without_mitigations` work ONLY in the
+// test build of this library (compile definition MIE_SANDBOX_TEST_HOOKS; library target
+// mie_sandbox_testhooks). In the shipped build they are ignored: nothing, and no environment
+// variable, can make a confined run weaker; it is applied in full or the start fails.
 struct RunOptions {
     // false: the child is started with the limits but without the confinement. Only for
     // tests (the control case that shows a refusal comes from the confinement).

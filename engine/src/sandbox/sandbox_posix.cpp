@@ -270,12 +270,16 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     if (options.confine) {
         environment_store.push_back("MIE_SANDBOX=1");
         environment_store.push_back("MIE_SANDBOX_STATUS_FD=" + std::to_string(kChildStatusFd));
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+        // Test builds only: the two switches a test child reads. In the shipped build these
+        // names are never passed, and the child's code that reads them does not exist.
         if (options.allow_weaker) {
             environment_store.push_back("MIE_SANDBOX_ALLOW_WEAKER=1");
         }
         if (options.test_break_confinement) {
             environment_store.push_back("MIE_SANDBOX_TEST_BREAK=1");
         }
+#endif
     }
     if (inherited != nullptr) {
         environment_store.push_back("MIE_INHERITED_FILE=" + std::to_string(kChildFileFd));
@@ -801,15 +805,14 @@ bool apply_landlock(std::string& what, std::string& why_not) {
 // not permitted" (EPERM), not the death of the process, for this reason: the C library and
 // other libraries try optional calls and take another way when one fails (a refused call is
 // then harmless), and a refused call leaves a worker that can still report what happened.
-// The call is not carried out either way. Two exceptions: a call made through another
-// calling convention KILLS the process (nothing legitimate does that), and clone3 is answered
-// "no such call" because that is the answer on which the C library falls back to clone.
+// The call is not carried out either way. One exception: a call made through another calling
+// convention KILLS the process (nothing legitimate does that).
 //
-// What is allowed is what a worker needs AFTER it has loaded its libraries and its rules:
-// reading and writing descriptors that are already open, memory, its own threads, clocks, its
-// own signals, and ending. Nothing that takes a path, nothing that makes a descriptor,
-// nothing that changes a file through its descriptor, nothing aimed at another process.
-// SANDBOX_NOTES.md has the same list with one line per call.
+// The list is what a TRACE of the real worker shows (reviewer's ruling B-3627), plus a small
+// margin in which every call has one written reason. There is NO call that starts a thread or
+// a process, opens a path or makes a socket: a library that tries to start a thread gets the
+// refusal error from clone / clone3 (pthread_create fails, std::thread throws).
+// SANDBOX_NOTES.md has the same list.
 
 sock_filter stmt(unsigned code, std::uint32_t k) {
     sock_filter instruction{};
@@ -833,11 +836,24 @@ constexpr unsigned kIfAtLeast = BPF_JMP | BPF_JGE | BPF_K;
 constexpr unsigned kIfAnyBit = BPF_JMP | BPF_JSET | BPF_K;
 constexpr unsigned kReturn = BPF_RET | BPF_K;
 
-// The low 32 bits of argument `index` (little-endian: checked in apply_seccomp), and the high.
+// The low 32 bits of argument `index` (little-endian: checked in apply_seccomp).
 std::uint32_t argument_low(unsigned index) {
     return static_cast<std::uint32_t>(offsetof(struct seccomp_data, args) + 8u * index);
 }
-std::uint32_t argument_high(unsigned index) { return argument_low(index) + 4u; }
+
+// Why a call is on the list. engine/tools/sandbox_trace_check.py reads these tags from this
+// file, so every allow line below ends with exactly one of them:
+//   TRACED            seen in a trace of the real worker (OpenSSL, YARA) on the test files;
+//   MARGIN("why")     never seen in a trace; it stays for the ONE reason written there.
+//                     No reason, no call. Nothing that starts a thread or a process, opens a
+//                     path or makes a socket may be a MARGIN call;
+//   SANITIZER("why")  only in a sanitizer build, which is never shipped.
+struct Tag {
+    const char* why;
+};
+constexpr Tag TRACED{nullptr};
+constexpr Tag MARGIN(const char* why) { return Tag{why}; }
+constexpr Tag SANITIZER(const char* why) { return Tag{why}; }
 
 // Builds the filter. Every "allow" block starts with the call number in the accumulator and,
 // when the number is another one, jumps over itself with the number still there; when the
@@ -848,18 +864,14 @@ public:
 
     void raw(sock_filter instruction) { code_.push_back(instruction); }
 
-    void answer(long number, std::uint32_t action) {
+    void allow(long number, Tag) {
         raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 1));
-        raw(stmt(kReturn, action));
-    }
-
-    void allow(long number) {
-        answer(number, SECCOMP_RET_ALLOW);
+        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
         ++allowed_;
     }
 
     // Allowed only if the low 32 bits of argument `index` are one of `values`.
-    void allow_if_argument_is(long number, unsigned index, std::initializer_list<std::uint32_t> values) {
+    void allow_if_argument_is(long number, unsigned index, std::initializer_list<std::uint32_t> values, Tag) {
         const std::size_t count = values.size();
         raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, count + 3));
         raw(stmt(kLoad, argument_low(index)));
@@ -873,39 +885,13 @@ public:
         ++allowed_;
     }
 
-    // Allowed only if argument `index` has at least one bit of `mask`.
-    void allow_if_bits(long number, unsigned index, std::uint32_t mask) {
-        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 4));
-        raw(stmt(kLoad, argument_low(index)));
-        raw(jump(kIfAnyBit, mask, 1, 0));
-        raw(stmt(kReturn, refuse_));
-        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
-        ++allowed_;
-    }
-
     // Allowed only if argument `index` has no bit of `mask`.
-    void allow_unless_bits(long number, unsigned index, std::uint32_t mask) {
+    void allow_unless_bits(long number, unsigned index, std::uint32_t mask, Tag) {
         raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 4));
         raw(stmt(kLoad, argument_low(index)));
         raw(jump(kIfAnyBit, mask, 0, 1));
         raw(stmt(kReturn, refuse_));
         raw(stmt(kReturn, SECCOMP_RET_ALLOW));
-        ++allowed_;
-    }
-
-    // prlimit64(pid, resource, new_limit, old_limit): allowed only for the caller itself
-    // (pid 0 or its own number) and only to READ a limit (new_limit is a null pointer).
-    void allow_reading_own_limits(long number, std::uint32_t own_pid) {
-        raw(jump(kIfEqual, static_cast<std::uint32_t>(number), 0, 9));
-        raw(stmt(kLoad, argument_low(0)));
-        raw(jump(kIfEqual, 0, 1, 0));        // pid 0: on to the pointer check
-        raw(jump(kIfEqual, own_pid, 0, 5));  // another process: refused
-        raw(stmt(kLoad, argument_low(2)));
-        raw(jump(kIfEqual, 0, 0, 3));
-        raw(stmt(kLoad, argument_high(2)));
-        raw(jump(kIfEqual, 0, 0, 1));
-        raw(stmt(kReturn, SECCOMP_RET_ALLOW));
-        raw(stmt(kReturn, refuse_));
         ++allowed_;
     }
 
@@ -918,8 +904,8 @@ private:
     std::size_t allowed_ = 0;
 };
 
-// Installs the filter for the calling thread (the worker has one thread when it calls this).
-// It cannot be removed again and is inherited by every thread the process starts later.
+// Installs the filter for the calling thread (the worker has one thread when it calls this,
+// and can start no other). It cannot be removed again.
 bool apply_seccomp(std::string& what, std::string& why_not) {
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
     why_not = "the seccomp filter is written for little-endian processors only";
@@ -942,107 +928,74 @@ bool apply_seccomp(std::string& what, std::string& why_not) {
     filter.raw(jump(kIfAtLeast, 0x40000000u, 0, 1));
     filter.raw(stmt(kReturn, errno_return(EPERM)));
 #endif
-#ifdef SYS_clone3
-    // clone3 hides its flags behind a pointer the filter cannot read: answered "no such
-    // call", and the C library falls back to clone, which is judged below.
-    filter.answer(SYS_clone3, errno_return(ENOSYS));
-#endif
 
-    // ---- descriptors that are already open: read, write, position, close ------------------
-    filter.allow(SYS_read);    // standard input; the status pipe is write-only
-    filter.allow(SYS_readv);   // the same, several buffers (C library)
-    filter.allow(SYS_pread64); // the handed-over file at an offset (io::File::read_at)
-    filter.allow(SYS_write);   // standard output and error; fails by itself on the read-only file
-    filter.allow(SYS_writev);  // the same, several buffers (C library error messages)
-    filter.allow(SYS_lseek);   // position in an open descriptor (C library streams)
-    filter.allow(SYS_close);   // closing its own descriptors
-    filter.allow(SYS_fstat);   // size and kind of an OPEN descriptor; takes no path
-    // fcntl: only reading a descriptor's flags (F_GETFD = 1, F_GETFL = 3; the C library asks
-    // when it wraps a descriptor in a stream). No duplicating, no changing flags, no locks.
-    filter.allow_if_argument_is(SYS_fcntl, 1, {1u, 3u});
-    // ioctl: only "is this a terminal" (TCGETS = 0x5401), which the C library asks about its
-    // output stream. Every other device control is refused.
-    filter.allow_if_argument_is(SYS_ioctl, 1, {0x5401u});
-
-    // ---- memory ---------------------------------------------------------------------------
-    filter.allow(SYS_brk);     // the allocator's heap
-    filter.allow(SYS_munmap);  // giving memory back
-    filter.allow(SYS_mremap);  // growing an allocation (realloc)
-    filter.allow(SYS_madvise); // the allocator telling the kernel that pages are free
+    // ---- seen in the trace of the real worker (run on set S; 14 calls) ----------------------
+    filter.allow(SYS_read, TRACED);            // standard input: the rules, the tables
+    filter.allow(SYS_pread64, TRACED);         // the handed-over file at an offset
+    filter.allow(SYS_write, TRACED);           // the answer, the status line; fails by itself on the read-only file
+    filter.allow(SYS_close, TRACED);           // its own descriptors
+    filter.allow(SYS_fstat, TRACED);           // size and kind of an OPEN descriptor; takes no path
+    filter.allow(SYS_brk, TRACED);             // the allocator's heap
+    filter.allow(SYS_munmap, TRACED);          // giving memory back
+    filter.allow(SYS_futex, TRACED);           // locks inside the C and C++ libraries (once-only initialisation)
+    filter.allow(SYS_getpid, TRACED);          // its own number (OpenSSL asks; abort)
+    filter.allow(SYS_rt_sigaction, TRACED);    // its own signal handlers
+    filter.allow(SYS_rt_sigprocmask, TRACED);  // its own signal mask
+    filter.allow(SYS_exit_group, TRACED);      // the process ends
 #if MIE_SANITIZER_BUILD
-    filter.allow(SYS_mmap);
-    filter.allow(SYS_mprotect);
+    filter.allow(SYS_mmap, SANITIZER("the runtime maps its shadow memory and may map with any protection"));
+    filter.allow(SYS_prctl, SANITIZER("the runtime names its mappings and reads process settings"));
 #else
-    // New memory and changed protection, but never EXECUTABLE (PROT_EXEC = 4): no code can be
-    // made or loaded after the confinement.
-    filter.allow_unless_bits(SYS_mmap, 2, 0x4u);
-    filter.allow_unless_bits(SYS_mprotect, 2, 0x4u);
-#endif
-
-    // ---- its own threads ------------------------------------------------------------------
-    // clone: a new THREAD of this process (CLONE_THREAD = 0x10000) only, never a new process.
-    filter.allow_if_bits(SYS_clone, 0, 0x00010000u);
-    filter.allow(SYS_futex);            // locks and condition variables
-    filter.allow(SYS_set_robust_list);  // every new thread registers its lock list (C library)
-#ifdef SYS_rseq
-    filter.allow(SYS_rseq);             // every new thread registers this (C library)
-#endif
-    filter.allow(SYS_sched_yield);      // giving up the processor in a busy lock
-    // The set of processors this process may use (the allocator and
-    // std::thread::hardware_concurrency ask): only for itself.
-    filter.allow_if_argument_is(SYS_sched_getaffinity, 0, {0u, own_pid});
-    filter.allow(SYS_getpid);           // its own number (abort, raise)
-    filter.allow(SYS_gettid);           // its own thread number (abort, raise)
-
-    // ---- clocks and sleeping --------------------------------------------------------------
-    filter.allow(SYS_clock_gettime);
-    filter.allow(SYS_clock_getres);
-    filter.allow(SYS_gettimeofday);
-#ifdef SYS_time
-    filter.allow(SYS_time);
-#endif
-    filter.allow(SYS_nanosleep);
-    filter.allow(SYS_clock_nanosleep);
-    filter.allow(SYS_restart_syscall);  // the kernel's own way to resume an interrupted sleep
-
-    // ---- its own signals ------------------------------------------------------------------
-    filter.allow(SYS_rt_sigaction);     // setting its own handlers (abort resets one)
-    filter.allow(SYS_rt_sigprocmask);   // blocking signals in its own threads
-    filter.allow(SYS_rt_sigreturn);     // coming back from a handler
-    // tgkill: a signal to a thread of THIS process only (abort, raise). kill, tkill and the
-    // other signal calls are not allowed at all.
-    filter.allow_if_argument_is(SYS_tgkill, 0, {own_pid});
-
-    // ---- other --------------------------------------------------------------------------
-    filter.allow(SYS_getrandom);        // random bytes from the kernel, no file involved
-    filter.allow_reading_own_limits(SYS_prlimit64, own_pid);
+    // New memory, but never EXECUTABLE (PROT_EXEC = 4): no code can be made after the confinement.
+    filter.allow_unless_bits(SYS_mmap, 2, 0x4u, TRACED);
     // prctl: only the three questions describe_self() asks (PR_GET_DUMPABLE = 3,
     // PR_GET_SECCOMP = 21, PR_GET_NO_NEW_PRIVS = 39). Nothing can be set.
-    filter.allow_if_argument_is(SYS_prctl, 0, {3u, 21u, 39u});
-    filter.allow(SYS_exit);             // a thread ends
-    filter.allow(SYS_exit_group);       // the process ends
+    filter.allow_if_argument_is(SYS_prctl, 0, {3u, 21u, 39u}, TRACED);
+#endif
+
+    // ---- the margin: never seen in a trace; one reason each ---------------------------------
+    filter.allow(SYS_rt_sigreturn, MARGIN("the kernel's return path from a signal handler: a process that has a handler (rt_sigaction is traced) cannot avoid it"));
+    filter.allow(SYS_restart_syscall, MARGIN("the kernel's own way to resume an interrupted wait (futex is traced) after the process was stopped and continued: the process does not choose to make it"));
+    filter.allow(SYS_clock_gettime, MARGIN("reading a clock: normally answered without a system call (vDSO); this is the fallback on machines whose clock source has none, and a refusal would give the worker a wrong time silently"));
+    filter.allow(SYS_getrandom, MARGIN("OpenSSL seeds its random generator on first need; refused, it tries to open /dev/urandom, which is refused, and the operation fails; takes no path, gives no descriptor"));
+    filter.allow(SYS_mremap, MARGIN("realloc of a large block; refused, the C library copies instead and needs twice the memory for a moment, which changes what fits under the memory limit; expected in the trace of the large files"));
+    filter.allow(SYS_writev, MARGIN("the C++ stream library writes a buffer plus new data with one writev, and the C library prints its fatal messages with it; same open descriptors as write; refused, an answer written through a stream is cut"));
+    filter.allow(SYS_gettid, MARGIN("abort() and assert() ask for their own thread number before they signal it (see tgkill); answers a number, changes nothing"));
+    // tgkill: only to THIS process (first argument = its own number).
+    filter.allow_if_argument_is(SYS_tgkill, 0, {own_pid}, MARGIN("abort() and assert(): a signal to its own thread, checked to be this process; refused, abort falls back to a halt instruction and the crash is reported as signal 11 instead of 6"));
 
 #if MIE_SANITIZER_BUILD
     // ---- SANITIZER BUILD ONLY: never in a shipped program ----------------------------------
-    // The sanitizer runtime reads /proc, sets an alternate signal stack and asks about the
-    // machine while the program runs. This wider list exists so that the sanitizer job can
-    // run the same tests; the text in `what` says so, so no log can pass for the shipped one.
-    filter.allow(SYS_openat);
-    filter.allow(SYS_readlinkat);
-    filter.allow(SYS_newfstatat);
-    filter.allow(SYS_getdents64);
-    filter.allow(SYS_sigaltstack);
-    filter.allow(SYS_sysinfo);
-    filter.allow(SYS_uname);
-    filter.allow(SYS_getrusage);
-    filter.allow(SYS_mincore);
-    filter.allow(SYS_mlock);
-    filter.allow(SYS_munlock);
+    // The sanitizer runtime works while the program runs: it protects and releases memory,
+    // sets an alternate signal stack, reads /proc and asks about the machine. This WIDER list
+    // exists so that the sanitizer job can run the same tests; the text in `what` says so, so
+    // no log can pass for the shipped filter. Paths can be opened here: in this build "no file
+    // by path" rests on Landlock alone.
+    filter.allow(SYS_mprotect, SANITIZER("runtime: guard pages and shadow memory"));
+    filter.allow(SYS_madvise, SANITIZER("runtime: its allocator gives pages back"));
+    filter.allow(SYS_sigaltstack, SANITIZER("runtime: alternate signal stack"));
+    filter.allow(SYS_sched_yield, SANITIZER("runtime: its spin locks"));
+    filter.allow(SYS_nanosleep, SANITIZER("runtime: waits in its locks and at a report"));
+    filter.allow(SYS_clock_nanosleep, SANITIZER("runtime: the same, newer C library"));
+    filter.allow(SYS_openat, SANITIZER("runtime: reads /proc/self/maps and similar"));
+    filter.allow(SYS_readlinkat, SANITIZER("runtime: finds its own program for reports"));
+    filter.allow(SYS_newfstatat, SANITIZER("runtime: file questions while reading /proc"));
+    filter.allow(SYS_getdents64, SANITIZER("runtime: lists /proc/self/task"));
+    filter.allow(SYS_lseek, SANITIZER("runtime: reading /proc files"));
+    filter.allow(SYS_sysinfo, SANITIZER("runtime: memory of the machine"));
+    filter.allow(SYS_uname, SANITIZER("runtime: kernel version"));
+    filter.allow(SYS_getrusage, SANITIZER("runtime: its memory statistics"));
+    filter.allow(SYS_prlimit64, SANITIZER("runtime: reads the stack and address-space limits"));
+    filter.allow(SYS_sched_getaffinity, SANITIZER("runtime: number of processors"));
+    filter.allow(SYS_mincore, SANITIZER("runtime: checks whether memory is mapped"));
+    filter.allow(SYS_mlock, SANITIZER("runtime"));
+    filter.allow(SYS_munlock, SANITIZER("runtime"));
+    filter.allow(SYS_exit, SANITIZER("runtime: a thread of the runtime ends"));
 #ifdef SYS_readlink
-    filter.allow(SYS_readlink);
+    filter.allow(SYS_readlink, SANITIZER("runtime: finds its own program for reports"));
 #endif
 #ifdef SYS_getrlimit
-    filter.allow(SYS_getrlimit);
+    filter.allow(SYS_getrlimit, SANITIZER("runtime: reads the stack limit"));
 #endif
 #endif
 
@@ -1104,22 +1057,32 @@ void tell_parent(bool ok, const std::string& text) {
     ::close(fd);
 }
 
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+// Test builds only (reviewer's finding SB-1): the shipped library does not read these.
 bool flag_set(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
+#endif
 
 }  // namespace
 
 bool enter_confinement(std::string& what_applied, std::string& error) {
     what_applied.clear();
     error.clear();
-    const bool allow_weaker = flag_set("MIE_SANDBOX_ALLOW_WEAKER");
+    // The two test switches exist only in the test build of this library. In the shipped
+    // build nothing in the environment can weaken or skip the confinement.
+    bool allow_weaker = false;
+    bool test_break = false;
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+    allow_weaker = flag_set("MIE_SANDBOX_ALLOW_WEAKER");
+    test_break = flag_set("MIE_SANDBOX_TEST_BREAK");
+#endif
     std::vector<std::string> applied;
     std::vector<std::string> missing;   // required parts that could not be applied
     std::vector<std::string> remarks;   // optional parts that are not there
 
-    if (flag_set("MIE_SANDBOX_TEST_BREAK")) {
+    if (test_break) {
         missing.push_back("test hook: the confinement was deliberately not applied");
     } else {
         // no-new-privileges (also set by the parent before exec; repeated so that a worker

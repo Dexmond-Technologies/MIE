@@ -95,22 +95,34 @@ target_link_libraries(mie_core PUBLIC nlohmann_json::nlohmann_json PRIVATE OpenS
 
 # ---- worker confinement ---------------------------------------------------------------
 if(WIN32)
-  add_library(mie_sandbox STATIC src/sandbox/sandbox_win.cpp)
-  target_link_libraries(mie_sandbox PUBLIC mie_core PRIVATE userenv advapi32 Threads::Threads)
+  set(MIE_SANDBOX_SOURCE src/sandbox/sandbox_win.cpp)
+  set(MIE_SANDBOX_SYSTEM_LIBS userenv advapi32)
 else()
-  add_library(mie_sandbox STATIC src/sandbox/sandbox_posix.cpp)
-  target_link_libraries(mie_sandbox PUBLIC mie_core PRIVATE Threads::Threads)
+  set(MIE_SANDBOX_SOURCE src/sandbox/sandbox_posix.cpp)
+  set(MIE_SANDBOX_SYSTEM_LIBS "")
 endif()
-target_include_directories(mie_sandbox PUBLIC include)
+# Shipped: no test switches (reviewer's finding SB-1).
+add_library(mie_sandbox STATIC ${MIE_SANDBOX_SOURCE})
+# Tests only: the same source with the test switches compiled in. Never linked into a shipped program.
+add_library(mie_sandbox_testhooks STATIC ${MIE_SANDBOX_SOURCE})
+target_compile_definitions(mie_sandbox_testhooks PRIVATE MIE_SANDBOX_TEST_HOOKS=1)
+foreach(lib mie_sandbox mie_sandbox_testhooks)
+  target_include_directories(${lib} PUBLIC include)
+  target_link_libraries(${lib} PUBLIC mie_core PRIVATE ${MIE_SANDBOX_SYSTEM_LIBS} Threads::Threads)
+endforeach()
 
 # Test programs of the confinement: never installed, never packaged.
 add_executable(mie-sandbox-testchild src/sandbox/testchild.cpp)
-target_link_libraries(mie-sandbox-testchild PRIVATE mie_sandbox mie_core)
+target_link_libraries(mie-sandbox-testchild PRIVATE mie_sandbox_testhooks mie_core)
+# The same test child built with the SHIPPED library: must ignore the test switches.
+add_executable(mie-sandbox-shippedchild src/sandbox/testchild.cpp)
+target_link_libraries(mie-sandbox-shippedchild PRIVATE mie_sandbox mie_core)
 if(WIN32)
   target_link_libraries(mie-sandbox-testchild PRIVATE ws2_32)
+  target_link_libraries(mie-sandbox-shippedchild PRIVATE ws2_32)
 endif()
 add_executable(mie-sandbox-testparent src/sandbox/testparent.cpp)
-target_link_libraries(mie-sandbox-testparent PRIVATE mie_sandbox mie_core)
+target_link_libraries(mie-sandbox-testparent PRIVATE mie_sandbox_testhooks mie_core)
 
 # ---- reader for Windows executables (own code, standard library only) --------------
 add_library(mie_pe STATIC src/pe/pe_reader.cpp)
@@ -249,7 +261,8 @@ if(MIE_BUILD_TESTS)
   set_tests_properties(strings_parity PROPERTIES TIMEOUT 600)
   add_test(NAME sandbox_cases
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/sandbox_cases.py
-                   $<TARGET_FILE:mie-sandbox-testparent> $<TARGET_FILE:mie-sandbox-testchild>)
+                   $<TARGET_FILE:mie-sandbox-testparent> $<TARGET_FILE:mie-sandbox-testchild>
+                   $<TARGET_FILE:mie-sandbox-shippedchild>)
   set_tests_properties(sandbox_cases PROPERTIES TIMEOUT 600)
   add_test(NAME pe_parity
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pe_parity.py

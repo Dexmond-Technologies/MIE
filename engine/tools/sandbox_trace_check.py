@@ -20,11 +20,14 @@ program run without the filter that marks the point some other way); `--whole` c
 call of every process.
 
 Result, one line each:
-  USED AND ALLOWED      the call is on the list
+  USED AND ALLOWED      the call is on the list, tagged TRACED
+  USED, TAGGED MARGIN   the call is on the list as a margin call and was now seen: retag it TRACED
   USED, NOT ON THE LIST the call was made after the starting point and is not on the list  -> FAIL
   REFUSED BY ARGUMENT   the call is on the list but this use was refused (EPERM)           -> FAIL
-  ALLOWED, NEVER USED   on the list, not seen in this trace (a candidate for removal; one
-                        trace does not prove a call is never needed)
+  WARNING               tagged TRACED but not seen in this trace (not a failure: a file set
+                        may not exercise it)
+  MARGIN, NOT USED      a margin call, with the one reason written in the source
+  ALLOWED WITHOUT A TAG / MARGIN WITHOUT A REASON   the source line lacks its tag             -> FAIL
 Exit code 0: every call used is allowed. 1: a FAIL line. 2: the check could not be run
 (strace missing, starting point never seen, list not readable); never counted as passed.
 """
@@ -39,7 +42,6 @@ import tempfile
 SECCOMP_LINE = r"prctl\(PR_SET_SECCOMP, SECCOMP_MODE_FILTER.*=\s*0\s*$"
 # Calls the filter answers on purpose without allowing them; seeing them refused is expected.
 ANSWERED_ON_PURPOSE = {
-    "clone3": "answered ENOSYS so that the C library falls back to clone",
     "newfstatat": "refused on purpose: it takes a path. Newer C libraries ask the kind of an open stream "
                   "this way; the stream works without the answer. If the worker itself needs it, that is "
                   "a finding, not something to allow",
@@ -48,11 +50,17 @@ ANSWERED_ON_PURPOSE = {
 # for an empty program are on the list like any other; nothing is exempt here.
 
 
+ALLOW_LINE = re.compile(r"filter\.allow\w*\(\s*SYS_(\w+)\b")
+TAG = re.compile(r"\b(TRACED|MARGIN|SANITIZER)\b(?:\(\s*\"((?:[^\"\\\\]|\\\\.)*)\"\s*\))?\s*\)\s*;")
+
+
 def allow_list(source_path):
-    """The names in filter.allow*(SYS_name ...) of the SHIPPED filter: the lines inside
+    """The calls of the SHIPPED filter: name -> (tag, reason). The tag is TRACED (seen in a
+    trace of the real worker), MARGIN (never seen; the reason is the text in the source) or
+    None when the line carries no tag, which is an error. The lines inside
     `#if MIE_SANITIZER_BUILD` (up to its #else / #endif) are the sanitizer build's and are
     left out."""
-    names = set()
+    calls = {}
     skipping_depth = None  # nesting depth at which a sanitizer-only part began
     depth = 0
     with open(source_path, encoding="utf-8") as handle:
@@ -74,10 +82,11 @@ def allow_list(source_path):
                 continue
             if skipping_depth is not None:
                 continue
-            found = re.search(r"filter\.allow\w*\(\s*SYS_(\w+)", line)
+            found = ALLOW_LINE.search(line)
             if found:
-                names.add(found.group(1))
-    return names
+                tag = TAG.search(line)
+                calls[found.group(1)] = (tag.group(1), tag.group(2) or "") if tag else (None, "")
+    return calls
 
 
 LINE = re.compile(r"^(?P<pid>\d+)\s+(?:<\.\.\. (?P<resumed>\w+) resumed>|(?P<name>\w+)\()(?P<rest>.*)$")
@@ -157,11 +166,26 @@ def main():
         return 2
 
     failed = False
+    for name in sorted(allowed):
+        tag, reason = allowed[name]
+        if tag is None:
+            failed = True
+            print("ALLOWED WITHOUT A TAG %-20s the source line has neither TRACED nor MARGIN(\"reason\")" % name)
+        elif tag == "SANITIZER":
+            failed = True
+            print("SANITIZER CALL IN THE SHIPPED LIST %-20s" % name)
+        elif tag == "MARGIN" and not reason.strip():
+            failed = True
+            print("MARGIN WITHOUT A REASON %-20s" % name)
     for name in sorted(used):
         if name in allowed:
+            tag = allowed[name][0]
             if name in refused:
                 failed = True
                 print("REFUSED BY ARGUMENT   %-20s used %d times; example: %s" % (name, used[name], refused[name]))
+            elif tag == "MARGIN":
+                print("USED, TAGGED MARGIN   %-20s used %d times: now seen in a trace, retag it TRACED" % (
+                    name, used[name]))
             else:
                 print("USED AND ALLOWED      %-20s used %d times" % (name, used[name]))
         elif name in ANSWERED_ON_PURPOSE:
@@ -170,10 +194,19 @@ def main():
             failed = True
             print("USED, NOT ON THE LIST %-20s used %d times%s" % (
                 name, used[name], "; example: " + refused[name] if name in refused else ""))
-    for name in sorted(allowed - set(used)):
-        print("ALLOWED, NEVER USED   %s" % name)
-    print("sandbox_trace_check: %d calls used after the starting point, %d on the list, %d allowed never used: %s"
-          % (len(used), len(allowed), len(allowed - set(used)), "FAIL" if failed else "PASS"))
+    for name in sorted(allowed):
+        tag, reason = allowed[name]
+        if name in used:
+            continue
+        if tag == "TRACED":
+            print("WARNING               %-20s tagged TRACED but not seen in THIS trace (this command or "
+                  "file set may not exercise it)" % name)
+        elif tag == "MARGIN":
+            print("MARGIN, NOT USED      %-20s reason: %s" % (name, reason))
+    traced = sum(1 for tag, _ in allowed.values() if tag == "TRACED")
+    margin = sum(1 for tag, _ in allowed.values() if tag == "MARGIN")
+    print("sandbox_trace_check: %d calls used after the starting point; the list has %d (TRACED %d, MARGIN %d): %s"
+          % (len(used), len(allowed), traced, margin, "FAIL" if failed else "PASS"))
     return 1 if failed else 0
 
 

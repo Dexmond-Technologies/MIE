@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -261,8 +263,10 @@ void try_write_handle(Line& line) {
     line.flag("wrote", done != FALSE && written == 1);
     line.number("error", done ? 0 : static_cast<long long>(::GetLastError()));
 #else
+    // write(), which the filter allows: the refusal must come from the descriptor itself
+    // (opened read-only: error 9, "bad file descriptor"), not from the filter.
     errno = 0;
-    const ssize_t written = ::pwrite(static_cast<int>(number), "x", 1, 0);
+    const ssize_t written = ::write(static_cast<int>(number), "x", 1);
     line.flag("wrote", written == 1);
     line.number("error", written == 1 ? 0 : errno);
 #endif
@@ -311,11 +315,60 @@ static_assert(sizeof(HandleEntry) == 40, "handle entry layout (64-bit)");
 static_assert(sizeof(HandleSnapshotHeader) == 16, "handle snapshot header layout (64-bit)");
 #endif
 using QueryProcessFunction = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+// NtQueryObject: the type (class 2) and the name (class 1) of an object behind a handle. Both
+// answers begin with a counted wide string (the native UNICODE_STRING), whose text follows in
+// the same buffer.
+using QueryObjectFunction = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+struct NativeString {
+    USHORT length;   // bytes
+    USHORT maximum;  // bytes
+    PWSTR text;
+};
+#if defined(_WIN64)
+static_assert(sizeof(NativeString) == 16, "native string layout (64-bit)");
+#endif
+
+// The call itself, guarded: should a handle from the system's list be gone or refuse the
+// question with an exception (invalid-handle use ends an AppContainer process), the exception
+// is caught and reported as a failure of this one question. No C++ object lives in here.
+LONG guarded_query_object(QueryObjectFunction query, HANDLE handle, ULONG what, void* buffer, ULONG size) {
+    __try {
+        ULONG needed = 0;
+        return query(handle, what, buffer, size, &needed);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return static_cast<LONG>(0xC0000008u);
+    }
+}
+
+// The answer of NtQueryObject as UTF-8 text; empty with ok = false if the system refused.
+std::string object_text(QueryObjectFunction query, HANDLE handle, ULONG what, bool& ok) {
+    std::vector<unsigned char> buffer(4096);
+    ok = false;
+    if (query == nullptr || guarded_query_object(query, handle, what, buffer.data(),
+                                                 static_cast<ULONG>(buffer.size())) != 0) {
+        return {};
+    }
+    NativeString text{};
+    std::memcpy(&text, buffer.data(), sizeof text);
+    ok = true;
+    if (text.text == nullptr || text.length == 0) {
+        return {};
+    }
+    const int wide = text.length / static_cast<int>(sizeof(wchar_t));
+    const int size = ::WideCharToMultiByte(CP_UTF8, 0, text.text, wide, nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<std::size_t>(size > 0 ? size : 0), '\0');
+    if (size > 0) {
+        ::WideCharToMultiByte(CP_UTF8, 0, text.text, wide, out.data(), size, nullptr, nullptr);
+    }
+    return out;
+}
 #endif
 
 // Lists what this process holds that it got from its parent.
-//   Linux: every open descriptor (asked one by one with fcntl F_GETFD, the only way left once
-//     paths cannot be opened), and how the handed-over file is open.
+//   Linux: every open descriptor, asked one by one with the system call fstat (on the allow
+//     list; made directly so that the C library cannot turn it into a call that takes a path),
+//     for every number below 2^20, the kernel's default ceiling for descriptor numbers.
 //   Windows: the system's own list of this process's handles, and which of them are marked
 //     inheritable. A handle a process inherits keeps that mark; the handles Windows itself
 //     opens in every new process, and the ones the program opens, do not have it. So
@@ -368,18 +421,64 @@ void list_inherited(Line& line) {
         line.text("method", "count only: the system's handle list does not have the expected layout");
         return;
     }
+    // For every handle of the list: its TYPE, if the system tells it in here. For a File that
+    // is a disk file or folder, and for a Key, also its NAME. Names are NOT asked for pipes,
+    // consoles, devices and sockets (asking a pipe for its name can wait for ever), nor for
+    // other types (events, sections, threads, ... mostly have none).
+    const QueryObjectFunction query_object =
+        reinterpret_cast<QueryObjectFunction>(::GetProcAddress(ntdll, "NtQueryObject"));
+    std::map<std::string, int> types;
+    std::string names;
     long long file_access = -1;
+    int types_refused = 0;
+    int names_skipped = 0;
     for (std::size_t i = 0; i < header.number_of_handles; ++i) {
         HandleEntry entry{};
         std::memcpy(&entry, buffer.data() + sizeof header + i * sizeof(HandleEntry), sizeof entry);
         const auto value = reinterpret_cast<std::uintptr_t>(entry.value);
-        if ((entry.attributes & 0x2u) != 0) {
+        const bool inheritable = (entry.attributes & 0x2u) != 0;
+        if (inheritable) {
             list += (list.empty() ? "" : ",") + std::to_string(value);
         }
         if (file >= 0 && value == static_cast<std::uintptr_t>(file)) {
             file_access = entry.granted_access;
         }
+        bool ok = false;
+        const std::string type = object_text(query_object, entry.value, 2 /* type */, ok);
+        if (!ok) {
+            ++types_refused;
+            ++types["(type not given by the system)"];
+            continue;
+        }
+        ++types[type];
+        std::string name;
+        bool name_asked = false;
+        if (type == "Key" || (type == "File" && ::GetFileType(entry.value) == FILE_TYPE_DISK)) {
+            name_asked = true;
+            name = object_text(query_object, entry.value, 1 /* name */, ok);
+            if (!ok) {
+                name = "(name not given by the system)";
+            }
+        } else if (type == "File") {
+            ++names_skipped;
+            name = "(pipe, console, device or socket: name not asked)";
+        }
+        if (name_asked || type == "File") {
+            char access[32];
+            std::snprintf(access, sizeof access, "0x%lx", static_cast<unsigned long>(entry.granted_access));
+            names += (names.empty() ? "" : ",") +
+                     json_text(type + " " + std::to_string(value) + (inheritable ? " INHERITED" : "") +
+                               " access " + access + ": " + name);
+        }
     }
+    std::string type_table;
+    for (const auto& [type, count] : types) {
+        type_table += (type_table.empty() ? "" : ",") + json_text(type) + ":" + std::to_string(count);
+    }
+    line.raw("handle_types", "{" + type_table + "}");
+    line.raw("file_and_key_handles", "[" + names + "]");
+    line.number("types_refused", types_refused);
+    line.number("file_names_not_asked", names_skipped);
     line.text("method", "NtQueryInformationProcess(ProcessHandleInformation)");
     line.number("total_handles", static_cast<long long>(header.number_of_handles));
     line.raw("inheritable_handles", "[" + list + "]");
@@ -387,25 +486,16 @@ void list_inherited(Line& line) {
     line.flag("file_handle_can_write",
               file_access >= 0 && (file_access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
 #else
-    long highest = 1L << 20;
-    struct rlimit limit {};
-    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_max != RLIM_INFINITY &&
-        limit.rlim_max < static_cast<rlim_t>(highest)) {
-        highest = static_cast<long>(limit.rlim_max);
-    }
+    const long highest = 1L << 20;
     for (long fd = 0; fd < highest; ++fd) {
-        if (::fcntl(static_cast<int>(fd), F_GETFD) != -1) {
+        unsigned char answer[512];  // room for the kernel's answer; only success or failure is used
+        if (::syscall(SYS_fstat, static_cast<int>(fd), answer) == 0) {
             list += (list.empty() ? "" : ",") + std::to_string(fd);
         }
     }
     line.raw("open_descriptors", "[" + list + "]");
     line.number("scanned", highest);
-    const long long file = inherited_number();
-    line.number("file_descriptor", file);
-    const int mode = file >= 0 ? ::fcntl(static_cast<int>(file), F_GETFL) : -1;
-    line.text("file_access", mode == -1 ? "unknown"
-                             : (mode & O_ACCMODE) == O_RDONLY ? "read-only"
-                             : (mode & O_ACCMODE) == O_WRONLY ? "write-only" : "read-write");
+    line.number("file_descriptor", inherited_number());
 #endif
 }
 

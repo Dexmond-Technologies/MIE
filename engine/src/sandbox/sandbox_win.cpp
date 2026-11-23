@@ -371,13 +371,25 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         return result;
     };
 
+    // The test switches of RunOptions work only in the test build of this library (reviewer's
+    // finding SB-1). In the shipped build they are not looked at: the confinement is applied
+    // in full or the start fails, and the two MIE_SANDBOX_* test names are never passed on.
+    bool hook_allow_weaker = false;
+    bool hook_break = false;
+    bool hook_without_policies = false;
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+    hook_allow_weaker = options.allow_weaker;
+    hook_break = options.test_break_confinement;
+    hook_without_policies = options.test_without_mitigations;
+#endif
+
     // ---- the AppContainer --------------------------------------------------------------
     std::string container_text = "none (confinement not requested)";
     bool in_container = false;
     if (options.confine) {
         std::string how;
         std::string why_not;
-        if (options.test_break_confinement) {
+        if (hook_break) {
             why_not = "test hook: the confinement was deliberately not applied";
         } else {
             sid = container_sid(how, why_not);
@@ -385,7 +397,7 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
         if (sid != nullptr) {
             in_container = true;
             container_text = "appcontainer (no capabilities; " + how + ")";
-        } else if (options.allow_weaker) {
+        } else if (hook_allow_weaker) {
             container_text = "WEAKER: no AppContainer: " + why_not;
         } else {
             return fail_start("the worker's AppContainer could not be set up: " + why_not);
@@ -512,14 +524,14 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
 #endif
     if (in_container && !not_built.empty()) {
         // The Windows headers this was built with lack a policy: never silently without it.
-        if (!options.allow_weaker) {
+        if (!hook_allow_weaker) {
             return fail_start("this build lacks:" + not_built);
         }
         container_text += " WEAKER: built without:" + not_built;
     }
     // Test hook: start in the container WITHOUT the policies, to tell whether a policy is
     // what keeps a child from starting. The result says WEAKER.
-    const bool with_policies = in_container && !options.test_without_mitigations;
+    const bool with_policies = in_container && !hook_without_policies;
     if (in_container && !with_policies) {
         container_text += " WEAKER: test hook: no mitigation or child-process policy";
     }
@@ -574,9 +586,11 @@ ChildResult run_confined(const std::filesystem::path& program, const std::vector
     variables.erase(std::remove_if(variables.begin(), variables.end(), starts_with_mie), variables.end());
     if (options.confine) {
         variables.push_back(L"MIE_SANDBOX=1");
-        if (options.allow_weaker) {
-            variables.push_back(L"MIE_SANDBOX_ALLOW_WEAKER=1");
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+        if (hook_allow_weaker) {
+            variables.push_back(L"MIE_SANDBOX_ALLOW_WEAKER=1");  // test builds only
         }
+#endif
     }
     if (file_copy != nullptr) {
         variables.push_back(L"MIE_INHERITED_FILE=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(file_copy)));
@@ -788,6 +802,7 @@ struct SelfState {
     bool appcontainer = false;
     DWORD integrity = 0;
     bool in_job = false;
+    int capabilities = -1;  // capability SIDs in the token; -1 = could not be read
 };
 
 SelfState self_state() {
@@ -809,6 +824,14 @@ SelfState self_state() {
         if (count > 0) {
             state.integrity = *::GetSidSubAuthority(label->Label.Sid, static_cast<DWORD>(count - 1));
         }
+    }
+    // The capabilities are what would let a container use the network (internetClient,
+    // privateNetworkClientServer, ...). The worker is created with none.
+    std::vector<unsigned char> capability_store(4096);
+    if (::GetTokenInformation(token, TokenCapabilities, capability_store.data(),
+                              static_cast<DWORD>(capability_store.size()), &size)) {
+        state.capabilities =
+            static_cast<int>(reinterpret_cast<const TOKEN_GROUPS*>(capability_store.data())->GroupCount);
     }
     ::CloseHandle(token);
     BOOL in_job = FALSE;
@@ -833,10 +856,13 @@ bool enter_confinement(std::string& what_applied, std::string& error) {
     error = !state.known          ? "the process token could not be read"
             : !state.appcontainer ? "this process does not run in an AppContainer"
                                   : "this process is not in a job object";
+#if defined(MIE_SANDBOX_TEST_HOOKS)
+    // Test builds only: the shipped library does not read this name.
     if (environment_value(L"MIE_SANDBOX_ALLOW_WEAKER") == L"1") {
         what_applied += " WEAKER: " + error;
         return true;
     }
+#endif
     return false;
 }
 
@@ -845,7 +871,7 @@ std::string describe_self() {
     char integrity[32];
     std::snprintf(integrity, sizeof integrity, "0x%lx", static_cast<unsigned long>(state.integrity));
     return std::string("appcontainer=") + (state.appcontainer ? "1" : "0") + " integrity=" + integrity +
-           " in_job=" + (state.in_job ? "1" : "0");
+           " in_job=" + (state.in_job ? "1" : "0") + " capabilities=" + std::to_string(state.capabilities);
 }
 
 }  // namespace mie::sandbox
