@@ -76,6 +76,10 @@ std::string json_result(const mie::sandbox::ChildResult& result) {
            ",\"profile_create_ms\":" + std::to_string(result.profile_create_ms) +
            ",\"profile_delete_ms\":" + std::to_string(result.profile_delete_ms) +
            ",\"profile_removal\":" + json_text(result.profile_removal) +
+           ",\"timeline\":{\"process_ended_ms\":" + std::to_string(result.timeline.process_ended_ms) +
+           ",\"output_drained_ms\":" + std::to_string(result.timeline.output_drained_ms) +
+           ",\"job_closed_ms\":" + std::to_string(result.timeline.job_closed_ms) +
+           ",\"returned_ms\":" + std::to_string(result.timeline.returned_ms) + "}" +
            ",\"peak_memory_bytes\":" + std::to_string(result.peak_memory_bytes) + ",\"seconds\":" + seconds + "}";
 }
 
@@ -203,6 +207,8 @@ int run_waiting(const WaitingRun& run) {
                  ",\"second_hand_over_error\":" + json_text(second_error);
     }
     const sandbox::ChildResult result = sandbox::collect(*worker, run.limits);
+    // The profile's clean-up, AFTER the result, as the host does it.
+    extra += ",\"retired\":" + json_retired(sandbox::retire(*worker));
     std::string line = json_result(result);
     line.pop_back();  // reopen the object
     line += extra + ",\"failure_text\":" + json_text(sandbox::failure(*worker)) + "}";
@@ -211,6 +217,12 @@ int run_waiting(const WaitingRun& run) {
 }
 
 }  // namespace
+
+std::string json_retired(const mie::sandbox::Retired& retired) {
+    return std::string("{\"removed\":") + (retired.removed ? "true" : "false") + ",\"text\":" + json_text(retired.text) +
+           ",\"emptied_ms\":" + std::to_string(retired.emptied_ms) + ",\"deleted_ms\":" +
+           std::to_string(retired.deleted_ms) + ",\"total_ms\":" + std::to_string(retired.total_ms) + "}";
+}
 
 std::string json_list(const std::vector<std::string>& items) {
     std::string out;
@@ -311,6 +323,7 @@ int run_cross(const std::string& child, const std::string& file_path, const mie:
         *worker_a, *file,
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(job_a.data()), job_a.size()), error_a);
     const sandbox::ChildResult result_a = sandbox::collect(*worker_a, limits);
+    const sandbox::Retired retired_a = sandbox::retire(*worker_a);  // A's profile goes now
     // What is on disk now, seen by THIS (unconfined) process, after A has ended.
     std::string on_disk;
     for (const std::string& path : paths) {
@@ -327,14 +340,16 @@ int run_cross(const std::string& child, const std::string& file_path, const mie:
         *worker_b, *file,
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(job_a.data()), job_a.size()), error_b);
     const sandbox::ChildResult result_b = sandbox::collect(*worker_b, limits);
+    const sandbox::Retired retired_b = sandbox::retire(*worker_b);
     std::printf("{\"folder_a\":%s,\"folder_b\":%s,\"handed_a\":%s,\"error_a\":%s,\"handed_b\":%s,\"error_b\":%s,"
                 "\"on_disk_after_a\":{%s},\"folder_a_exists_after_a\":%s,\"folder_b_exists_after_b\":%s,"
-                "\"a\":%s,\"b\":%s}\n",
+                "\"a\":%s,\"b\":%s,\"retired_a\":%s,\"retired_b\":%s}\n",
                 json_text(folder_a).c_str(), json_text(folder_b).c_str(), handed_a ? "true" : "false",
                 json_text(error_a).c_str(), handed_b ? "true" : "false", json_text(error_b).c_str(), on_disk.c_str(),
                 folder_a_after ? "true" : "false",
                 (!folder_b.empty() && std::filesystem::exists(folder_b, ignored)) ? "true" : "false",
-                json_result(result_a).c_str(), json_result(result_b).c_str());
+                json_result(result_a).c_str(), json_result(result_b).c_str(),
+                json_retired(retired_a).c_str(), json_retired(retired_b).c_str());
     return 0;
 }
 

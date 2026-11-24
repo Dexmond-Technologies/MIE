@@ -88,6 +88,17 @@ struct ChildResult {
     double profile_create_ms = 0.0;
     double profile_delete_ms = 0.0;
     std::string profile_removal;
+    // collect() only: moments after the hand-over, in milliseconds (-1 = not reached / not
+    // measured on this system). process_ended: the parent saw the worker's end; output_drained:
+    // its pipes were read to the end; job_closed (Windows): the job and process handles are
+    // closed; returned: collect() is about to return. The profile's clean-up is NOT in here:
+    // it is retire()'s (see Retired).
+    struct Timeline {
+        double process_ended_ms = -1.0;
+        double output_drained_ms = -1.0;
+        double job_closed_ms = -1.0;
+        double returned_ms = -1.0;
+    } timeline;
     std::uint64_t peak_memory_bytes = 0;  // measured by the system, not by the child (0 = unknown)
     double seconds = 0.0;                 // wall time from start to end
 };
@@ -260,6 +271,23 @@ ChildResult collect(WaitingChild& child, const Limits& limits);
 
 // Ends a worker that was never used (its rules are out of date, it is too old).
 void end_waiting(WaitingChild& child);
+
+// Windows: deletes the worker's own AppContainer profile (its folder emptied without following
+// any link, then DeleteAppContainerProfile). To be called by the host AFTER collect() or
+// end_waiting(), once the result is delivered: it is the slow part of a worker's end and is
+// kept out of collect()'s time. Ends the worker first if it still runs, so a profile is never
+// deleted under a live worker. Once per worker; a later call reports "already retired". The
+// WaitingChild's destructor does it for a worker the host did not retire. A profile that
+// cannot be deleted is left behind and reported; the sweep at the next start retries. Linux:
+// nothing to delete (the worker has no profile).
+struct Retired {
+    bool removed = false;
+    std::string text;
+    double emptied_ms = -1.0;  // emptying its folder
+    double deleted_ms = -1.0;  // DeleteAppContainerProfile
+    double total_ms = -1.0;
+};
+Retired retire(WaitingChild& child);
 
 // What was applied when the worker started: on Linux what the worker itself reported at
 // stage 1, on Windows what the parent applied when it created the process.

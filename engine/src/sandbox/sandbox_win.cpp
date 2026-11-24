@@ -455,7 +455,8 @@ std::string own_folder_note(const std::wstring& name) {
 
 // Deletes a worker's profile: first everything in its folder, without following anything,
 // then the profile itself (registry key and folder). `milliseconds`: the time it took.
-std::string remove_worker_profile(const std::wstring& name, double& milliseconds, bool& removed) {
+std::string remove_worker_profile(const std::wstring& name, double& milliseconds, bool& removed,
+                                  double* emptied_ms = nullptr) {
     const auto before = std::chrono::steady_clock::now();
     removed = false;
     std::string text;
@@ -479,6 +480,9 @@ std::string remove_worker_profile(const std::wstring& name, double& milliseconds
             may_delete = false;
             why = std::to_string(state.failed) + " entries could not be removed";
         }
+    }
+    if (emptied_ms != nullptr) {
+        *emptied_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
     }
     if (!may_delete) {
         text = "own profile NOT removed: " + why;
@@ -1250,8 +1254,13 @@ struct WaitingChild::Impl {
     bool memory_message = false; // the job said that the memory limit was reached
     std::uint64_t peak_memory = 0;
     std::string at_limit;        // what the worker looked like at the time limit
-    std::string profile_removal; // what happened when its own profile was deleted
+    std::string profile_removal; // what happened when its own profile was deleted (retire)
     double profile_delete_ms = 0.0;
+    bool retired = false;        // its profile was dealt with (retire or the destructor)
+    // Moments after the hand-over, for ChildResult::timeline.
+    std::chrono::steady_clock::time_point t_ended{};
+    std::chrono::steady_clock::time_point t_drained{};
+    std::chrono::steady_clock::time_point t_job_closed{};
 };
 
 namespace {
@@ -1304,6 +1313,7 @@ void pump(WaitingChild::Impl& c) {
     });
     if (!c.ended && ::WaitForSingleObject(c.child.process, 0) == WAIT_OBJECT_0) {
         c.ended = true;
+        c.t_ended = std::chrono::steady_clock::now();
         ::GetExitCodeProcess(c.child.process, &c.exit_code);
     }
 }
@@ -1321,6 +1331,7 @@ void finish_child(WaitingChild::Impl& c) {
             ::GetExitCodeProcess(c.child.process, &c.exit_code);
         }
         pump(c);  // what was still in the pipes
+        c.t_drained = std::chrono::steady_clock::now();
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION measured{};
         if (::QueryInformationJobObject(c.child.job, JobObjectExtendedLimitInformation, &measured, sizeof measured,
                                         nullptr)) {
@@ -1344,13 +1355,38 @@ void finish_child(WaitingChild::Impl& c) {
                            &c.child.process, &c.child.job}) {
         close_handle(*handle);  // closing the job's last handle kills anything still in it
     }
-    // The worker is gone: its own profile, and with it everything it wrote, goes too.
-    if (!c.child.profile_name.empty()) {
-        bool removed = false;
-        c.profile_removal = remove_worker_profile(c.child.profile_name, c.profile_delete_ms, removed);
-        c.child.profile_name.clear();
-    }
+    c.t_job_closed = std::chrono::steady_clock::now();
+    // The worker's own profile is NOT deleted here: that is retire()'s work (or the
+    // destructor's), after the host has delivered the result. The worker is gone by now, and
+    // its profile is never used again by anyone.
     c.finished = true;
+}
+
+// Deletes the profile of an ENDED worker (ends it first if it still runs). Once.
+Retired retire_profile(WaitingChild::Impl& c) {
+    Retired retired;
+    finish_child(c);
+    if (c.retired) {
+        retired.text = "already retired";
+        retired.removed = c.profile_removal.rfind("own profile removed", 0) == 0;
+        return retired;
+    }
+    c.retired = true;
+    if (c.child.profile_name.empty()) {
+        retired.text = "no profile (started without confinement, or it could not be created)";
+        retired.removed = true;
+        return retired;
+    }
+    double total_ms = 0.0;
+    double emptied_ms = 0.0;
+    c.profile_removal = remove_worker_profile(c.child.profile_name, total_ms, retired.removed, &emptied_ms);
+    c.profile_delete_ms = total_ms;
+    c.child.profile_name.clear();
+    retired.text = c.profile_removal;
+    retired.emptied_ms = emptied_ms;
+    retired.deleted_ms = total_ms - emptied_ms;
+    retired.total_ms = total_ms;
+    return retired;
 }
 
 void update_state(WaitingChild::Impl& c) {
@@ -1426,7 +1462,7 @@ WaitingChild::WaitingChild(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) 
 
 WaitingChild::~WaitingChild() {
     if (impl_) {
-        finish_child(*impl_);
+        retire_profile(*impl_);  // a profile the host did not retire goes here
     }
 }
 
@@ -1555,9 +1591,20 @@ ChildResult collect(WaitingChild& child, const Limits& limits) {
     result.container_folder_note = c.child.folder_note;
     result.container_folder = narrow(profile_folder(c.child.profile_name));
     result.profile_create_ms = c.child.profile_create_ms;
-    const auto profile_figures = [&] {  // after finish_child: the profile is deleted by then
-        result.profile_removal = c.profile_removal;
+    // The profile is deleted later, by retire(): not in the time of this call.
+    const auto profile_figures = [&] {
+        result.profile_removal = c.retired ? c.profile_removal : std::string("not yet: deleted by retire()");
         result.profile_delete_ms = c.profile_delete_ms;
+        const auto since = [&](std::chrono::steady_clock::time_point at) {
+            return at == std::chrono::steady_clock::time_point{} ||
+                           c.handed_over == std::chrono::steady_clock::time_point{}
+                       ? -1.0
+                       : std::chrono::duration<double, std::milli>(at - c.handed_over).count();
+        };
+        result.timeline.process_ended_ms = since(c.t_ended);
+        result.timeline.output_drained_ms = since(c.t_drained);
+        result.timeline.job_closed_ms = since(c.t_job_closed);
+        result.timeline.returned_ms = since(std::chrono::steady_clock::now());
     };
     if (c.state != WaitingState::HandedOver) {
         const std::string why = c.state == WaitingState::Ended
@@ -1642,6 +1689,8 @@ void end_waiting(WaitingChild& child) {
 }
 
 std::string confinement_at_start(const WaitingChild& child) { return child.impl().child.confinement; }
+
+Retired retire(WaitingChild& child) { return retire_profile(child.impl()); }
 
 std::string worker_folder(const WaitingChild& child) {
     const WaitingChild::Impl& c = child.impl();

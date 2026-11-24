@@ -48,7 +48,10 @@ SECCOMP_LINE = r"prctl\(PR_SET_SECCOMP, SECCOMP_MODE_FILTER.*=\s*0\s*$"
 # The waiting shape (ruling M-13): the worker reports "stage1 ..." on its status pipe, prepares
 # (reads OUR rules, compiles them) and only later installs the filter. The calls between the
 # two are listed apart: they run without the filter.
-STAGE1_LINE = r"write\(\d+, \"stage1 "
+# The report is ONE write(2) of "stage1 <what>\n" on the status descriptor (number 4 at start;
+# see status_line in sandbox_posix.cpp); a short write would repeat write() for the rest. The
+# pattern also takes a descriptor decorated by strace -y ("4<pipe:[123]>") and the writev form.
+STAGE1_LINE = r"\bwrite\w*\(\d+(?:<[^>]*>)?,\s*(?:\[\{iov_base=)?\"stage1 "
 # Calls the filter answers on purpose without allowing them; seeing them refused is expected.
 ANSWERED_ON_PURPOSE = {
     "newfstatat": "refused on purpose: it takes a path. Newer C libraries ask the kind of an open stream "
@@ -107,6 +110,10 @@ def read_trace(path, start_pattern, whole):
     if no stage-1 report was seen (the one-shot shape))."""
     before_seal = None
     in_stage1 = set()  # process numbers that reported stage 1 and have not yet sealed
+    # Without a stage-1 report: the calls of each process from its successful execve to its
+    # seal, kept as a second measure (exec_to_seal) so that the list is never simply missing.
+    since_exec = {}    # pid -> name -> count, from its execve on, until it seals
+    exec_to_seal = {}
     stage1 = re.compile(STAGE1_LINE)
     used = {}
     refused = {}
@@ -137,6 +144,10 @@ def read_trace(path, start_pattern, whole):
             is_start = bool(start.search(line))
             if pid in in_stage1 and not is_start and found.group("name"):
                 before_seal[name] = before_seal.get(name, 0) + 1
+            if pid in since_exec and not is_start and found.group("name"):
+                since_exec[pid][name] = since_exec[pid].get(name, 0) + 1
+            if name == "execve" and re.search(r"=\s*0\s*$", line):
+                since_exec[pid] = {}  # a new program in this process: count from here
             if stage1.search(line):
                 in_stage1.add(pid)
                 if before_seal is None:
@@ -154,7 +165,9 @@ def read_trace(path, start_pattern, whole):
                 counted.add(pid)
                 in_stage1.discard(pid)
                 seen_start = True
-    return used, refused, seen_start, before_seal
+                for call, number in since_exec.pop(pid, {}).items():
+                    exec_to_seal[call] = exec_to_seal.get(call, 0) + number
+    return used, refused, seen_start, before_seal, exec_to_seal
 
 
 def main():
@@ -190,7 +203,8 @@ def main():
     try:
         done = subprocess.run([strace, "-f", "-qq", "-o", trace_path, "--"] + command)
         print("command exit code: %d" % done.returncode)
-        used, refused, seen_start, before_seal = read_trace(trace_path, arguments.after, arguments.whole)
+        used, refused, seen_start, before_seal, exec_to_seal = read_trace(trace_path, arguments.after,
+                                                                          arguments.whole)
     finally:
         if folder is not None:
             shutil.rmtree(folder, ignore_errors=True)
@@ -201,7 +215,14 @@ def main():
 
     if before_seal is None:
         print("BEFORE THE SEAL       (no stage-1 report in this trace: the one-shot shape, where the filter is "
-              "installed before the worker reads anything)")
+              "installed before the worker reads anything, or the report was not recognised; pattern %r)"
+              % STAGE1_LINE)
+        if exec_to_seal:
+            print("FROM EXEC TO THE SEAL (not filtered; the whole start of each sealed process, stage 1 and its "
+                  "preparation included): %d different calls" % len(exec_to_seal))
+            for name in sorted(exec_to_seal):
+                print("FROM EXEC TO THE SEAL %-20s used %d times%s" % (
+                    name, exec_to_seal[name], "" if name in allowed else "   (not on the allow list)"))
     else:
         print("BEFORE THE SEAL (not filtered; our own rule files and table only): %d different calls between "
               "the stage-1 report and the filter" % len(before_seal))

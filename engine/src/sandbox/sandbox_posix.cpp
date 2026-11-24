@@ -1324,8 +1324,15 @@ ChildResult collect(WaitingChild& child, const Limits& limits) {
             kill_waiting(c);
         }
     }
+    const auto drained = std::chrono::steady_clock::now();
     finish_child(c);
     c.state = WaitingState::Ended;
+    const auto since = [&](std::chrono::steady_clock::time_point at) {
+        return std::chrono::duration<double, std::milli>(at - c.handed_over).count();
+    };
+    result.timeline.process_ended_ms = c.reaped_at > c.handed_over ? since(c.reaped_at) : -1.0;
+    result.timeline.output_drained_ms = since(drained);
+    result.timeline.returned_ms = since(std::chrono::steady_clock::now());
 
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.handed_over).count();
 #if defined(__APPLE__)
@@ -1406,6 +1413,14 @@ void end_waiting(WaitingChild& child) {
 }
 
 std::string worker_folder(const WaitingChild&) { return {}; }
+
+Retired retire(WaitingChild& child) {
+    finish_child(child.impl());  // a worker that still runs is ended; nothing else to delete here
+    Retired retired;
+    retired.removed = true;
+    retired.text = "no profile on Linux";
+    return retired;
+}
 
 std::string confinement_at_start(const WaitingChild& child) {
     const WaitingChild::Impl& c = child.impl();

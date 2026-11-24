@@ -36,6 +36,7 @@ CROSS = "M-13 one profile per worker: a file left by one worker is not seen by a
 SWEEP = "M-13 clean-up after a crash: profiles left by a hard-killed parent are removed by the next start's sweep"
 WINDOWS_MUST_RUN = []  # filled on Windows: the cases above must run there
 PROFILE_COST = {"create": [], "delete": []}  # milliseconds per start / per end (Windows)
+TIMELINE = {"process_ended_ms": [], "output_drained_ms": [], "job_closed_ms": [], "returned_ms": []}
 SHIPPED = "SB-1: a child built with the shipped library ignores the test switches in its environment"
 P2 = "r-01 point 2: reading a file in the user's profile that was not handed over fails"
 P3 = "r-01 point 3: starting another process from the confined child fails"
@@ -94,19 +95,33 @@ def run_parent(parent, child, options, action, wall=WALL):
     return result, inner
 
 
-def note_profile_cost(result):
-    """Windows: the time the worker's own profile took to create and to delete."""
+def note_profile_cost(result, retired=None):
+    """Windows: the time the worker's own profile took to create and (in retire(), after the
+    result) to delete; and, for a waiting worker, the moments of collect() after the hand-over."""
+    retired = retired or result.get("retired") or {}
     if result.get("profile_create_ms", 0) > 0:
         PROFILE_COST["create"].append(result["profile_create_ms"])
-    if result.get("profile_delete_ms", 0) > 0:
-        PROFILE_COST["delete"].append(result["profile_delete_ms"])
+    deleted = retired.get("total_ms", -1) if retired else result.get("profile_delete_ms", 0)
+    if deleted and deleted > 0:
+        PROFILE_COST["delete"].append(deleted)
+    for key, value in (result.get("timeline") or {}).items():
+        if key in TIMELINE and value is not None and value >= 0:
+            TIMELINE[key].append(value)
 
 
 def brief(result, inner):
     cost = ""
+    retired = result.get("retired") or {}
     if result.get("profile_create_ms", 0) > 0:
-        cost = " profile: create %.1f ms, delete %.1f ms, %s;" % (
-            result.get("profile_create_ms", 0), result.get("profile_delete_ms", 0), result.get("profile_removal", ""))
+        cost = " profile: create %.1f ms, delete %.1f ms (emptied %.1f, DeleteAppContainerProfile %.1f), %s;" % (
+            result.get("profile_create_ms", 0), retired.get("total_ms", result.get("profile_delete_ms", 0)),
+            retired.get("emptied_ms", -1), retired.get("deleted_ms", -1),
+            retired.get("text", result.get("profile_removal", "")))
+    timeline = result.get("timeline") or {}
+    if timeline.get("returned_ms", -1) >= 0:
+        cost += " collect after the hand-over: ended %.1f, drained %.1f, job closed %.1f, returned %.1f ms;" % (
+            timeline.get("process_ended_ms", -1), timeline.get("output_drained_ms", -1),
+            timeline.get("job_closed_ms", -1), timeline.get("returned_ms", -1))
     return "end=%s exit=%s inner=%s detail=%r applied=%r%s" % (
         result.get("end"), result.get("exit_code"), json.dumps(inner, sort_keys=True),
         result.get("detail", "")[:700], result.get("confinement", ""), cost)
@@ -133,6 +148,11 @@ def summary():
             print("profile cost (%s, ms, per worker): %d measured, median %.1f, 90th %.1f, max %.1f" % (
                 kind, len(figures), figures[len(figures) // 2], figures[min(len(figures) - 1, len(figures) * 9 // 10)],
                 figures[-1]))
+    for key in ("process_ended_ms", "output_drained_ms", "job_closed_ms", "returned_ms"):
+        figures = sorted(TIMELINE[key])
+        if figures:
+            print("collect() after the hand-over, %s: %d measured, median %.1f, max %.1f" % (
+                key, len(figures), figures[len(figures) // 2], figures[-1]))
     blocking = [name for name in MUST_RUN + tuple(WINDOWS_MUST_RUN)
                 if not any(status in ("PASS", "FAIL") and case_name == name for status, case_name, _ in results)]
     print("sandbox_cases: %d passed, %d failed, %d not run%s" % (
@@ -797,7 +817,7 @@ def run_cases(parent, child, shipped_child, windows, linux, work):
         answer = json.loads(lines[-1].decode("ascii")) if lines else {}
         for side in ("a", "b"):
             if isinstance(answer.get(side), dict):
-                note_profile_cost(answer[side])
+                note_profile_cost(answer[side], answer.get("retired_" + side))
         return answer
 
     def child_line(result):
@@ -851,7 +871,7 @@ def run_cases(parent, child, shipped_child, windows, linux, work):
                 "worker B's folder, and in the TEMP and TMP it sees. WRITTEN: %s. Refused: %s. Written outside " \
                 "its own folder: %s. A's folder still on disk after A ended: %s (%s). %s" % (
                     written or "none", line_a.get("not_written", []) or "none", outside_own or "none",
-                    cross.get("folder_a_exists_after_a"), (cross.get("a") or {}).get("profile_removal"),
+                    cross.get("folder_a_exists_after_a"), (cross.get("retired_a") or {}).get("text"),
                     brief(cross.get("a") or {}, line_a))
             good = bool(line_a) and not outside_own and cross.get("folder_a_exists_after_a") is False
             for path in outside_own:
