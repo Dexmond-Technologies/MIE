@@ -127,7 +127,7 @@ def read_trace(path, start_pattern, whole):
             tail = re.match(r"^(\d+)\s+<\.\.\. \w+ resumed>(.*)$", line)
             if tail and tail.group(1) in pending:
                 joined = pending.pop(tail.group(1)) + tail.group(2)
-                if start.search(joined):
+                if start.search(joined) or stage1.search(joined):
                     line = tail.group(1) + " " + joined   # a whole call line, beginning included
             found = LINE.match(line)
             if not found:
