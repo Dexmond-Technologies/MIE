@@ -437,7 +437,8 @@ jobs:
           set -eu
           git init --quiet .vcpkg
           git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
-          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          # one 403 from github.com in run 45308595489: try three times
+          for try in 1 2 3; do git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT" && break; sleep 30; done
           git -C .vcpkg checkout --quiet FETCH_HEAD
           test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"

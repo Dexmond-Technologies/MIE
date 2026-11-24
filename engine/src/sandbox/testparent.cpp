@@ -46,6 +46,8 @@
 
 namespace {
 
+std::string json_retired(const mie::sandbox::Retired& retired);
+
 std::string json_text(const std::string& text) {
     std::string out = "\"";
     for (const char c : text) {
@@ -216,13 +218,14 @@ int run_waiting(const WaitingRun& run) {
     return 0;
 }
 
-}  // namespace
-
 std::string json_retired(const mie::sandbox::Retired& retired) {
     return std::string("{\"removed\":") + (retired.removed ? "true" : "false") + ",\"text\":" + json_text(retired.text) +
            ",\"emptied_ms\":" + std::to_string(retired.emptied_ms) + ",\"deleted_ms\":" +
            std::to_string(retired.deleted_ms) + ",\"total_ms\":" + std::to_string(retired.total_ms) + "}";
 }
+
+}  // namespace
+
 
 std::string json_list(const std::vector<std::string>& items) {
     std::string out;
