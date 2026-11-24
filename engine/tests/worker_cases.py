@@ -117,6 +117,24 @@ def spread(values):
     return 'median %.1f, 95th percentile %.1f, max %.1f' % (at(values, 0.5), at(values, 0.95), values[-1])
 
 
+BREAKDOWN = (('hand_over_file returned (parent)', 't_hand_over_returned_ms'),
+             ('sealed: fully confined, file received (worker)', 't_sealed_ms'),
+             ('result ready, answer about to be written (worker)', 't_scan_done_ms'),
+             ('answer handed to the system (worker)', 't_answer_written_ms'),
+             ('main() returned (worker)', 't_main_ended_ms'),
+             ('collect() returned: process ended and reaped (parent)', 't_collect_returned_ms'),
+             ('every check done (parent)', 'from_hand_over_ms'))
+
+
+def print_breakdown(jobs, indent='      '):
+    """Shape B: where the time of a file goes, milliseconds FROM THE START OF THE HAND-OVER
+    CALL (worker moments on the machine-wide steady clock)."""
+    print('%smilliseconds from the start of the hand-over call (median / 95th percentile / max):' % indent)
+    for label, key in BREAKDOWN:
+        values = [j.get(key, -1.0) for j in jobs if j.get(key, -1.0) is not None and j.get(key, -1.0) >= 0]
+        print('%s  %-58s %s' % (indent, label, spread(values) if values else 'NOT MEASURED'), flush=True)
+
+
 def grant_container_access():
     """Windows: the worker's AppContainer must be able to read the program folder. The
     installer does this for the product; the test does it for the build folder."""
@@ -580,11 +598,23 @@ def main():
             job = by_path(jobs_of(idle_log)).get('a.txt', {})
             idle_figures[shape] = job.get('total_ms')
             if shape == 'B':
+                idle_figures['B from the hand-over'] = job.get('from_hand_over_ms')
+                print_breakdown([job] if job else [], indent='  (a) ')
                 idle_record = [r for r in records(idle_log) if r.get('record') == 'idle']
                 print('  (a) pool before the file: %s' % (json.dumps(idle_record[0], sort_keys=True) if idle_record else
                                                           'NOT MEASURED'))
-        print('  (a) ONE FILE AFTER IDLE (3 s, pool of 2 full, nothing else running): shape B %s ms; shape A (a worker '
-              'started for it: the price of an empty pool) %s ms' % (idle_figures.get('B'), idle_figures.get('A')))
+        print('  (a) ONE FILE AFTER IDLE (3 s, pool of 2 full, nothing else running): shape B %s ms from when the parent '
+              'got the file, %s ms from the start of the hand-over; shape A (a worker started for it: the price of an '
+              'empty pool) %s ms' % (idle_figures.get('B'), idle_figures.get('B from the hand-over'), idle_figures.get('A')))
+        # The same with the replacement started only after the answer: shows whether a worker that
+        # starts while the file is scanned slows the scan.
+        quiet_log = os.path.join(tmp, 'idle-B-quiet.log.jsonl')
+        worker_run(WORKER, idle_dir, os.path.join(tmp, 'idle-B-quiet.jsonl'), common,
+                   ['--log', quiet_log, '--idle-before-first', '3', '--refill-after-answer'], shape=('--pool', '2'))
+        quiet = by_path(jobs_of(quiet_log)).get('a.txt', {})
+        print('  (a) shape B with the replacement started only AFTER the answer: %s ms from when the parent got the '
+              'file, %s ms from the start of the hand-over' % (quiet.get('total_ms'), quiet.get('from_hand_over_ms')))
+        print_breakdown([quiet] if quiet else [], indent='  (a) ')
         if LINUX:
             idle_ref_times = os.path.join(tmp, 'idle-reference.times.jsonl')
             run_reference(idle_dir, os.path.join(tmp, 'idle-reference.jsonl'), idle_ref_times, reputation_file)
@@ -612,6 +642,7 @@ def main():
                     spread(waits), spread(refills)))
                 print('      (back-to-back files drain a pool of 2: these figures measure how fast workers can be '
                       'started and prepared; figure (a) is the case the pool is for)')
+                print_breakdown([j for j in jobs_of(logs[shape]) if j.get('answered')])
         figures('C++ unconfined test runner, Engine::scan_file', unconfined, direct_wall)
         if reference:
             figures('Python reference, Engine.scan_file (engine built once: %s s)' % (
@@ -660,6 +691,7 @@ def main():
                 print('      of which waiting for a ready worker: %s; starting replacements: %s (an empty pool costs '
                       'shape A\'s price; preparations are written between files, so they are in the whole-run time, '
                       'not in the per-file totals)' % (spread(waits), spread(refills)))
+                print_breakdown([j for j in jobs_of(burst_log) if j.get('answered')])
             code, out, err = run([PY, os.path.join(PARITY, 'compare.py'), '--identical', burst_direct, burst_table])
             check(code == 0, 'T: the burst table of shape %s is identical to the unconfined runner\'s' % shape)
         figures('C++ unconfined test runner, Engine::scan_file',

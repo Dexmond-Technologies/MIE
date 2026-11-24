@@ -6,7 +6,7 @@
 //                  --reputation FILE --scoring FILE [--no-reputation] [--details FILE.jsonl]
 //                  [--log FILE.jsonl] [--wall SECONDS] [--memory BYTES]
 //                  [--pool N|proposed] [--max-age SECONDS] [--idle-before-first SECONDS]
-//                  [--reload-after RELATIVE/PATH]
+//                  [--reload-after RELATIVE/PATH] [--refill-after-answer]
 //                  [--test-fault RELATIVE/PATH=KIND]... [--unconfined] [--allow-weaker]
 //                  [--test-second-hand-over] [--test-die-waiting N] [--test-die-waiting-from K]
 //   mie-worker-run --sid
@@ -95,7 +95,7 @@ void usage() {
                "                      [--wall SECONDS] [--memory BYTES] [--test-fault PATH=KIND]... [--unconfined]\n"
                "                      [--allow-weaker] [--pool N|proposed] [--max-age SECONDS]\n"
                "                      [--idle-before-first SECONDS] [--reload-after PATH] [--test-second-hand-over]\n"
-               "                      [--test-die-waiting N] [--test-die-waiting-from K]\n"
+               "                      [--test-die-waiting N] [--test-die-waiting-from K] [--refill-after-answer]\n"
                "       mie-worker-run --sid\n",
                stderr);
 }
@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     mie::sandbox::RunOptions run_options;
     std::string pool_text = "0", max_age_text, idle_text, reload_after, die_waiting_text, die_from_text;
     bool second_hand_over = false;
+    bool refill_after_answer = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const auto value = [&](std::string& target) {
@@ -166,6 +167,8 @@ int main(int argc, char** argv) {
             ok = value(die_waiting_text);
         } else if (arg == "--test-die-waiting-from") {
             ok = value(die_from_text);
+        } else if (arg == "--refill-after-answer") {
+            refill_after_answer = true;
         } else if (arg == "--test-second-hand-over") {
             second_hand_over = true;
         } else if (arg == "--no-reputation") {
@@ -212,6 +215,7 @@ int main(int argc, char** argv) {
         options.max_waiting_age_seconds = std::atof(max_age_text.c_str());
     }
     options.test_second_hand_over = second_hand_over;
+    options.refill_during_scan = !refill_after_answer;
     options.test_die_while_waiting = die_waiting_text.empty() ? 0 : std::atoi(die_waiting_text.c_str());
     options.test_die_while_waiting_from = die_from_text.empty() ? 0 : std::atoi(die_from_text.c_str());
     const double idle_seconds = idle_text.empty() ? 0.0 : std::atof(idle_text.c_str());
@@ -436,6 +440,13 @@ int main(int argc, char** argv) {
                                 {"after_seal_ms", outcome.after_seal_ms},
                                 {"wait_ready_ms", outcome.wait_ready_ms},
                                 {"refill_ms", outcome.refill_ms},
+                                {"t_hand_over_returned_ms", outcome.t_hand_over_returned_ms},
+                                {"t_sealed_ms", outcome.t_sealed_ms},
+                                {"t_scan_done_ms", outcome.t_scan_done_ms},
+                                {"t_answer_written_ms", outcome.t_answer_written_ms},
+                                {"t_main_ended_ms", outcome.t_main_ended_ms},
+                                {"t_collect_returned_ms", outcome.t_collect_returned_ms},
+                                {"from_hand_over_ms", outcome.from_hand_over_ms},
                                 {"attempts", outcome.attempts},
                                 {"worker_generation", outcome.worker_generation},
                                 {"second_hand_over", outcome.second_hand_over},

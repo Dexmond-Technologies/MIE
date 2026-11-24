@@ -78,6 +78,13 @@ double milliseconds_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+// The steady clock in nanoseconds. On Linux (CLOCK_MONOTONIC) and Windows (the performance
+// counter) this clock is the same for every process of the machine, so the parent can put the
+// worker's moments on its own time line (shape B's breakdown of the time from the hand-over).
+std::int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+
 std::int64_t own_process_id() {
 #if defined(_WIN32)
     return static_cast<std::int64_t>(_getpid());
@@ -398,8 +405,12 @@ int scan_and_answer(const Prepared& prepared, mie::io::File& file, const std::st
     body["result"] = json::parse(mie::to_json(result));
     if (sealed_at != nullptr) {
         body["after_seal_ms"] = milliseconds_since(*sealed_at);
+        body["scan_done_ns"] = steady_ns();
     }
     if (write_answer(body)) {
+        // After the answer: the moment it was handed to the system, on standard error (it cannot
+        // be in the answer itself). The parent reads it for the breakdown.
+        say("answer written at " + std::to_string(steady_ns()));
         return mie::worker::kExitOk;
     }
     // The result does not fit one frame (very many or very long findings). The findings
@@ -533,6 +544,7 @@ int run_prestarted(bool die_while_waiting) {
     std::string sealed;
     const std::unique_ptr<mie::io::File> file = mie::sandbox::receive_file_and_seal(file_job_bytes, sealed);
     const Clock::time_point sealed_at = Clock::now();
+    const std::int64_t sealed_ns = steady_ns();
     if (!file) {
         say("no file came with the hand-over");  // not expected: the sandbox ends the process instead
         return mie::worker::kExitNoFile;
@@ -554,7 +566,8 @@ int run_prestarted(bool die_while_waiting) {
                  {"self", mie::sandbox::describe_self()},
                  {"pid", own_process_id()},
                  {"setup_ms", prepared->setup_ms},
-                 {"preparation_sha256", preparation_sha256}};
+                 {"preparation_sha256", preparation_sha256},
+                 {"sealed_ns", sealed_ns}};
     return scan_and_answer(*prepared, *file, file_job.display_name, body, &sealed_at);
 }
 
@@ -603,7 +616,11 @@ int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
     try {
-        return run(argc, argv);
+        const int code = run(argc, argv);
+        // Everything of run() is torn down here (the engine, the compiled rules, the file); what
+        // is left is the C runtime's own end. The parent reads this moment for the breakdown.
+        say("main ends at " + std::to_string(steady_ns()));
+        return code;
     } catch (const std::bad_alloc&) {
         std::fputs("mie-worker: out of memory\n", stderr);
         return mie::sandbox::kOutOfMemoryExitCode;

@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
@@ -67,6 +69,35 @@ double number_field(const json& object, const char* key) {
 
 double milliseconds_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+std::int64_t steady_ns(Clock::time_point moment) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(moment.time_since_epoch()).count();
+}
+
+// A worker's steady-clock stamp, as milliseconds after `origin_ns`; -1 when absent or absurd.
+double stamp_after(std::int64_t stamp_ns, std::int64_t origin_ns) {
+    if (stamp_ns <= 0) {
+        return -1.0;
+    }
+    const double ms = static_cast<double>(stamp_ns - origin_ns) / 1e6;
+    return ms > -1000.0 && ms < 1e7 ? ms : -1.0;
+}
+
+// The number after `label` in the worker's standard error (as the sandbox kept it), or 0.
+std::int64_t stamp_in(const std::string& text, const char* label) {
+    const std::size_t at = text.rfind(label);
+    if (at == std::string::npos) {
+        return 0;
+    }
+    std::int64_t value = 0;
+    for (std::size_t i = at + std::strlen(label); i < text.size() && text[i] >= '0' && text[i] <= '9'; ++i) {
+        if (value > (INT64_MAX - 9) / 10) {
+            return 0;
+        }
+        value = value * 10 + (text[i] - '0');
+    }
+    return value;
 }
 
 // What was received, for a log: how many bytes, the length the first four claim, the first
@@ -866,6 +897,8 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
     std::unique_ptr<Slot> slot;
     double waited_ms = 0.0;
     bool handed = false;
+    Clock::time_point hand_over_start = Clock::now();
+    Clock::time_point hand_over_returned = hand_over_start;
     for (int tries = 0; tries < 3 && !handed; ++tries) {
         double waited = 0.0;
         slot = take_ready(error, waited);
@@ -873,7 +906,9 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
         if (!slot) {
             break;
         }
+        hand_over_start = Clock::now();
         if (sandbox::hand_over_file(*slot->child, file, job_bytes, error)) {
+            hand_over_returned = Clock::now();
             handed = true;
         } else {
             retire(*slot, "unusable", "the hand-over failed: " + error);
@@ -907,12 +942,35 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
     // started (not waited for; their preparation is sent between files) and the ready ones are
     // polled. The time this takes is on the file's path and is reported as refill_ms.
     const Clock::time_point refill_start = Clock::now();
-    maintain(false);
+    if (options_.refill_during_scan) {
+        maintain(false);
+    }
     const double refill_ms = milliseconds_since(refill_start);
 
-    const Clock::time_point run_start = Clock::now();
     const sandbox::ChildResult child = sandbox::collect(*slot->child, options_.limits);
-    const double worker_run_ms = milliseconds_since(run_start);
+    const Clock::time_point collect_returned = Clock::now();
+    const double worker_run_ms = std::chrono::duration<double, std::milli>(collect_returned - hand_over_start).count();
+    // The breakdown from the start of the hand-over call (reviewer's A-8 question: where the
+    // time of a file goes when a worker was ready).
+    const std::int64_t origin = steady_ns(hand_over_start);
+    const auto in_ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const auto breakdown = [&](JobOutcome& outcome, const json* body) {
+        outcome.t_hand_over_returned_ms = in_ms(hand_over_start, hand_over_returned);
+        outcome.t_collect_returned_ms = in_ms(hand_over_start, collect_returned);
+        outcome.t_answer_written_ms = stamp_after(stamp_in(child.detail, "answer written at "), origin);
+        outcome.t_main_ended_ms = stamp_after(stamp_in(child.detail, "main ends at "), origin);
+        if (body != nullptr) {
+            const auto sealed = body->find("sealed_ns");
+            const auto done = body->find("scan_done_ns");
+            outcome.t_sealed_ms =
+                sealed != body->end() && sealed->is_number_integer() ? stamp_after(sealed->get<std::int64_t>(), origin) : -1.0;
+            outcome.t_scan_done_ms =
+                done != body->end() && done->is_number_integer() ? stamp_after(done->get<std::int64_t>(), origin) : -1.0;
+        }
+        outcome.from_hand_over_ms = milliseconds_since(hand_over_start);
+    };
     if (options_.test_second_hand_over) {
         std::string refused_why;
         second += sandbox::hand_over_file(*slot->child, file, job_bytes, refused_why)
@@ -929,6 +987,7 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
         outcome.worker_run_ms = worker_run_ms;
         outcome.worker_generation = worker_generation;
         outcome.second_hand_over = second;
+        breakdown(outcome, nullptr);
         outcome.total_ms = milliseconds_since(job_start);
         return outcome;
     };
@@ -1004,6 +1063,7 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
     outcome.wait_ready_ms = waited_ms;
     outcome.refill_ms = refill_ms;
     outcome.worker_run_ms = worker_run_ms;
+    breakdown(outcome, &checked.body);
     outcome.total_ms = milliseconds_since(job_start);
     return outcome;
 }

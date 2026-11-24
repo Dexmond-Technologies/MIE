@@ -159,6 +159,10 @@ struct HostOptions {
     int pool_size = 0;
     double max_waiting_age_seconds = kDefaultMaxWaitingAgeSeconds;  // shape B: an older waiting worker is replaced
     int ready_timeout_seconds = kReadyTimeoutSeconds;                // shape B
+    // Shape B: start the replacement workers right after the hand-over (true: they start while
+    // the file is scanned) or only after the answer (false). For measuring whether a starting
+    // worker slows the one that scans.
+    bool refill_during_scan = true;
     // TESTS ONLY, never set by the product:
     sandbox::RunOptions run;  // shape A: run.confine=false also passes --test-allow-unconfined
     std::string test_fault;   // put into the next job(s); needs the test-hooks worker
@@ -215,7 +219,17 @@ struct JobOutcome {
     double refill_ms = 0.0;            // shape B: starting replacements after the hand-over (in total_ms)
     double worker_run_ms = 0.0;        // A: start call to the worker's end; B: hand-over to the worker's end
     double start_overhead_ms = 0.0;    // A: worker_run_ms - worker_alive_ms (start, confine, end)
-    double total_ms = 0.0;             // everything the parent did for this file
+    double total_ms = 0.0;             // everything the parent did for this file (from when it got the job)
+    // Shape B: the time line FROM THE START OF THE HAND-OVER CALL, milliseconds (-1 = not known).
+    // Worker moments come from the steady clock, which is the same for all processes of the
+    // machine (Linux CLOCK_MONOTONIC, Windows performance counter).
+    double t_hand_over_returned_ms = -1.0;  // parent: hand_over_file returned
+    double t_sealed_ms = -1.0;              // worker: receive_file_and_seal returned (fully confined)
+    double t_scan_done_ms = -1.0;           // worker: the result is ready, the answer about to be written
+    double t_answer_written_ms = -1.0;      // worker: the answer handed to the system (standard error line)
+    double t_main_ended_ms = -1.0;          // worker: main() returns; the C runtime's end follows
+    double t_collect_returned_ms = -1.0;    // parent: collect() returned (the process ended and was reaped)
+    double from_hand_over_ms = -1.0;        // parent: hand-over start to the end of every check
 };
 
 // What happened in the pool, for the run's log (shape B). One JSON object per event.
