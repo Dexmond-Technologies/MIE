@@ -185,6 +185,9 @@ jobs:
           # the before-seal list was missing in runs 45300977783 and 45304179471).
           echo "--- lines naming stage1, the status line or the filter, first 12:"
           grep -n -E 'stage1|SECCOMP|"ok ' "$RUNNER_TEMP/worker-trace-pool.txt" | head -12 | cut -c1-220 || true
+          echo "--- the first worker's write calls before its filter (run 45306410933 showed the parent reading 'stage1' but no worker write naming it):"
+          first=$(grep -m1 -oE '^[0-9]+ +prctl\(PR_SET_SECCOMP' "$RUNNER_TEMP/worker-trace-pool.txt" | grep -oE '^[0-9]+' || true)
+          [ -n "$first" ] && grep -n -E "^$first +(write|writev|pwrite64|sendmsg|execve|<\.\.\. write)" "$RUNNER_TEMP/worker-trace-pool.txt" | head -15 | cut -c1-220 || true
 
   sanitize:
     runs-on: ubuntu-latest
