@@ -91,7 +91,7 @@ std::uint64_t block_size(std::size_t index) {
 Buffer PyDecompressor::decompress(Bytes data, std::uint64_t max_length) {
     if (failed_) throw *failed_;
     if (eof) throw PyError{"EOFError", "End of stream already reached"};
-    input_.insert(input_.end(), data.begin(), data.end());
+    append(input_, data);
     Buffer out;
     std::size_t in_pos = 0, made_total = 0, block = 0;
     try {
@@ -444,7 +444,7 @@ private:
             padded_at_.reset();
         }
         const Bytes more = file_read(from_file);
-        out.insert(out.end(), more.begin(), more.end());
+        append(out, more);
         return out;
     }
     void prepend(const Buffer& data) {
@@ -460,7 +460,7 @@ private:
         while (data.size() < count) {
             const Buffer more = padded_read(count - data.size());
             if (more.empty()) throw PyError{"EOFError", kEndedEarly};
-            data.insert(data.end(), more.begin(), more.end());
+            append(data, more);
         }
         return data;
     }
@@ -573,13 +573,13 @@ public:
             if (whole == 0) break;
             const Buffer data = raw_read(whole);
             if (data.empty()) return out;
-            out.insert(out.end(), data.begin(), data.end());
+            append(out, data);
             remaining -= data.size();
         }
         while (remaining > 0 && buffer_.size() < kIoBuffer) {  // the rest through the buffer
             const Buffer data = raw_read(kIoBuffer - buffer_.size());
             if (data.empty()) return out;
-            buffer_.insert(buffer_.end(), data.begin(), data.end());
+            append(buffer_, data);
             const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, data.size()));
             out.insert(out.end(), data.begin(), data.begin() + static_cast<std::ptrdiff_t>(take));
             at_ += take;
@@ -630,7 +630,7 @@ public:
     bool eof() const { return decoder_ && decoder_->eof; }
     Buffer decompress(Bytes data, std::uint64_t max_length) {
         if (decoder_) return decoder_->decompress(data, max_length);
-        head_.insert(head_.end(), data.begin(), data.end());
+        append(head_, data);
         if (head_.size() <= 4) return {};
         const std::size_t properties = le16(head_, 2);
         if (head_.size() <= 4 + properties) return {};
@@ -700,7 +700,7 @@ Buffer read_zip_member(int method, View file, Num data_start, Num compress_size,
             eof = decoder->eof || (compress_left <= Num(0) && !decoder->has_pending_input());
             if (eof) {
                 const Buffer tail = decoder->flush();
-                data.insert(data.end(), tail.begin(), tail.end());
+                append(data, tail);
             }
         } else if (method == 12) {
             Bytes raw;

@@ -427,7 +427,7 @@ void Tar::sparse_10(Info& next) {
         if (end == buf.end() && read_more) {
             const Buffer more = file_.read(kBlock);
             const std::size_t old = buf.size();
-            buf.insert(buf.end(), more.begin(), more.end());
+            append(buf, more);
             end = std::find(buf.begin() + static_cast<std::ptrdiff_t>(old), buf.end(), std::uint8_t{'\n'});
         }
         if (end == buf.end()) throw PyError{"ValueError", "not enough values to unpack (expected 2, got 1)"};
@@ -486,7 +486,7 @@ Buffer read_member(PyFile& file, const Info& member, const Options& options, Met
             if (out.empty()) {
                 out = std::move(got);
             } else {
-                out.insert(out.end(), got.begin(), got.end());
+                append(out, got);
             }
         } else {
             out.insert(out.end(), count, std::uint8_t{0});

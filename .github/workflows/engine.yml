@@ -408,6 +408,47 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-gcc14:
+    # node4 (the nightly's machine) compiles with GCC 14, which reports warnings the hosted
+    # compilers (GCC 13 and 15, MSVC) do not (run of 2026-11-23); warnings are errors, so every
+    # push builds the whole engine with GCC 14 too. Build only; the tests run in build-test.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: GCC 14
+        run: |
+          sudo apt-get install -y g++-14
+          g++-14 --version | head -1
+      - name: Fetch and bootstrap vcpkg at the pinned commit
+        run: |
+          set -eu
+          git init --quiet .vcpkg
+          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg
+          git -C .vcpkg fetch --quiet --depth 1 origin "$VCPKG_COMMIT"
+          git -C .vcpkg checkout --quiet FETCH_HEAD
+          test "$(git -C .vcpkg rev-parse HEAD)" = "$VCPKG_COMMIT"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ./.vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-ubuntu-24.04-gcc14-${{ env.VCPKG_COMMIT }}-${{ hashFiles('engine/vcpkg.json', 'engine/vcpkg-ports/**') }}
+          restore-keys: |
+            vcpkg-ubuntu-24.04-gcc14-${{ env.VCPKG_COMMIT }}-
+      - name: Configure and build everything with GCC 14 (warnings are errors)
+        run: |
+          set -eu
+          cmake -S engine -B build -DCMAKE_BUILD_TYPE=Release -DMIE_BUILD_TESTS=OFF -DMIE_WITH_RULES=ON \
+            -DVCPKG_MANIFEST_FEATURES=rules "-DVCPKG_OVERLAY_PORTS=$GITHUB_WORKSPACE/engine/vcpkg-ports" \
+            "-DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/.vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake --build build --parallel 4
+
   signature-recipe:
     # The recipe for the run on real signed files on the corpus machine (Ubuntu 24.04, gcc 13,
     # Python 3.12.3 by COMMANDER_SEAT's report), run here first on the same system with its own

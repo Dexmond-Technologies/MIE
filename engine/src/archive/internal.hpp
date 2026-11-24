@@ -9,6 +9,8 @@
 // Shared by the zip reader, the tar reader and the decompression wrappers. Not installed.
 #pragma once
 
+#include <stdexcept>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -25,6 +27,16 @@ namespace mie::archive::detail {
 
 using Bytes = std::span<const std::uint8_t>;
 using Buffer = std::vector<std::uint8_t>;
+
+// Appends bytes to a buffer by resize and memcpy. (vector::insert of a byte range is reported by
+// GCC 14 as a false -Wstringop-overflow, an error with -Werror; node4's night of 2026-11-23.)
+inline void append(Buffer& out, Bytes more) {
+    if (more.empty()) return;                      // memcpy never sees an empty or null range
+    const std::size_t old = out.size();
+    if (more.size() > out.max_size() - old) throw std::length_error("archive buffer too large");
+    out.resize(old + more.size());
+    std::memcpy(out.data() + old, more.data(), more.size());
+}
 
 // What the reference would have raised: the Python exception's type name and, where the
 // reference prints it, its message. Thrown inside the readers and caught at the same places
