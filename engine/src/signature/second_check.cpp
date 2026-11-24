@@ -3,7 +3,7 @@
 // 2011 Google Inc., Apache License 2.0), and the rules of certvalidator 0.11.1 and asn1crypto
 // 1.5.1, Copyright (c) Will Bond, MIT License. Changes made: re-implemented in C++ on OpenSSL.
 // Full notices in THIRD-PARTY-NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond
-// Technologies.
+// Technologies Ltd.
 //
 // The second, independent check of an Authenticode signature (reviewer's condition 8,
 // board B-3630). SHIPPED PROFILE ONLY; off in the parity profile.

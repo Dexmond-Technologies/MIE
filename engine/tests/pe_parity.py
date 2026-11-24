@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Compares MIE's executable reader, which follows pefile 2024.8.26 (MIT; notice in THIRD-PARTY-
 # NOTICES), with pefile itself. This test contains no pefile code. Apache License 2.0, Copyright
-# 2026 Dexmond Technologies.
+# 2026 Dexmond Technologies Ltd.
 #
 """CI test: the C++ PE reader reports what pefile 2024.8.26 and the reference's PEAnalyzer
 report, field by field (reviewer's condition M-4b.3, board B-3608).

@@ -4,7 +4,7 @@
 // Python Software Foundation, licensed under the PSF License Agreement. Changes made: the reading
 // rules, limits, error classes and error texts were re-implemented in C++ over in-memory buffers,
 // with hard ceilings of our own added (ARCHIVE_SPEC.md sections 9-10). Full notice in THIRD-PARTY-
-// NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond Technologies.
+// NOTICES. This file: Apache License 2.0, Copyright 2026 Dexmond Technologies Ltd.
 //
 // Zip reader: what CPython 3.12.16 zipfile gives (Lib/zipfile/__init__.py) to the reference's
 // _extract_zip and _zip_covers_file (dexmond_mie/core.py at ff313e2, lines 565-606, 657-684).

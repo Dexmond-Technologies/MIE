@@ -3,7 +3,7 @@ THIRD-PARTY NOTICES for Dexmond MIE
 Dexmond MIE is licensed under the Apache License 2.0 (see LICENSE). Some of its files follow or
 copy other projects; their copyright and licence notices are kept here, each with the MIE files
 that follow it. The Python MIE in dexmond_mie/ and the C++ engine's parity profile, which copies
-the behaviour of that Python MIE, are Dexmond Technologies' own work under the same Apache 2.0
+the behaviour of that Python MIE, are Dexmond Technologies Ltd's own work under the same Apache 2.0
 licence.
 
 Libraries fetched at build time and not contained in this repository (OpenSSL, YARA, zlib, bzip2,
@@ -322,6 +322,9 @@ Licence text:
 ==============================================================================
 
 Copyright: Copyright (c) 2018 Ralph Broenink. Parts: Copyright 2011 Google Inc. All Rights Reserved.
+verify-sigs carries the Apache License 2.0 as its COPYING file and no NOTICE file (checked on 2026-11-24
+in the export of code.google.com/p/verify-sigs mirrored at github.com/slayercat/verify-sigs), so there is no
+NOTICE text of its own to reproduce under section 4(d).
 Licence: MIT License; the verify-sigs parts under the Apache License 2.0 (full text in LICENSE)
 
 What MIE takes from it: The Authenticode check re-implements signify's header locations and certificate-table walk (signed_file/pe.py), image digest and page hashes (fingerprinter.py, indirect_data.py), SignedData / SignerInfo validation (pkcs7/*.py, authenticode/signed_data.py, signer_info.py), both time-stamp kinds (tsp.py) and its strict countersignature checks, including some message texts. signify marks fingerprinter.py, asn1/spc.py, authenticode/signed_file/pe.py and authenticode/signed_data.py as based on Google's verify-sigs (Apache License 2.0).
