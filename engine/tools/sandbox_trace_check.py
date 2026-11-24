@@ -174,6 +174,25 @@ def read_trace(path, start_pattern, whole):
     return used, refused, seen_start, before_seal, exec_to_seal
 
 
+def whole_calls(handle):
+    """Yields the trace's lines with every call strace split in two ('name(args <unfinished ...>' and
+    later '<... name resumed>rest') joined into one line, placed where the call ended. Without this a
+    split seal or recvmsg is not seen, and the calls after the real seal look like calls before it
+    (run 45314594332)."""
+    pending = {}
+    for raw in handle:
+        line = raw.rstrip("\n")
+        head = re.match(r"^(\d+)\s+(.*) <unfinished \.\.\.>$", line)
+        if head:
+            pending[head.group(1)] = head.group(2)
+            continue
+        tail = re.match(r"^(\d+)\s+<\.\.\. \w+ resumed>(.*)$", line)
+        if tail and tail.group(1) in pending:
+            yield tail.group(1) + " " + pending.pop(tail.group(1)) + tail.group(2)
+            continue
+        yield line
+
+
 def descriptor_check(path, start_pattern):
     """Reviewer's condition on the pre-started shape (M-13 condition 1, ruling on run 45310215569):
     per worker, between the recvmsg that brings the file and the seal, nothing may read, pread,
@@ -185,8 +204,7 @@ def descriptor_check(path, start_pattern):
     start = re.compile(start_pattern)
     state = {}   # pid -> {'stage': 'start'|'after_recv'|'sealed', 'fd': None, 'reads_before': {fd: n}, 'touch': []}
     with open(path, encoding="utf-8", errors="replace") as handle:
-        for raw in handle:
-            line = raw.rstrip("\n")
+        for line in whole_calls(handle):
             pid_match = re.match(r"^(\d+)\s", line)
             if not pid_match:
                 continue
