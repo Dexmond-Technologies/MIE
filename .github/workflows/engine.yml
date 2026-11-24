@@ -181,6 +181,10 @@ jobs:
             --corpus "$RUNNER_TEMP/trace-set/files" --out "$RUNNER_TEMP/trace-table-pool.jsonl" \
             --rules rules --reputation "$RUNNER_TEMP/trace-set/set_s.reputation.json" \
             --scoring engine/data/scoring.reference.json --wall 900
+          # What the trace shows around a worker's stage-1 report and its seal (first lines only;
+          # the before-seal list was missing in runs 45300977783 and 45304179471).
+          echo "--- lines naming stage1, the status line or the filter, first 12:"
+          grep -n -E 'stage1|SECCOMP|"ok ' "$RUNNER_TEMP/worker-trace-pool.txt" | head -12 | cut -c1-220 || true
 
   sanitize:
     runs-on: ubuntu-latest
