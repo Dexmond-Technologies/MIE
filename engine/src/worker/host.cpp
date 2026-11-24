@@ -260,6 +260,7 @@ struct Host::Slot {
     std::string buffer;              // what came on its standard output before the hand-over
     bool ready = false;
     bool gone = false;               // ended, retired, or found dead: never to be used
+    bool used = false;               // it served the file being delivered
     Description ready_info;
 };
 
@@ -287,8 +288,74 @@ void Host::shutdown() {
         if (!slot->gone) {
             sandbox::end_waiting(*slot->child);
         }
+        (void)sandbox::retire(*slot->child);
     }
     pool_.clear();
+    for (const std::unique_ptr<Slot>& slot : to_retire_) {
+        (void)sandbox::retire(*slot->child);
+    }
+    to_retire_.clear();
+}
+
+void Host::defer(std::unique_ptr<Slot> slot, bool used_for_the_file) {
+    if (!slot) {
+        return;
+    }
+    if (!slot->gone) {
+        sandbox::end_waiting(*slot->child);  // a worker is never retired while it runs (retire() also ensures it)
+        slot->gone = true;
+    }
+    slot->used = used_for_the_file;
+    to_retire_.push_back(std::move(slot));
+}
+
+// The clean-up of workers that served no file (died, too old, unusable, ended by a new
+// configuration): between files, each reported as a pool event with its time.
+void Host::retire_deferred_unused() {
+    std::vector<std::unique_ptr<Slot>> keep;
+    for (std::unique_ptr<Slot>& slot : to_retire_) {
+        if (slot->used) {
+            keep.push_back(std::move(slot));
+            continue;
+        }
+        const sandbox::Retired done = sandbox::retire(*slot->child);
+        event("profile_removed", (done.removed ? "removed: " : "NOT removed: ") + done.text + " (" +
+                                     std::to_string(done.total_ms) + " ms)",
+              sandbox::seconds_since_start(*slot->child));
+    }
+    to_retire_.swap(keep);
+}
+
+AfterDelivery Host::after_delivery() {
+    AfterDelivery out;
+    if (options_.pool_size <= 0) {
+        return out;
+    }
+    for (const std::unique_ptr<Slot>& slot : to_retire_) {
+        if (!slot->used) {
+            continue;
+        }
+        const sandbox::Retired done = sandbox::retire(*slot->child);
+        ++out.retired;
+        out.removed = out.removed && done.removed;
+        out.text = printable(done.text, 300);
+        const auto add = [](double& sum, double value) {
+            if (value >= 0.0) {
+                sum = sum < 0.0 ? value : sum + value;
+            }
+        };
+        add(out.retire_ms, done.total_ms);
+        add(out.retire_emptied_ms, done.emptied_ms);
+        add(out.retire_deleted_ms, done.deleted_ms);
+    }
+    retire_deferred_unused();  // the unused ones too; the used ones (just retired) are kept by it
+    to_retire_.clear();
+    if (!options_.refill_during_scan) {
+        const Clock::time_point start = Clock::now();
+        maintain(false);  // start the replacements; their preparation is sent in a later round
+        out.refill_ms = milliseconds_since(start);
+    }
+    return out;
 }
 
 std::vector<PoolEvent> Host::take_events() {
@@ -330,14 +397,14 @@ void Host::set_config(Config config) {
                                         reinterpret_cast<const std::uint8_t*>(preparation_.data()), preparation_.size()));
     }
     std::size_t ended = 0;
-    for (const std::unique_ptr<Slot>& slot : pool_) {
+    for (std::unique_ptr<Slot>& slot : pool_) {
         if (!slot->gone) {
-            sandbox::end_waiting(*slot->child);
-            slot->gone = true;
             ++ended;
         }
+        defer(std::move(slot), false);
     }
     pool_.clear();
+    retire_deferred_unused();  // a configuration change comes between files
     described_ = false;
     event("config_changed", "waiting workers ended: " + std::to_string(ended));
 }
@@ -377,6 +444,7 @@ bool Host::start_slot(std::string& error) {
         error = "the worker could not be started: " + sandbox::failure(*slot->child);
         slot->gone = true;
         retire(*slot, "start_failed", error);
+        defer(std::move(slot), false);
         return false;
     }
     event("started", sandbox::confinement_at_start(*slot->child));
@@ -482,8 +550,19 @@ void Host::maintain(bool send_preparations) {
             retire(*slot, "too_old", "waited longer than " + std::to_string(options_.max_waiting_age_seconds) + " s");
         }
     }
-    pool_.erase(std::remove_if(pool_.begin(), pool_.end(), [](const std::unique_ptr<Slot>& slot) { return slot->gone; }),
-                pool_.end());
+    // Ended workers leave the pool; their clean-up (sandbox::retire) waits until between files.
+    std::deque<std::unique_ptr<Slot>> alive;
+    for (std::unique_ptr<Slot>& slot : pool_) {
+        if (slot->gone) {
+            defer(std::move(slot), false);
+        } else {
+            alive.push_back(std::move(slot));
+        }
+    }
+    pool_.swap(alive);
+    if (send_preparations) {
+        retire_deferred_unused();  // never while a file is being scanned (send_preparations false)
+    }
     while (static_cast<int>(pool_.size()) < options_.pool_size &&
            start_failures_in_a_row_ < kStartFailuresBeforeGivingUp) {
         std::string error;
@@ -912,7 +991,7 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
             handed = true;
         } else {
             retire(*slot, "unusable", "the hand-over failed: " + error);
-            slot.reset();
+            defer(std::move(slot), false);
         }
     }
     if (!handed) {
@@ -978,6 +1057,14 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
                       : "; after the answer: refused (" + printable(refused_why, 200) + ")";
     }
     const std::uint64_t worker_generation = slot->generation;
+    // The used worker waits for after_delivery(): its clean-up is not in this file's time.
+    defer(std::move(slot), true);
+    const auto add_timeline = [&](JobOutcome& outcome) {
+        outcome.tl_process_ended_ms = child.timeline.process_ended_ms;
+        outcome.tl_output_drained_ms = child.timeline.output_drained_ms;
+        outcome.tl_job_closed_ms = child.timeline.job_closed_ms;
+        outcome.tl_returned_ms = child.timeline.returned_ms;
+    };
 
     const auto failed = [&](const std::string& reason) {
         JobOutcome outcome = abnormal(child, reason, base);
@@ -988,6 +1075,7 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
         outcome.worker_generation = worker_generation;
         outcome.second_hand_over = second;
         breakdown(outcome, nullptr);
+        add_timeline(outcome);
         outcome.total_ms = milliseconds_since(job_start);
         return outcome;
     };
@@ -1064,6 +1152,7 @@ JobOutcome Host::pooled_attempt(io::File& file, const std::string& display_name,
     outcome.refill_ms = refill_ms;
     outcome.worker_run_ms = worker_run_ms;
     breakdown(outcome, &checked.body);
+    add_timeline(outcome);
     outcome.total_ms = milliseconds_since(job_start);
     return outcome;
 }

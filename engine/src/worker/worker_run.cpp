@@ -6,7 +6,7 @@
 //                  --reputation FILE --scoring FILE [--no-reputation] [--details FILE.jsonl]
 //                  [--log FILE.jsonl] [--wall SECONDS] [--memory BYTES]
 //                  [--pool N|proposed] [--max-age SECONDS] [--idle-before-first SECONDS]
-//                  [--reload-after RELATIVE/PATH] [--refill-after-answer]
+//                  [--reload-after RELATIVE/PATH] [--refill-after-answer|--refill-during-scan]
 //                  [--test-fault RELATIVE/PATH=KIND]... [--unconfined] [--allow-weaker]
 //                  [--test-second-hand-over] [--test-die-waiting N] [--test-die-waiting-from K]
 //   mie-worker-run --sid
@@ -95,7 +95,7 @@ void usage() {
                "                      [--wall SECONDS] [--memory BYTES] [--test-fault PATH=KIND]... [--unconfined]\n"
                "                      [--allow-weaker] [--pool N|proposed] [--max-age SECONDS]\n"
                "                      [--idle-before-first SECONDS] [--reload-after PATH] [--test-second-hand-over]\n"
-               "                      [--test-die-waiting N] [--test-die-waiting-from K] [--refill-after-answer]\n"
+               "                      [--test-die-waiting N] [--test-die-waiting-from K] [--refill-after-answer|--refill-during-scan]\n"
                "       mie-worker-run --sid\n",
                stderr);
 }
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     mie::sandbox::RunOptions run_options;
     std::string pool_text = "0", max_age_text, idle_text, reload_after, die_waiting_text, die_from_text;
     bool second_hand_over = false;
-    bool refill_after_answer = false;
+    bool refill_during_scan = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const auto value = [&](std::string& target) {
@@ -168,7 +168,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--test-die-waiting-from") {
             ok = value(die_from_text);
         } else if (arg == "--refill-after-answer") {
-            refill_after_answer = true;
+            refill_during_scan = false;  // the default; kept as a name for the order
+        } else if (arg == "--refill-during-scan") {
+            refill_during_scan = true;
         } else if (arg == "--test-second-hand-over") {
             second_hand_over = true;
         } else if (arg == "--no-reputation") {
@@ -215,7 +217,7 @@ int main(int argc, char** argv) {
         options.max_waiting_age_seconds = std::atof(max_age_text.c_str());
     }
     options.test_second_hand_over = second_hand_over;
-    options.refill_during_scan = !refill_after_answer;
+    options.refill_during_scan = refill_during_scan;
     options.test_die_while_waiting = die_waiting_text.empty() ? 0 : std::atoi(die_waiting_text.c_str());
     options.test_die_while_waiting_from = die_from_text.empty() ? 0 : std::atoi(die_from_text.c_str());
     const double idle_seconds = idle_text.empty() ? 0.0 : std::atof(idle_text.c_str());
@@ -298,7 +300,10 @@ int main(int argc, char** argv) {
          json{{"size", options.pool_size},
               {"max_age_seconds", options.max_waiting_age_seconds},
               {"shape", options.pool_size > 0 ? "pre-started one-shot workers (M-13)" : "one worker started per file"},
-              {"files_per_worker", mie::worker::kFilesPerWorker}}},
+              {"files_per_worker", mie::worker::kFilesPerWorker},
+              {"refill_order", options.pool_size <= 0         ? "not applicable"
+                               : options.refill_during_scan ? "replacement started during the scan"
+                                                            : "result delivered, worker retired, then replacement started"}}},
     };
     out << line_of(header);
     const auto write_events = [&] {
@@ -380,7 +385,6 @@ int main(int argc, char** argv) {
         host.maintain();
         write_events();
         const mie::worker::JobOutcome outcome = host.scan_file(path);
-        write_events();
         const mie::ScanResult& result = outcome.result;
         answered += outcome.answered ? 1 : 0;
         if (!result.hashes.sha256.empty()) {
@@ -416,6 +420,9 @@ int main(int argc, char** argv) {
             }
         }
         out << line_of(record);
+        out.flush();  // the result is DELIVERED before the used worker is retired
+        const mie::worker::AfterDelivery after = host.after_delivery();
+        write_events();
         if (log.is_open()) {
             log << line_of(json{{"record", "job"},
                                 {"path", relative},
@@ -447,6 +454,18 @@ int main(int argc, char** argv) {
                                 {"t_main_ended_ms", outcome.t_main_ended_ms},
                                 {"t_collect_returned_ms", outcome.t_collect_returned_ms},
                                 {"from_hand_over_ms", outcome.from_hand_over_ms},
+                                {"tl_process_ended_ms", outcome.tl_process_ended_ms},
+                                {"tl_output_drained_ms", outcome.tl_output_drained_ms},
+                                {"tl_job_closed_ms", outcome.tl_job_closed_ms},
+                                {"tl_returned_ms", outcome.tl_returned_ms},
+                                {"retired", after.retired},
+                                {"retire_removed", after.removed},
+                                {"retire_text", after.text},
+                                {"retire_ms", after.retire_ms},
+                                {"retire_emptied_ms", after.retire_emptied_ms},
+                                {"retire_deleted_ms", after.retire_deleted_ms},
+                                {"refill_after_delivery_ms", after.refill_ms},
+                                {"refill_order", options.refill_during_scan ? "during the scan" : "after delivery"},
                                 {"attempts", outcome.attempts},
                                 {"worker_generation", outcome.worker_generation},
                                 {"second_hand_over", outcome.second_hand_over},

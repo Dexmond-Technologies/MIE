@@ -159,10 +159,15 @@ struct HostOptions {
     int pool_size = 0;
     double max_waiting_age_seconds = kDefaultMaxWaitingAgeSeconds;  // shape B: an older waiting worker is replaced
     int ready_timeout_seconds = kReadyTimeoutSeconds;                // shape B
-    // Shape B: start the replacement workers right after the hand-over (true: they start while
-    // the file is scanned) or only after the answer (false). For measuring whether a starting
-    // worker slows the one that scans.
-    bool refill_during_scan = true;
+    // Shape B, the order after a file (both orders can be measured):
+    //   false (default): the answer is checked, the result DELIVERED, then after_delivery():
+    //                    the used worker is retired (sandbox::retire: its profile deleted on
+    //                    Windows), then the replacement is started;
+    //   true:            the replacement is started right after the hand-over, while the file is
+    //                    scanned; the used worker is still retired only after delivery.
+    // In both, neither the clean-up nor the replacement's start is in the answer's time except
+    // the start in the `true` order (it is `refill_ms`, inside the file's total).
+    bool refill_during_scan = false;
     // TESTS ONLY, never set by the product:
     sandbox::RunOptions run;  // shape A: run.confine=false also passes --test-allow-unconfined
     std::string test_fault;   // put into the next job(s); needs the test-hooks worker
@@ -230,6 +235,22 @@ struct JobOutcome {
     double t_main_ended_ms = -1.0;          // worker: main() returns; the C runtime's end follows
     double t_collect_returned_ms = -1.0;    // parent: collect() returned (the process ended and was reaped)
     double from_hand_over_ms = -1.0;        // parent: hand-over start to the end of every check
+    // Shape B: the sandbox's own time line of collect() (ChildResult::timeline), from the hand-over.
+    double tl_process_ended_ms = -1.0;      // the parent saw the worker's end
+    double tl_output_drained_ms = -1.0;     // its pipes read to the end
+    double tl_job_closed_ms = -1.0;         // Windows: job and process handles closed
+    double tl_returned_ms = -1.0;           // collect() about to return
+};
+
+// What after_delivery() did for the file just delivered (shape B). Not part of the file's time.
+struct AfterDelivery {
+    int retired = 0;                  // workers retired for this file (2 after a configuration mismatch)
+    bool removed = true;              // every one's profile removed (Linux: nothing to remove)
+    std::string text;                 // what retire() said (the last one)
+    double retire_ms = -1.0;          // sandbox::retire, total (summed over the workers)
+    double retire_emptied_ms = -1.0;  // of which emptying the folder
+    double retire_deleted_ms = -1.0;  // of which DeleteAppContainerProfile
+    double refill_ms = 0.0;           // starting the replacements (default order)
 };
 
 // What happened in the pool, for the run's log (shape B). One JSON object per event.
@@ -273,6 +294,9 @@ public:
     void set_config(Config config);
     // Ends every waiting worker (also done by the destructor).
     void shutdown();
+    // Shape B: to be called by the caller once the result of the last file is DELIVERED. Retires
+    // the worker(s) that served it, then (default order) starts the replacements. Shape A: nothing.
+    AfterDelivery after_delivery();
     std::vector<PoolEvent> take_events();
 
     void set_test_fault(const std::string& fault) { options_.test_fault = fault; }
@@ -299,6 +323,9 @@ private:
     std::unique_ptr<Slot> take_ready(std::string& error, double& waited_ms);
     void event(const std::string& what, const std::string& detail, double age_seconds = 0.0);
     void retire(Slot& slot, const std::string& what, const std::string& detail);
+    // Ended workers wait here for sandbox::retire, which is done between files only.
+    void defer(std::unique_ptr<Slot> slot, bool used_for_the_file);
+    void retire_deferred_unused();
 
     Config config_;
     HostOptions options_;
@@ -310,6 +337,7 @@ private:
     std::string preparation_;          // the preparation bytes of the current configuration
     std::string preparation_sha256_;   // their SHA-256
     std::deque<std::unique_ptr<Slot>> pool_;
+    std::vector<std::unique_ptr<Slot>> to_retire_;  // ended; their clean-up comes between files
     std::vector<PoolEvent> events_;
     int start_failures_in_a_row_ = 0;
     std::uint64_t maintain_round_ = 0;  // a worker started in a round gets its preparation in a later one

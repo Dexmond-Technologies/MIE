@@ -122,7 +122,11 @@ BREAKDOWN = (('hand_over_file returned (parent)', 't_hand_over_returned_ms'),
              ('result ready, answer about to be written (worker)', 't_scan_done_ms'),
              ('answer handed to the system (worker)', 't_answer_written_ms'),
              ('main() returned (worker)', 't_main_ended_ms'),
-             ('collect() returned: process ended and reaped (parent)', 't_collect_returned_ms'),
+             ('sandbox: the parent saw the worker\'s end', 'tl_process_ended_ms'),
+             ('sandbox: its pipes read to the end', 'tl_output_drained_ms'),
+             ('sandbox: job and process handles closed (Windows)', 'tl_job_closed_ms'),
+             ('sandbox: collect() about to return', 'tl_returned_ms'),
+             ('collect() returned (parent)', 't_collect_returned_ms'),
              ('every check done (parent)', 'from_hand_over_ms'))
 
 
@@ -133,6 +137,13 @@ def print_breakdown(jobs, indent='      '):
     for label, key in BREAKDOWN:
         values = [j.get(key, -1.0) for j in jobs if j.get(key, -1.0) is not None and j.get(key, -1.0) >= 0]
         print('%s  %-58s %s' % (indent, label, spread(values) if values else 'NOT MEASURED'), flush=True)
+    retire = [j.get('retire_ms', -1.0) for j in jobs if (j.get('retire_ms') or -1.0) >= 0]
+    deleted = [j.get('retire_deleted_ms', -1.0) for j in jobs if (j.get('retire_deleted_ms') or -1.0) >= 0]
+    refill = [j.get('refill_after_delivery_ms', 0.0) for j in jobs]
+    print('%sAFTER the result was delivered, not in the file\'s time (the pool\'s cost): retiring the used worker %s '
+          '(of which deleting its profile %s); starting the replacement %s' % (
+              indent, spread(retire) if retire else 'NOT MEASURED', spread(deleted) if deleted else 'not applicable',
+              spread(refill)), flush=True)
 
 
 def grant_container_access():
@@ -603,18 +614,20 @@ def main():
                 idle_record = [r for r in records(idle_log) if r.get('record') == 'idle']
                 print('  (a) pool before the file: %s' % (json.dumps(idle_record[0], sort_keys=True) if idle_record else
                                                           'NOT MEASURED'))
-        print('  (a) ONE FILE AFTER IDLE (3 s, pool of 2 full, nothing else running): shape B %s ms from when the parent '
+        print('  (a) ONE FILE AFTER IDLE (3 s, pool of 2 full, nothing else running; default order: result delivered, '
+              'worker retired, replacement started): shape B %s ms from when the parent '
               'got the file, %s ms from the start of the hand-over; shape A (a worker started for it: the price of an '
               'empty pool) %s ms' % (idle_figures.get('B'), idle_figures.get('B from the hand-over'), idle_figures.get('A')))
-        # The same with the replacement started only after the answer: shows whether a worker that
-        # starts while the file is scanned slows the scan.
-        quiet_log = os.path.join(tmp, 'idle-B-quiet.log.jsonl')
-        worker_run(WORKER, idle_dir, os.path.join(tmp, 'idle-B-quiet.jsonl'), common,
-                   ['--log', quiet_log, '--idle-before-first', '3', '--refill-after-answer'], shape=('--pool', '2'))
-        quiet = by_path(jobs_of(quiet_log)).get('a.txt', {})
-        print('  (a) shape B with the replacement started only AFTER the answer: %s ms from when the parent got the '
-              'file, %s ms from the start of the hand-over' % (quiet.get('total_ms'), quiet.get('from_hand_over_ms')))
-        print_breakdown([quiet] if quiet else [], indent='  (a) ')
+        # The other order: the replacement started right after the hand-over, while the file is
+        # scanned (shows whether a starting worker slows the one that scans). The figure above is
+        # the default order: result delivered, used worker retired, then the replacement started.
+        busy_log = os.path.join(tmp, 'idle-B-during.log.jsonl')
+        worker_run(WORKER, idle_dir, os.path.join(tmp, 'idle-B-during.jsonl'), common,
+                   ['--log', busy_log, '--idle-before-first', '3', '--refill-during-scan'], shape=('--pool', '2'))
+        busy = by_path(jobs_of(busy_log)).get('a.txt', {})
+        print('  (a) shape B with the replacement started DURING the scan: %s ms from when the parent got the '
+              'file, %s ms from the start of the hand-over' % (busy.get('total_ms'), busy.get('from_hand_over_ms')))
+        print_breakdown([busy] if busy else [], indent='  (a) ')
         if LINUX:
             idle_ref_times = os.path.join(tmp, 'idle-reference.times.jsonl')
             run_reference(idle_dir, os.path.join(tmp, 'idle-reference.jsonl'), idle_ref_times, reputation_file)
