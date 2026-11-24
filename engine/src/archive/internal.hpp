@@ -9,6 +9,7 @@
 // Shared by the zip reader, the tar reader and the decompression wrappers. Not installed.
 #pragma once
 
+#include <functional>
 #include <stdexcept>
 #include <cstring>
 #include <cstddef>
@@ -30,8 +31,16 @@ using Buffer = std::vector<std::uint8_t>;
 
 // Appends bytes to a buffer by resize and memcpy. (vector::insert of a byte range is reported by
 // GCC 14 as a false -Wstringop-overflow, an error with -Werror; node4's night of 2026-11-23.)
+// `more` may not be a view into `out` itself (resize would move the bytes it points at); such a
+// call is handled by copying `more` first (reviewer's note on d495ce2; no caller does it today).
 inline void append(Buffer& out, Bytes more) {
     if (more.empty()) return;                      // memcpy never sees an empty or null range
+    const std::less<const std::uint8_t*> before;
+    if (!out.empty() && !before(more.data(), out.data()) && before(more.data(), out.data() + out.size())) {
+        const Buffer copy(more.begin(), more.end());
+        append(out, copy);
+        return;
+    }
     const std::size_t old = out.size();
     if (more.size() > out.max_size() - old) throw std::length_error("archive buffer too large");
     out.resize(old + more.size());
