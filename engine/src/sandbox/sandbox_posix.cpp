@@ -129,6 +129,47 @@ std::uint64_t resident_bytes(pid_t pid) {
 std::uint64_t resident_bytes(pid_t) { return 0; }
 #endif
 
+// A descriptor that becomes readable when the child has ended (Linux 5.3 and later), so that
+// the parent's wait wakes at the child's END and not only at the end of a fixed step. Opened
+// by the PARENT for its own child; the confined child's allow list is not involved. -1 where
+// the kernel does not have it (ENOSYS) or elsewhere: the parent then takes 1 ms steps, but
+// only once every stream of the child is closed (see wait_step_ms).
+int open_end_descriptor(pid_t pid) {
+#if defined(__linux__)
+#ifdef SYS_pidfd_open
+    const long number = SYS_pidfd_open;
+#else
+    const long number = 434;  // the same number on every processor
+#endif
+    const long fd = ::syscall(number, pid, 0u);  // the descriptor is close-on-exec by itself
+    return fd >= 0 ? static_cast<int>(fd) : -1;
+#else
+    (void)pid;
+    return -1;
+#endif
+}
+
+// How long one wait may last: at most `step_ms` (the resident-memory watch looks that often),
+// never past the deadline, and 1 ms when nothing else can wake the wait (no stream of the
+// child is open and there is no end descriptor): a child whose streams are closed is ending,
+// and a fixed step would only add its length to every result.
+int wait_step_ms(std::chrono::steady_clock::time_point deadline, int step_ms, bool anything_to_wake) {
+    if (!anything_to_wake) {
+        return 1;
+    }
+    const auto left =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+    if (left <= 0) {
+        return 1;  // past the deadline: the child is being killed; its end wakes the wait
+    }
+    return left < step_ms ? static_cast<int>(left) + 1 : step_ms;
+}
+
+const char* end_watch_text(int end_fd) {
+    return end_fd >= 0 ? "end of the child noticed by pidfd"
+                       : "end of the child noticed by 1 ms steps once its streams closed (no pidfd_open here)";
+}
+
 void kill_child(pid_t pid) {
     // The child is the leader of its own process group; kill the group so that nothing it
     // may have started survives, then the process itself in case the group call failed.
@@ -272,6 +313,7 @@ struct StartedChild {
     int err = -1;      // ... of its standard error
     int status = -1;   // ... of the status pipe (-1 without confinement)
     int channel = -1;  // the parent's end of the channel for the one file
+    int end_fd = -1;   // readable when the child has ended (pidfd); -1 if the kernel has none
     bool address_space_limited = false;
 };
 
@@ -525,6 +567,9 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
     if (status_pipe[0] >= 0) {
         set_nonblocking(status_pipe[0]);
     }
+    // The child is not reaped by anyone but this code, so the number still names it here.
+    int end_fd = open_end_descriptor(pid);
+    const bool end_fd_opened = end_fd >= 0;
 
     if (keep != nullptr) {
         // A waiting start ends here: the caller owns the child and its descriptors from now.
@@ -534,6 +579,7 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
         keep->err = err_pipe[0];
         keep->status = status_pipe[0];
         keep->channel = channel[0];
+        keep->end_fd = end_fd;
         keep->address_space_limited = limit_address_space;
         in_pipe[1] = out_pipe[0] = err_pipe[0] = status_pipe[0] = channel[0] = -1;
         result.end = ChildResult::End::Exited;
@@ -620,7 +666,7 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
             }
         }
 
-        struct pollfd fds[4];
+        struct pollfd fds[5];
         int count = 0;
         int out_index = -1;
         int err_index = -1;
@@ -646,7 +692,14 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
                 fds[count++] = {in_pipe[1], POLLOUT, 0};
             }
         }
-        const int ready = ::poll(fds, static_cast<nfds_t>(count), 20);
+        // The child's end wakes this wait at once (it is then reaped at the top of the loop).
+        // Only while it is not reaped: afterwards the descriptor stays readable.
+        if (end_fd >= 0 && !reaped) {
+            fds[count++] = {end_fd, POLLIN, 0};
+        }
+        const bool anything_to_wake = count > 0;
+        const int ready = ::poll(count > 0 ? fds : nullptr, static_cast<nfds_t>(count),
+                                 wait_step_ms(deadline, 20, anything_to_wake));
         if (ready < 0 && errno != EINTR) {
             refuse(errno_text("poll", errno));
             continue;
@@ -719,6 +772,7 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
     }
 
     close_all();
+    close_fd(end_fd);
     if (!reaped) {
         kill_child(pid);
         ::wait4(pid, &wait_status, 0, &usage);
@@ -747,6 +801,7 @@ static ChildResult run_or_start(const std::filesystem::path& program, const std:
     }
 
     std::string parent_part = "parent: own process group, no-new-privileges, no core file, no other descriptors";
+    parent_part += std::string(", ") + end_watch_text(end_fd_opened ? 0 : -1);
     if (limit_address_space) {
         parent_part += ", address-space limit " + std::to_string(limits.memory_bytes) + " bytes";
     } else if (limits.memory_bytes > 0) {
@@ -837,6 +892,7 @@ struct WaitingChild::Impl {
     int wait_status = 0;
     struct rusage usage {};
     std::uint64_t highest_resident = 0;
+    bool end_fd_opened = false;  // the end of the worker is noticed by pidfd
 };
 
 namespace {
@@ -929,7 +985,7 @@ void pump(WaitingChild::Impl& c, int timeout_ms, std::span<const std::uint8_t> i
         }
     }
 
-    struct pollfd fds[4];
+    struct pollfd fds[5];
     int count = 0;
     int out_index = -1;
     int err_index = -1;
@@ -951,9 +1007,15 @@ void pump(WaitingChild::Impl& c, int timeout_ms, std::span<const std::uint8_t> i
         in_index = count;
         fds[count++] = {c.child.in, POLLOUT, 0};
     }
+    // The worker's end wakes this wait at once (pidfd); it is reaped by the next round.
+    if (c.child.end_fd >= 0 && !c.reaped) {
+        fds[count++] = {c.child.end_fd, POLLIN, 0};
+    }
     if (count == 0) {
+        // Nothing can wake the wait (every stream closed, no pidfd): the worker is ending.
+        // A short step, never the whole timeout.
         if (timeout_ms > 0) {
-            ::poll(nullptr, 0, timeout_ms);
+            ::poll(nullptr, 0, 1);
         }
         return;
     }
@@ -1026,6 +1088,7 @@ void finish_child(WaitingChild::Impl& c) {
     close_fd(c.child.err);
     close_fd(c.child.status);
     close_fd(c.child.channel);
+    close_fd(c.child.end_fd);
     if (c.child.pid > 0) {
         if (!c.reaped) {
             kill_child(c.child.pid);
@@ -1057,6 +1120,7 @@ void update_state(WaitingChild::Impl& c) {
 
 std::string parent_part_of(const WaitingChild::Impl& c) {
     std::string text = "parent: own process group, no-new-privileges, no core file, no other descriptors";
+    text += std::string(", ") + end_watch_text(c.end_fd_opened ? 0 : -1);
     if (c.child.address_space_limited) {
         text += ", address-space limit " + std::to_string(c.memory_bytes) + " bytes";
     } else if (c.memory_bytes > 0) {
@@ -1147,6 +1211,7 @@ std::unique_ptr<WaitingChild> start_waiting(const std::filesystem::path& program
         impl->failure = created.detail.empty() ? "the worker could not be started" : created.detail;
         impl->finished = true;
     } else {
+        impl->end_fd_opened = impl->child.end_fd >= 0;
         // Without confinement (tests only) there is no stage-1 report to wait for.
         impl->state = options.run.confine ? WaitingState::Starting : WaitingState::Waiting;
     }
@@ -1246,7 +1311,7 @@ ChildResult collect(WaitingChild& child, const Limits& limits) {
     }
     const auto deadline = c.handed_over + std::chrono::seconds(limits.wall_seconds > 0 ? limits.wall_seconds : 0);
     while (!c.finished) {
-        pump(c, 20, {}, nullptr);
+        pump(c, c.reaped ? 20 : wait_step_ms(deadline, 20, true), {}, nullptr);
         const bool streams_open = c.child.out >= 0 || c.child.err >= 0 || c.child.status >= 0;
         if (c.reaped && !streams_open) {
             break;
