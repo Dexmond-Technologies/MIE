@@ -29,6 +29,19 @@
 # Usage: run_nightly.sh            (configuration by environment, defaults below)
 set -u
 
+# The build must not take anything from an outside build environment (COMMANDER_SEAT, board
+# B-3875: a shared compiler cache, a shared vcpkg cache and another linker were installed on the
+# machines without review). Everything that could bring them in is cleared here, and what is
+# left is written into the build log.
+unset VCPKG_BINARY_SOURCES VCPKG_DEFAULT_BINARY_CACHE VCPKG_ROOT VCPKG_FEATURE_FLAGS \
+      CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_LINKER_TYPE CMAKE_GENERATOR \
+      CMAKE_TOOLCHAIN_FILE CMAKE_BUILD_PARALLEL_LEVEL CFLAGS CXXFLAGS CPPFLAGS LDFLAGS \
+      LD LD_PRELOAD CC CXX
+while IFS= read -r name; do unset "$name"; done < <(env | sed -n 's/^\(CCACHE_[A-Za-z0-9_]*\)=.*/\1/p')
+# a compiler cache put in front of the compilers through PATH (e.g. /usr/lib/ccache) is removed too
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -i ccache | paste -sd: -)"
+export PATH
+
 WORK="${MIE_FUZZ_WORK:-/mnt/node4-work/mie-fuzz}"
 REPO_URL="${MIE_FUZZ_REPO:-https://github.com/Dexmond-Technologies/MIE.git}"
 BRANCH="${MIE_FUZZ_BRANCH:-cpp/stage1}"
@@ -134,6 +147,10 @@ VCPKG="$WORK/vcpkg-$VCPKG_COMMIT"
 
 # ---- build the fuzz targets (clang, libFuzzer, sanitizers) ---------------------------------
 BUILD="$WORK/build"
+{ echo "build environment (after clearing outside settings):"
+  env | grep -E '^(CC|CXX|VCPKG|CMAKE|CCACHE|LD|CFLAGS|CXXFLAGS|LDFLAGS)' | sort || true
+  for tool in c++ clang++ ld; do echo "$tool is: $(command -v "$tool") -> $(readlink -f "$(command -v "$tool")" 2>/dev/null)"; done
+  echo "PATH: $PATH"; } >>"$RUN_DIR/build.log" 2>&1
 export CC=clang CXX=clang++ VCPKG_ROOT="$VCPKG" VCPKG_DISABLE_METRICS=1
 export VCPKG_DEFAULT_BINARY_CACHE="$WORK/vcpkg-cache"
 mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
