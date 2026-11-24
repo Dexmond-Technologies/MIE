@@ -207,8 +207,12 @@ def descriptor_check(path, start_pattern):
             first = re.match(r"\s*(-?\d+)", args)
             fd = int(first.group(1)) if first else None
             if name == "recvmsg":
-                s["recv"] += 1
-                s["stage"] = "after_recv"
+                result = re.search(r"=\s*(-?\d+)\s*$", args)
+                if result and int(result.group(1)) > 0:
+                    s["recv"] += 1
+                    s["stage"] = "after_recv"
+                else:
+                    s["empty_recv"] = s.get("empty_recv", 0) + 1   # end of the channel: no file came
                 continue
             if name == "fcntl" and s["stage"] == "after_recv" and "F_GETFL" in args and s["fd"] is None:
                 s["fd"] = fd
@@ -222,6 +226,7 @@ def descriptor_check(path, start_pattern):
                 s["touch"].append((name, fd))
     lines, failed = [], False
     workers = {pid: s for pid, s in state.items() if s["recv"]}
+    without = sorted(pid for pid, s in state.items() if not s["recv"] and s.get("empty_recv"))
     if not workers:
         return ["HANDED-OVER DESCRIPTOR CHECK: no worker received a file by recvmsg in this trace (one-shot shape)"], False
     fds = sorted({s["fd"] for s in workers.values() if s["fd"] is not None})
@@ -238,8 +243,12 @@ def descriptor_check(path, start_pattern):
                 bad.append("%s: %s on the received descriptor %d before the seal" % (pid, name, fd))
     allowed_read_fds = {0, 3}   # standard input (the preparation) and the channel (descriptor 3)
     other = {fd: n for fd, n in reads.items() if fd not in allowed_read_fds}
-    lines.append("HANDED-OVER DESCRIPTOR CHECK: %d workers received a file; received descriptor number(s): %s"
-                 % (len(workers), fds))
+    lines.append("HANDED-OVER DESCRIPTOR CHECK: %d workers received a file; received descriptor number(s): %s; "
+                 "%d workers reached the end of the channel without a file (process ids %s)"
+                 % (len(workers), fds, len(without), ", ".join(without[:10])))
+    mapped = sum(1 for s in workers.values() for name, fd in s["touch"] if name == "mmap" and fd == s["fd"])
+    lines.append("HANDED-OVER DESCRIPTOR CHECK: mmap calls naming the received descriptor between recvmsg and the "
+                 "seal: %d (mmap's fifth argument is read)" % mapped)
     lines.append("HANDED-OVER DESCRIPTOR CHECK: reads before the seal by descriptor: %s (allowed: 0 standard input, "
                  "3 the channel)" % dict(sorted((str(k), v) for k, v in reads.items())))
     for fd, n in sorted(other.items(), key=lambda x: str(x[0])):
