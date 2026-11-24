@@ -51,7 +51,11 @@ SECCOMP_LINE = r"prctl\(PR_SET_SECCOMP, SECCOMP_MODE_FILTER.*=\s*0\s*$"
 # The report is ONE write(2) of "stage1 <what>\n" on the status descriptor (number 4 at start;
 # see status_line in sandbox_posix.cpp); a short write would repeat write() for the rest. The
 # pattern also takes a descriptor decorated by strace -y ("4<pipe:[123]>") and the writev form.
+# The worker makes itself not dumpable at stage 1 (by design), so strace can no longer read its
+# buffers and prints the stage-1 report as write(4, 0x..., N) (run 45310215569). The last step of
+# stage 1 is landlock_restrict_self; that call, which strace shows whole, marks stage 1 as well.
 STAGE1_LINE = r"\bwrite\w*\(\d+(?:<[^>]*>)?,\s*(?:\[\{iov_base=)?\"stage1 "
+STAGE1_LINE = r"(?:" + STAGE1_LINE + r")|landlock_restrict_self\(.*=\s*0\s*$"
 # Calls the filter answers on purpose without allowing them; seeing them refused is expected.
 ANSWERED_ON_PURPOSE = {
     "newfstatat": "refused on purpose: it takes a path. Newer C libraries ask the kind of an open stream "
