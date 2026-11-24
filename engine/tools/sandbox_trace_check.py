@@ -174,6 +174,85 @@ def read_trace(path, start_pattern, whole):
     return used, refused, seen_start, before_seal, exec_to_seal
 
 
+def descriptor_check(path, start_pattern):
+    """Reviewer's condition on the pre-started shape (M-13 condition 1, ruling on run 45310215569):
+    per worker, between the recvmsg that brings the file and the seal, nothing may read, pread,
+    readv or mmap the handed-over descriptor; and every read before the seal must be on standard
+    input or the channel. The received descriptor is the one the worker asks fcntl(N, F_GETFL)
+    about after recvmsg (strace cannot show recvmsg's control message: the worker is not dumpable).
+    Returns (lines to print, failed)."""
+    call = re.compile(r"^(\d+)\s+(read|pread64|readv|preadv|preadv2|mmap|fcntl|recvmsg)\((.*)$")
+    start = re.compile(start_pattern)
+    state = {}   # pid -> {'stage': 'start'|'after_recv'|'sealed', 'fd': None, 'reads_before': {fd: n}, 'touch': []}
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.rstrip("\n")
+            pid_match = re.match(r"^(\d+)\s", line)
+            if not pid_match:
+                continue
+            pid = pid_match.group(1)
+            if re.search(STAGE1_LINE, line):
+                state[pid] = {"stage": "start", "fd": None, "reads_before": {}, "touch": [], "recv": 0}
+                continue
+            s = state.get(pid)
+            if s is None or s["stage"] == "sealed":
+                continue
+            if start.search(line):
+                s["stage"] = "sealed"
+                continue
+            m = call.match(line)
+            if not m:
+                continue
+            name, args = m.group(2), m.group(3)
+            first = re.match(r"\s*(-?\d+)", args)
+            fd = int(first.group(1)) if first else None
+            if name == "recvmsg":
+                s["recv"] += 1
+                s["stage"] = "after_recv"
+                continue
+            if name == "fcntl" and s["stage"] == "after_recv" and "F_GETFL" in args and s["fd"] is None:
+                s["fd"] = fd
+                continue
+            if name == "mmap":
+                parts = [x.strip() for x in args.split(",")]
+                fd = int(parts[4]) if len(parts) > 4 and re.fullmatch(r"-?\d+", parts[4]) else None
+            if name in ("read", "pread64", "readv", "preadv", "preadv2"):
+                s["reads_before"][fd] = s["reads_before"].get(fd, 0) + 1
+            if s["stage"] == "after_recv" and fd is not None:
+                s["touch"].append((name, fd))
+    lines, failed = [], False
+    workers = {pid: s for pid, s in state.items() if s["recv"]}
+    if not workers:
+        return ["HANDED-OVER DESCRIPTOR CHECK: no worker received a file by recvmsg in this trace (one-shot shape)"], False
+    fds = sorted({s["fd"] for s in workers.values() if s["fd"] is not None})
+    reads = {}
+    bad = []
+    for pid, s in workers.items():
+        for fd, n in s["reads_before"].items():
+            reads[fd] = reads.get(fd, 0) + n
+        if s["fd"] is None:
+            bad.append("%s: the received descriptor was never named by fcntl(F_GETFL)" % pid)
+            continue
+        for name, fd in s["touch"]:
+            if fd == s["fd"] and name in ("read", "pread64", "readv", "preadv", "preadv2", "mmap"):
+                bad.append("%s: %s on the received descriptor %d before the seal" % (pid, name, fd))
+    allowed_read_fds = {0, 3}   # standard input (the preparation) and the channel (descriptor 3)
+    other = {fd: n for fd, n in reads.items() if fd not in allowed_read_fds}
+    lines.append("HANDED-OVER DESCRIPTOR CHECK: %d workers received a file; received descriptor number(s): %s"
+                 % (len(workers), fds))
+    lines.append("HANDED-OVER DESCRIPTOR CHECK: reads before the seal by descriptor: %s (allowed: 0 standard input, "
+                 "3 the channel)" % dict(sorted((str(k), v) for k, v in reads.items())))
+    for fd, n in sorted(other.items(), key=lambda x: str(x[0])):
+        bad.append("a read before the seal on descriptor %s (%d times), neither standard input nor the channel" % (fd, n))
+    for item in bad[:20]:
+        lines.append("HANDED-OVER DESCRIPTOR CHECK: FAIL  " + item)
+    failed = bool(bad)
+    lines.append("HANDED-OVER DESCRIPTOR CHECK: %s" % ("FAIL" if failed else
+                 "PASS (no read, pread, readv or mmap of the received descriptor between recvmsg and the seal; "
+                 "reads before the seal only on standard input and the channel)"))
+    return lines, failed
+
+
 def main():
     parser = argparse.ArgumentParser(description="trace a command and compare with the sandbox allow list")
     parser.add_argument("--source", required=True, help="path of sandbox_posix.cpp")
@@ -209,6 +288,7 @@ def main():
         print("command exit code: %d" % done.returncode)
         used, refused, seen_start, before_seal, exec_to_seal = read_trace(trace_path, arguments.after,
                                                                           arguments.whole)
+        check_lines, check_failed = descriptor_check(trace_path, arguments.after)
     finally:
         if folder is not None:
             shutil.rmtree(folder, ignore_errors=True)
@@ -273,6 +353,9 @@ def main():
             print("MARGIN, NOT USED      %-20s reason: %s" % (name, reason))
     traced = sum(1 for tag, _ in allowed.values() if tag == "TRACED")
     margin = sum(1 for tag, _ in allowed.values() if tag == "MARGIN")
+    for text in check_lines:
+        print(text)
+    failed = failed or check_failed
     print("sandbox_trace_check: %d calls used after the starting point; the list has %d (TRACED %d, MARGIN %d): %s"
           % (len(used), len(allowed), traced, margin, "FAIL" if failed else "PASS"))
     return 1 if failed else 0
