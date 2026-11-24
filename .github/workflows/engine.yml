@@ -131,9 +131,10 @@ jobs:
           now=$(date -u +%s); bad=0
           for t in pe_parity:mie-pe-probe pe_analysis_parity:mie-pe-analysis-probe archive_parity:mie-archive-probe; do
             test=${t%%:*}; probe=${t##*:}
-            MIE_PARITY_DEADLINE_UNIX=$now python3 engine/tests/$test.py build/$probe "$GITHUB_WORKSPACE" > deadline-$test.log 2>&1
-            code=$?
-            grep -E "^$test: (STOPPED AT THE DEADLINE|compared [0-9]+ damaged variants)" deadline-$test.log
+            # (the step's shell stops at the first non-zero status: catch the expected 3 here)
+            code=0
+            MIE_PARITY_DEADLINE_UNIX=$now python3 engine/tests/$test.py build/$probe "$GITHUB_WORKSPACE" > deadline-$test.log 2>&1 || code=$?
+            grep -E "^$test: (STOPPED AT THE DEADLINE|compared [0-9]+ damaged variants)" deadline-$test.log || true
             echo "$test: exit code $code (3 expected)"
             [ "$code" = 3 ] || { bad=1; tail -20 deadline-$test.log; }
           done

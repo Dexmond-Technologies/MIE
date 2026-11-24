@@ -113,9 +113,22 @@ def read_trace(path, start_pattern, whole):
     counted = set()   # process / thread numbers whose calls count
     seen_start = whole
     start = re.compile(start_pattern)
+    pending = {}  # pid -> the beginning of a call strace printed as "<unfinished ...>"
     with open(path, encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             line = raw.rstrip("\n")
+            # With several processes at once strace splits a call into "name(args <unfinished ...>"
+            # and later "<... name resumed>rest". Join the two halves, so that the starting line
+            # (the filter's prctl ... = 0) is seen whole; the call is still counted once, at its
+            # beginning (run 45216107042: in the pre-started shape the start was never seen).
+            head = re.match(r"^(\d+)\s+(.*) <unfinished \.\.\.>$", line)
+            if head:
+                pending[head.group(1)] = head.group(2)
+            tail = re.match(r"^(\d+)\s+<\.\.\. \w+ resumed>(.*)$", line)
+            if tail and tail.group(1) in pending:
+                joined = pending.pop(tail.group(1)) + tail.group(2)
+                if start.search(joined):
+                    line = tail.group(1) + " " + joined   # a whole call line, beginning included
             found = LINE.match(line)
             if not found:
                 continue  # signals, exits
